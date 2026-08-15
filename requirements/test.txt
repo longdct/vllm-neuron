@@ -1,6 +1,6 @@
 torch
 numpy
-transformers>=5.5.1,<6.0.0
+transformers>=5.5.3,<6.0.0
 pytest
 pytest-cov
 pytest-forked

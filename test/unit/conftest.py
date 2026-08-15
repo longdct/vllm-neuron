@@ -111,6 +111,24 @@ def deepseek_v4_config() -> ModuleType:
     )
 
 
+@pytest.fixture(scope="session")
+def dense_csa() -> ModuleType:
+    """The dense-CSA bound and admission guard, loaded without torch or vllm."""
+    return load_neuron_module(
+        "vllm_neuron.model.deepseek_v4.dense_csa",
+        "vllm_neuron/model/deepseek_v4/dense_csa.py",
+    )
+
+
+@pytest.fixture(scope="session")
+def memory_budget() -> ModuleType:
+    """The per-rank memory accounting model, loaded without torch or vllm."""
+    return load_neuron_module(
+        "vllm_neuron.model.memory_budget",
+        "vllm_neuron/model/memory_budget.py",
+    )
+
+
 @pytest.fixture
 def registry(guards: ModuleType) -> ModuleType:
     """The registry module, reset between tests.

@@ -36,17 +36,32 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 
 | Item | Phase | State |
 |---|---|---|
-| Patch registry, phases, guards, tripwires | P0.2 | **built** (uncommitted), validated against **0.21** — needs re-validation at 0.26 |
-| Bare-interpreter test harness | — | **built** (uncommitted), `test/unit/conftest.py` loads vllm-free modules by path |
-| **Config normalization + validation** (`model/deepseek_v4/config.py`) | **P3a.1** | **done** — 31 tests, mutation-checked |
-| Everything else | P0–P9 | not started; most is environment-blocked (see below) |
+| Version pins moved to vLLM 0.26 / `0.26.0.1.0.0` / `transformers>=5.5.3` | **P0.1** | **done** — pre-bump state preserved at commit `be0def6` |
+| Patch registry, phases, guards, tripwires | P0.2 | **built**, validated against **0.21** — `VALIDATED_VLLM_VERSION` stays `0.21.0` until tripwires pass on a real 0.26 tree |
+| Bare-interpreter test harness | — | **built** — `test/unit/conftest.py` loads vllm-free modules by path |
+| **Config normalization + validation** (`model/deepseek_v4/config.py`) | **P3a.1** | **done** — 31 tests |
+| **Dense-CSA bound + admission guard** (`model/deepseek_v4/dense_csa.py`) | **P5** | **arithmetic done** — 40 tests; compressor constants still required as inputs |
+| **Per-rank memory accounting model** (`model/memory_budget.py`) | **P7a** | **done** — 32 tests; needs GPT-OSS calibration to pass its gate |
+| Everything else | P0.2–P9 | environment-blocked (see below) |
 
-**Why P3a.1 landed before P0.** P0, P1, and P2 all require a Linux box with `vllm==0.26.0` or a Trn2
-instance, and neither exists on the development machine. Config normalization is the one critical-path
-item with no such dependency — it is pure data-shape logic, so it was written dependency-free and
-tested on a bare interpreter. This is the intended use of the local tier, not a reordering of the
-plan: P3a's remaining steps (weight mapping, mHC, compressor, MLA, MoE, decode) all need torch and
-stay blocked behind P0–P2.
+Suite: **171 passed, 5 skipped**, no torch/vllm. New modules are mutation-checked — deliberately
+breaking the bound formula, the admission rule, and the streaming-peak formula each produced failures.
+
+**Why P5 and P7a landed before P0–P2.** P0.2, P1, P2 all need a Linux box with `vllm==0.26.0` or a
+Trn2 instance, and neither exists on the development machine. The three items above are the critical
+path's only environment-independent work: config normalization is data-shape logic, the CSA bound is
+integer arithmetic, and weight accounting reads safetensors headers. All three were written
+dependency-free and tested on a bare interpreter, which is the intended use of the local tier — not a
+reordering. Their *dependent* work is untouched: P5's derivation still needs the pinned compressor
+constants, P7a still needs calibration against a measured GPT-OSS peak, and P3a's remaining steps
+(weight mapping, mHC, compressor, MLA, MoE, decode) all need torch.
+
+**What the two new modules deliberately refuse to do.** `dense_csa.CompressorGeometry` has no default
+kernel width, stride, or offset — a defaulted constant would yield a plausible bound that had never
+been derived, which is precisely the ~2048-token trap the plan warns against. `memory_budget` marks
+every line `EXACT` or `ESTIMATED`, and `MemoryBudget` exposes no scalar total, so a modelled range can
+never be quoted as a measurement; `fits_in()` returns `None` when the range straddles capacity, which
+is the signal to run P7b rather than to guess.
 
 ## Ground truth as of this plan
 
