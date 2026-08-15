@@ -207,6 +207,7 @@ class NeuronPlatform(Platform):
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
+    _deepseek_dense_csa_bound = None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -367,6 +368,7 @@ class NeuronPlatform(Platform):
             return
 
         cls._validate_deepseek_v4_unsupported_features(vllm_config)
+        cls._configure_deepseek_v4_dense_csa_bound(model_config)
 
         # Frontend multimodal patchify runs under vLLM's
         # set_default_torch_num_threads(), which pins torch to OMP_NUM_THREADS or
@@ -484,6 +486,25 @@ class NeuronPlatform(Platform):
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
 
+        if cls._deepseek_dense_csa_bound is not None:
+            from vllm_neuron.model.deepseek_v4.dense_csa import check_admission
+
+            prompt_ids = processed_inputs.get("prompt_token_ids")
+            if prompt_ids is None:
+                prompt_embeds = processed_inputs.get("prompt_embeds")
+                if prompt_embeds is None:
+                    raise ValueError(
+                        "DeepSeek-V4 dense-CSA admission requires prompt token count"
+                    )
+                prompt_tokens = prompt_embeds.shape[0]
+            else:
+                prompt_tokens = len(prompt_ids)
+            check_admission(
+                prompt_tokens,
+                getattr(params, "max_tokens", None),
+                cls._deepseek_dense_csa_bound,
+            )
+
         if cls._max_embeds_per_image is None:
             return
 
@@ -527,6 +548,25 @@ class NeuronPlatform(Platform):
                 "cache fork and rollback are implemented"
             )
 
+    @classmethod
+    def _configure_deepseek_v4_dense_csa_bound(cls, model_config) -> None:
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "deepseek_v4":
+            cls._deepseek_dense_csa_bound = None
+            return
+        from vllm_neuron.model.deepseek_v4.dense_csa import (
+            CountingMode,
+            geometry_from_config,
+            model_bound,
+        )
+
+        geometries = {
+            index: geometry_from_config(hf_config, layer_type)
+            for index, layer_type in enumerate(hf_config.layer_types)
+        }
+        cls._deepseek_dense_csa_bound = model_bound(
+            geometries, hf_config.index_topk, mode=CountingMode.COMPLETE
+        )
     @classmethod
     def _validate_quantization_config(cls, model_config) -> None:
         """Validate quantization config. Only KV cache quantization
