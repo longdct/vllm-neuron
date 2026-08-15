@@ -15,6 +15,13 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm_neuron import envs
+from vllm_neuron.vllm.patches import Phase, apply_phase
+from vllm_neuron.vllm.patches.guards import (
+    PatchError,
+    find_literal_field_schema,
+    literal_rejection_locs,
+)
+from vllm_neuron.vllm.scheduler_selection import resolve_neuron_scheduler_cls
 
 from vllm.platforms import Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -279,6 +286,11 @@ class NeuronPlatform(Platform):
         """Configure vLLM for vLLM Neuron platform."""
         # Patches for bidirectional KV transfer and streaming KV (DI features).
 
+        # Assert the upstream symbols the platform-config patches below depend on
+        # still look the way they expect. Runs first so drift is reported before
+        # any patch installs itself against a moved target.
+        apply_phase(Phase.PLATFORM_CONFIG)
+
         cls._patch_termination_timeouts()
         cls._register_neuron_all2all_backend()
 
@@ -371,20 +383,13 @@ class NeuronPlatform(Platform):
                 merge_factor = get_vision_token_merge_factor(model_config.hf_config)
                 cls._max_embeds_per_image = max(buckets) // max(merge_factor, 1)
 
-        # Override the default vLLM scheduler with our custom Neuron scheduler
-        # We need to override even if it's already set to the default scheduler
-        if scheduler_config.scheduler_cls is None or scheduler_config.scheduler_cls in (
-            "vllm.v1.core.sched.scheduler.Scheduler",
-            "vllm.v1.core.sched.async_scheduler.AsyncScheduler",
-        ):
-            if scheduler_config.async_scheduling:
-                scheduler_config.scheduler_cls = (
-                    "vllm_neuron.vllm.core.scheduler.NeuronAsyncScheduler"
-                )
-            else:
-                scheduler_config.scheduler_cls = (
-                    "vllm_neuron.vllm.core.scheduler.NeuronScheduler"
-                )
+        # Override the default vLLM scheduler with our custom Neuron scheduler.
+        # We override even when it is already set to an upstream default path.
+        resolved = resolve_neuron_scheduler_cls(
+            scheduler_config.scheduler_cls, scheduler_config.async_scheduling
+        )
+        if resolved is not None:
+            scheduler_config.scheduler_cls = resolved
         else:
             logger.warning(
                 "scheduler_cls already set to non-default: %s, "
@@ -768,16 +773,43 @@ class NeuronPlatform(Platform):
 
         schema = ParallelConfig.__pydantic_core_schema__
 
-        for field in schema["schema"]["schema"]["schema"]["fields"]:
-            if field.get("name") == "all2all_backend":
-                literal_schema = field["schema"]["schema"]
-                if "neuron" not in literal_schema["expected"]:
-                    literal_schema["expected"] = list(literal_schema["expected"]) + [
-                        "neuron"
-                    ]
-                break
+        # Located by field name rather than by fixed-depth indexing: the previous
+        # schema["schema"]["schema"]["schema"]["fields"] walk breaks or silently
+        # edits the wrong node whenever pydantic re-nests model schemas. The
+        # matching tripwire fails startup if the field stops being a Literal.
+        literal_schema = find_literal_field_schema(schema, "all2all_backend")
+        if literal_schema is None:
+            raise PatchError(
+                "ParallelConfig.all2all_backend is no longer a Literal field "
+                "reachable in __pydantic_core_schema__; cannot register the "
+                "'neuron' all2all backend"
+            )
+        if "neuron" not in literal_schema["expected"]:
+            literal_schema["expected"] = [*literal_schema["expected"], "neuron"]
 
         ParallelConfig.__pydantic_validator__ = SchemaValidator(schema)
+
+        # Verify the registration actually took, rather than assuming it. Editing
+        # __pydantic_core_schema__ and rebuilding the validator is not guaranteed
+        # to change validation: on pydantic 2.13 a rebuilt SchemaValidator was
+        # observed still rejecting a value added to the Literal this way. Left
+        # unchecked that is silent -- the backend simply fails config validation
+        # later with a confusing "not a valid option" error.
+        try:
+            ParallelConfig(all2all_backend="neuron")
+        except Exception as exc:
+            if literal_rejection_locs(exc, "all2all_backend"):
+                raise PatchError(
+                    "registering the 'neuron' all2all backend had no effect: "
+                    "ParallelConfig still rejects all2all_backend='neuron' after "
+                    "patching its pydantic schema. The installed pydantic likely "
+                    "no longer rebuilds validation from __pydantic_core_schema__."
+                ) from exc
+            # Some unrelated field objected (e.g. a new required field). We cannot
+            # confirm the registration from here, but it is not evidence against it.
+            logger.debug(
+                "all2all backend registration could not be self-verified: %s", exc
+            )
 
     @classmethod
     def _patch_termination_timeouts(cls) -> None:
