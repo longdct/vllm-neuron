@@ -22,14 +22,24 @@ to be tested before a Neuron or Linux environment is available -- the same
 convention already used by ``vllm_neuron/vllm/patches/guards.py`` and
 ``vllm_neuron/vllm/scheduler_selection.py``.
 
-.. warning::
-   The ``layer_types`` **string vocabulary** in :data:`_LAYER_TYPE_KINDS` is not
-   yet verified against the pinned Transformers release -- the repository has no
-   Transformers 5.x installed to read it from. It is written to accept the
-   documented spellings and to *raise* on anything else, so an unverified guess
-   surfaces as a startup error naming the offending value rather than as a
-   mis-typed layer. Confirm the vocabulary when the pin lands (plan P0.1) and
-   extend the mapping if the real config disagrees.
+**Verified against Transformers 5.15.0** (``DeepseekV4Config``), which settled
+three things this module previously guessed at, all of them wrongly:
+
+* The ``layer_types`` vocabulary is ``sliding_attention`` /
+  ``compressed_sparse_attention`` / ``heavily_compressed_attention`` -- not the
+  ``compressed_attention`` spelling originally assumed. The strict-raise design
+  worked as intended: the wrong guess would have failed loudly at startup rather
+  than mis-typing layers.
+* ``compress_rates`` is a **dict keyed by layer type**, not a per-layer list.
+  The two have different lengths and different meanings, and reading one as the
+  other produces silently wrong ratios rather than an error.
+* Per-layer MLP structure comes from ``mlp_layer_types``. ``num_hash_layers``
+  exists only as a legacy kwarg that upstream consumes during ``__post_init__``,
+  so it never survives on a loaded config object.
+
+The same is true of ``compress_ratios``: upstream pops it, folds it into
+``layer_types``, and does not retain it. Both legacy forms therefore appear only
+on raw checkpoint JSON, which is exactly why both paths are still supported here.
 """
 
 from collections.abc import Mapping
@@ -38,12 +48,12 @@ from enum import Enum
 from typing import Any
 
 __all__ = [
+    "SUPPORTED_COMPRESS_RATIOS",
     "AttentionKind",
     "DeepseekV4ConfigError",
     "LayerSpec",
     "MLPKind",
     "NormalizedDeepseekV4Config",
-    "SUPPORTED_COMPRESS_RATIOS",
     "normalize_config",
     "normalize_layer_specs",
 ]
@@ -81,12 +91,32 @@ class MLPKind(str, Enum):
 #: variant this plugin has not been built or tested for.
 SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 
-#: ``layer_types`` spellings mapped to the kind they denote. See the module
-#: warning: unverified against the pinned Transformers release, and intentionally
-#: strict so an unknown spelling raises instead of defaulting.
-_LAYER_TYPE_KINDS: Mapping[str, AttentionKind] = {
-    "sliding_attention": AttentionKind.SLIDING_WINDOW,
-    "compressed_attention": AttentionKind.COMPRESSED,
+#: ``layer_types`` spellings mapped to the compression ratio each denotes.
+#:
+#: Verified against ``transformers.models.deepseek_v4.configuration_deepseek_v4``
+#: at Transformers 5.15.0, which defines the vocabulary as
+#: ``DEEPSEEK_V4_LAYER_TYPES`` and the inverse mapping as
+#: ``_COMPRESS_RATIO_TO_LAYER_TYPE = {0: "sliding_attention",
+#: 4: "compressed_sparse_attention", 128: "heavily_compressed_attention"}``.
+#:
+#: The ratio for a *compressed* type is only a default: upstream lets
+#: ``compress_rates`` override the value per type, so this table supplies the
+#: fallback and :func:`_ratios_from_layer_types` prefers the config's own dict.
+#: ``sliding_attention`` is the exception -- it means "no compression", and no
+#: ``compress_rates`` entry exists for it.
+_LAYER_TYPE_TO_RATIO: Mapping[str, int] = {
+    "sliding_attention": 0,
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
+
+#: The one ``layer_types`` value that means "uncompressed sliding window".
+_SLIDING_LAYER_TYPE = "sliding_attention"
+
+#: ``mlp_layer_types`` spellings, from ``DEEPSEEK_V4_MLP_LAYER_TYPES``.
+_MLP_TYPE_KINDS: Mapping[str, "MLPKind"] = {
+    "hash_moe": MLPKind.HASH_MOE,
+    "moe": MLPKind.ROUTED_MOE,
 }
 
 #: The only scoring/selection combination the MoE implementation targets.
@@ -220,45 +250,74 @@ def _validate_ratios(ratios: list[int], num_hidden_layers: int, source: str) -> 
 
 
 def _ratios_from_layer_types(
-    layer_types: list[Any], compress_rates: list[int], num_hidden_layers: int
+    layer_types: list[Any], compress_rates: Any, num_hidden_layers: int
 ) -> list[int]:
     """Fold the normalized form into plain per-layer ratios.
 
-    ``layer_types`` and ``compress_rates`` are cross-checked rather than one
-    being trusted over the other: they encode the same fact twice, so a
-    disagreement means the config is not what this code thinks it is.
+    Note the shapes, which are **not** symmetric and were the easiest thing to
+    get wrong here: ``layer_types`` is one entry *per layer*, while
+    ``compress_rates`` is a dict keyed *by layer type* -- upstream's default is
+    ``{"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}``.
+    So the per-layer ratio is a lookup through the type name, not a positional
+    zip. Treating ``compress_rates`` as a per-layer list yields ratios that are
+    silently wrong for every layer past the second.
+
+    ``sliding_attention`` carries no ``compress_rates`` entry -- it means "no
+    compression" -- and is resolved to 0 without consulting the dict.
     """
     if len(layer_types) != num_hidden_layers:
         raise DeepseekV4ConfigError(
             f"'layer_types' has {len(layer_types)} entries but num_hidden_layers "
             f"is {num_hidden_layers}"
         )
-    _validate_ratios(compress_rates, num_hidden_layers, "'compress_rates'")
 
-    for index, (raw_type, ratio) in enumerate(zip(layer_types, compress_rates)):
+    if compress_rates is None:
+        rates: Mapping[str, Any] = {}
+    elif isinstance(compress_rates, Mapping):
+        rates = compress_rates
+    else:
+        raise DeepseekV4ConfigError(
+            f"'compress_rates' must be a mapping from layer type to compression "
+            f"ratio (e.g. {{'compressed_sparse_attention': 4}}), got "
+            f"{type(compress_rates).__name__}. A per-layer list is the legacy "
+            f"'compress_ratios' field, which is a different thing"
+        )
+
+    ratios: list[int] = []
+    for index, raw_type in enumerate(layer_types):
         if not isinstance(raw_type, str):
             raise DeepseekV4ConfigError(
                 f"'layer_types'[{index}] must be a string, got {raw_type!r}"
             )
-        kind = _LAYER_TYPE_KINDS.get(raw_type)
-        if kind is None:
+        if raw_type not in _LAYER_TYPE_TO_RATIO:
             raise DeepseekV4ConfigError(
                 f"'layer_types'[{index}] is {raw_type!r}, which this implementation "
                 f"does not recognize; known values are "
-                f"{sorted(_LAYER_TYPE_KINDS)}. Refusing to guess the layer's "
+                f"{sorted(_LAYER_TYPE_TO_RATIO)}. Refusing to guess the layer's "
                 f"structure -- see vllm_neuron/model/deepseek_v4/config.py"
             )
-        expected = (
-            AttentionKind.SLIDING_WINDOW if ratio == 0 else AttentionKind.COMPRESSED
-        )
-        if kind is not expected:
+
+        if raw_type == _SLIDING_LAYER_TYPE:
+            # No compression, and upstream carries no rate entry for it. A config
+            # that supplies one is describing something this code does not model.
+            if raw_type in rates and rates[raw_type] != 0:
+                raise DeepseekV4ConfigError(
+                    f"'compress_rates' gives {raw_type!r} a ratio of "
+                    f"{rates[raw_type]!r}, but that layer type means "
+                    f"'uncompressed sliding window'"
+                )
+            ratios.append(0)
+            continue
+
+        ratio = rates.get(raw_type, _LAYER_TYPE_TO_RATIO[raw_type])
+        if not isinstance(ratio, int) or isinstance(ratio, bool):
             raise DeepseekV4ConfigError(
-                f"layer {index} is inconsistent: 'layer_types' says {raw_type!r} "
-                f"but 'compress_rates' is {ratio} (which implies "
-                f"{expected.value}). The config's two encodings of the same "
-                f"fact disagree"
+                f"'compress_rates'[{raw_type!r}] must be an integer, got {ratio!r}"
             )
-    return list(compress_rates)
+        ratios.append(ratio)
+
+    _validate_ratios(ratios, num_hidden_layers, "'layer_types' + 'compress_rates'")
+    return ratios
 
 
 def _extract_compress_ratios(config: Any, num_hidden_layers: int) -> list[int]:
@@ -278,21 +337,19 @@ def _extract_compress_ratios(config: Any, num_hidden_layers: int) -> list[int]:
         _validate_ratios(from_raw, num_hidden_layers, "'compress_ratios'")
 
     from_normalized: list[int] | None = None
-    if layer_types is not None or compress_rates is not None:
-        if layer_types is None or compress_rates is None:
-            present, absent = (
-                ("layer_types", "compress_rates")
-                if layer_types is not None
-                else ("compress_rates", "layer_types")
-            )
-            raise DeepseekV4ConfigError(
-                f"DeepSeek-V4 config provides {present!r} without {absent!r}; the "
-                f"normalized form requires both"
-            )
+    if layer_types is not None:
+        # ``compress_rates`` may legitimately be absent: upstream defaults it, and
+        # the per-type fallback in ``_LAYER_TYPE_TO_RATIO`` matches that default.
+        # ``layer_types`` is the field that cannot be defaulted, because it is the
+        # only per-layer signal.
         from_normalized = _ratios_from_layer_types(
-            list(layer_types),
-            _as_int_list(compress_rates, "compress_rates"),
-            num_hidden_layers,
+            list(layer_types), compress_rates, num_hidden_layers
+        )
+    elif compress_rates is not None and raw_ratios is None:
+        raise DeepseekV4ConfigError(
+            "DeepSeek-V4 config provides 'compress_rates' without 'layer_types'; "
+            "'compress_rates' is keyed by layer type and says nothing about which "
+            "layer is which, so per-layer structure cannot be determined"
         )
 
     if from_raw is None and from_normalized is None:
@@ -320,20 +377,7 @@ def normalize_layer_specs(config: Any) -> tuple[LayerSpec, ...]:
     num_hidden_layers = _require_positive_int(config, "num_hidden_layers")
     ratios = _extract_compress_ratios(config, num_hidden_layers)
 
-    num_hash_layers = _get(config, "num_hash_layers", 0)
-    if (
-        not isinstance(num_hash_layers, int)
-        or isinstance(num_hash_layers, bool)
-        or num_hash_layers < 0
-    ):
-        raise DeepseekV4ConfigError(
-            f"'num_hash_layers' must be a non-negative integer, got {num_hash_layers!r}"
-        )
-    if num_hash_layers > num_hidden_layers:
-        raise DeepseekV4ConfigError(
-            f"'num_hash_layers' ({num_hash_layers}) exceeds 'num_hidden_layers' "
-            f"({num_hidden_layers})"
-        )
+    mlp_kinds = _extract_mlp_kinds(config, num_hidden_layers)
 
     return tuple(
         LayerSpec(
@@ -344,10 +388,89 @@ def normalize_layer_specs(config: Any) -> tuple[LayerSpec, ...]:
                 else AttentionKind.COMPRESSED
             ),
             compress_ratio=ratio,
-            mlp=MLPKind.HASH_MOE if index < num_hash_layers else MLPKind.ROUTED_MOE,
+            mlp=mlp_kinds[index],
         )
         for index, ratio in enumerate(ratios)
     )
+
+
+def _extract_mlp_kinds(config: Any, num_hidden_layers: int) -> list[MLPKind]:
+    """Per-layer feed-forward structure.
+
+    Two forms, mirroring the attention side:
+
+    * ``mlp_layer_types`` -- one ``"hash_moe"`` / ``"moe"`` entry per layer. This
+      is what a config loaded through ``DeepseekV4Config`` exposes, and it is
+      authoritative.
+    * ``num_hash_layers`` -- the legacy scalar, meaning "the first *n* layers are
+      hash-MoE". Upstream consumes this kwarg during ``__post_init__`` and folds
+      it into ``mlp_layer_types``, so it survives only on raw checkpoint JSON.
+
+    Attention and MLP structure are **independent**: a layer's compression ratio
+    does not determine whether it is hash- or routed-MoE. Both lists are read
+    separately rather than one being derived from the other.
+    """
+    mlp_layer_types = _get(config, "mlp_layer_types", None)
+    num_hash_layers = _get(config, "num_hash_layers", None)
+
+    from_types: list[MLPKind] | None = None
+    if mlp_layer_types is not None:
+        entries = list(mlp_layer_types)
+        if len(entries) != num_hidden_layers:
+            raise DeepseekV4ConfigError(
+                f"'mlp_layer_types' has {len(entries)} entries but "
+                f"num_hidden_layers is {num_hidden_layers}"
+            )
+        from_types = []
+        for index, raw in enumerate(entries):
+            kind = _MLP_TYPE_KINDS.get(raw) if isinstance(raw, str) else None
+            if kind is None:
+                raise DeepseekV4ConfigError(
+                    f"'mlp_layer_types'[{index}] is {raw!r}, which this "
+                    f"implementation does not recognize; known values are "
+                    f"{sorted(_MLP_TYPE_KINDS)}"
+                )
+            from_types.append(kind)
+
+    from_count: list[MLPKind] | None = None
+    if num_hash_layers is not None:
+        if (
+            not isinstance(num_hash_layers, int)
+            or isinstance(num_hash_layers, bool)
+            or num_hash_layers < 0
+        ):
+            raise DeepseekV4ConfigError(
+                f"'num_hash_layers' must be a non-negative integer, got "
+                f"{num_hash_layers!r}"
+            )
+        if num_hash_layers > num_hidden_layers:
+            raise DeepseekV4ConfigError(
+                f"'num_hash_layers' ({num_hash_layers}) exceeds 'num_hidden_layers' "
+                f"({num_hidden_layers})"
+            )
+        from_count = [
+            MLPKind.HASH_MOE if i < num_hash_layers else MLPKind.ROUTED_MOE
+            for i in range(num_hidden_layers)
+        ]
+
+    if from_types is not None and from_count is not None and from_types != from_count:
+        mismatches = [
+            i for i, (a, b) in enumerate(zip(from_types, from_count)) if a != b
+        ]
+        raise DeepseekV4ConfigError(
+            f"DeepSeek-V4 config carries both 'mlp_layer_types' and "
+            f"'num_hash_layers', and they disagree at layer(s) {mismatches[:8]}; "
+            f"refusing to choose between them"
+        )
+
+    if from_types is not None:
+        return from_types
+    if from_count is not None:
+        return from_count
+    # Neither form present: no hash-MoE layers. Unlike the attention side this is
+    # a safe default rather than an error -- "no layer uses hash routing" is a
+    # coherent model, whereas "no layer has a compression ratio" is not.
+    return [MLPKind.ROUTED_MOE] * num_hidden_layers
 
 
 def _validate_unsupported_variants(config: Any) -> None:

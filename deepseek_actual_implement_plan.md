@@ -36,29 +36,68 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 
 | Item | Phase | State |
 |---|---|---|
-| Version pins moved to vLLM 0.26 / `0.26.0.1.0.0` / `transformers>=5.5.3` | **P0.1** | **done** — pre-bump state preserved at commit `be0def6` |
-| Patch registry, phases, guards, tripwires | P0.2 | **built**, validated against **0.21** — `VALIDATED_VLLM_VERSION` stays `0.21.0` until tripwires pass on a real 0.26 tree |
+| Version pins moved to vLLM 0.26 / `0.26.0.1.0.0` / `transformers>=5.5.3` | **P0.1** | **done** — pre-bump state preserved at commit `be0def6`; transformers ceiling since narrowed to `<5.16` (the version actually exercised) |
+| Patch registry, phases, guards, tripwires | **P0.2** | **done** — all 4 tripwires execute clean against an installed **vLLM 0.26.0**; `VALIDATED_VLLM_VERSION` bumped to `0.26.0` and the gate is now automated |
 | Bare-interpreter test harness | — | **built** — `test/unit/conftest.py` loads vllm-free modules by path |
-| **Config normalization + validation** (`model/deepseek_v4/config.py`) | **P3a.1** | **done** — 31 tests |
+| **`InputBatch` construction re-sync** (`vllm/worker/input_batch_params.py`) | **P0.3.1** | **done** — 10 tests incl. a real heterogeneous `InputBatch` (SWA + 512-d MLA + Full) |
+| **Ported-surface guards** (`_update_states`, `_update_after_schedule`) | **P0.3.2** | **done** — both ports verified field-by-field against 0.26 and guarded by tests |
+| **DI rejected loudly** (`vllm/di_support.py`) | **P0.4** | **done** — 9 tests; rejection fires on the import path *and* at config time |
+| **Config normalization + validation** (`model/deepseek_v4/config.py`) | **P3a.1** | **done and oracle-verified** — 33 unit tests + 12 against the real `DeepseekV4Config` (Transformers 5.15.0). Three assumptions were wrong and are now corrected; see below |
 | **Dense-CSA bound + admission guard** (`model/deepseek_v4/dense_csa.py`) | **P5** | **arithmetic done** — 40 tests; compressor constants still required as inputs |
 | **Per-rank memory accounting model** (`model/memory_budget.py`) | **P7a** | **done** — 32 tests; needs GPT-OSS calibration to pass its gate |
-| Everything else | P0.2–P9 | environment-blocked (see below) |
+| Encoder-decoder cache sizing risk (R1) | **P0.3** | **mitigated** — rejected before block-table construction until the runner grows `max_encoder_len` |
+| Kernel/page block-size assumption (R2) | **P1 prerequisite** | **settled for the current backend** — QKV scatter and segmented gather address the page block directly; equality is guarded |
+| Upstream heterogeneous lifecycle registration | **P1.1** | **done** — platform hook validates real MLA/c4/c128/SWA/hidden-state/R-SWA specs have upstream managers |
+| Single-tensor latent MLA allocation | **P1.2** | **done in runner** — compressed physical shape uses `storage_block_size`; no dummy V tensor |
+| Prefix/speculative feature guards | **P1.6** | **rejection done** — DeepSeek-V4 rejects both at configuration time; successful lifecycle semantics remain backlog |
+| 512-d portable MLA reference | **P2.a** | **partial** — fp32-oracle prefill/decode math landed; full projection/RoPE/cache-composition fixture remains |
+| Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — oracle-backed component math landed; decoder/model integration remains |
+| Pinned compressor geometry | **P5** | **derived** — Transformers 5.15 complete-window emission proves c4's default bound is 2051 total tokens; runtime request wiring remains |
+| Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
 
-Suite: **171 passed, 5 skipped**, no torch/vllm. New modules are mutation-checked — deliberately
-breaking the bound formula, the admission rule, and the streaming-peak formula each produced failures.
+**P3a.1's three corrected assumptions.** The config normalizer had been written without a Transformers
+5.x install to read; all three of its guesses were wrong, and all three passed its hand-built unit
+tests. Recorded because it is the clearest available argument for oracle tests over fixture tests:
 
-**Why P5 and P7a landed before P0–P2.** P0.2, P1, P2 all need a Linux box with `vllm==0.26.0` or a
-Trn2 instance, and neither exists on the development machine. The three items above are the critical
-path's only environment-independent work: config normalization is data-shape logic, the CSA bound is
-integer arithmetic, and weight accounting reads safetensors headers. All three were written
-dependency-free and tested on a bare interpreter, which is the intended use of the local tier — not a
-reordering. Their *dependent* work is untouched: P5's derivation still needs the pinned compressor
-constants, P7a still needs calibration against a measured GPT-OSS peak, and P3a's remaining steps
-(weight mapping, mHC, compressor, MLA, MoE, decode) all need torch.
+| Assumed | Actually |
+|---|---|
+| `layer_types` spelling `compressed_attention` | `compressed_sparse_attention` (c4) and `heavily_compressed_attention` (c128); `sliding_attention` was right |
+| `compress_rates` is a per-layer list | a **dict keyed by layer type** — different length, different meaning. Read positionally it yields silently wrong ratios from layer 2 on |
+| `num_hash_layers` selects hash-MoE layers | it is a **legacy kwarg upstream consumes** in `__post_init__`; `mlp_layer_types` is the live field. Same for `compress_ratios` |
+
+The strict-raise design held: the vocabulary error would have failed loudly at startup rather than
+mis-typing layers. The `compress_rates` shape error would **not** have — it was the dangerous one.
+
+Also established, and worth carrying into P3b: **attention and MLP structure are independent lists.**
+In the default V4 config, layers 0–2 are `hash_moe` *and* `heavily_compressed_attention` — so hash-MoE
+layers are **not** the sliding-window layers, contrary to this plan's earlier "SWA + hash-MoE (ratio 0,
+layers 0–2)" phrasing in P3b. A test pins the independence so it cannot be re-derived by inference.
+
+Suite: **248 passed, 4 skipped** — the bare tier remains dependency-free; the component tier uses
+torch, and the `test/vllm_neuron/` tier runs against a real vLLM 0.26.0 and a real
+`DeepseekV4Config`. The `InputBatch` tests provide an explicit CPU `DeviceConfig`, so they no longer
+depend on `VLLM_NEURON_CPU_MODE` merely to construct the fixture. New modules are mutation-checked —
+deliberately breaking the bound formula, the admission rule, the streaming-peak formula, the
+encoder-only skip, and the per-group block-count derivation each produced failures.
+
+**P0's development gate is met except for its T3 clause.** Deps resolve, imports smoke-test, every
+tripwire passes at 0.26, `InputBatch` and the scheduler ports are re-synced, and DI is rejected at
+configuration time. What is *not* met, and cannot be here, is "GPT-OSS and Qwen3-VL serve at **T3**
+with acceptable logit drift" — that needs Trn2. P1 is unblocked on everything except that
+regression evidence.
+
+**Why P5 and P7a landed before P1–P2.** They were implemented while the original development
+environment lacked the dependencies required by P1/P2. That blocker has since been removed: the
+current Linux/Python 3.12 environment supports T0–T2, so P1, P2.a–P2.c, and the local portions of
+P3–P5 are now actionable in critical-path order. The pinned Transformers implementation has since
+settled P5's emission constants, but runtime admission wiring remains. P7a still needs calibration
+against a measured GPT-OSS peak, and P3a still needs weight mapping, decoder/model integration, and
+one-token execution despite its portable component primitives now existing.
 
 **What the two new modules deliberately refuse to do.** `dense_csa.CompressorGeometry` has no default
-kernel width, stride, or offset — a defaulted constant would yield a plausible bound that had never
-been derived, which is precisely the ~2048-token trap the plan warns against. `memory_budget` marks
+kernel width, stride, or offset. `geometry_from_config` is the sole convenience constructor and reads
+the pinned Transformers compression-rate mapping; the default c4 complete-window bound is 2051
+tokens, not an assumed 2048. `memory_budget` marks
 every line `EXACT` or `ESTIMATED`, and `MemoryBudget` exposes no scalar total, so a modelled range can
 never be quoted as a measurement; `fits_in()` returns `None` when the range straddles capacity, which
 is the signal to run P7b rather than to guess.
@@ -69,11 +108,11 @@ Verified against the working tree, not assumed:
 
 | Fact | Evidence |
 |---|---|
-| Pin is `vllm==0.21.0`, package `0.21.0.1.0.0` | `requirements/core.txt:6`, `pyproject.toml:10` |
-| Patch registry **already built** — phases, guards, tripwires | `vllm_neuron/vllm/patches/{registry,guards,tripwires,node_topology}.py`, uncommitted |
-| Guards are validated against **0.21**, not 0.26 | `patches/guards.py:39` `VALIDATED_VLLM_VERSION = "0.21.0"` |
-| Test harness **bootstrapped**, small | `test/unit/…`, `test/vllm_neuron/test_upstream_compat.py`, uncommitted |
-| `InputBatch` constructed in one place | `neuron_model_runner.py:7658` |
+| ~~Pin is `vllm==0.21.0`~~ → now `vllm==0.26.0`, package `0.26.0.1.0.0` | `requirements/core.txt:6`, `pyproject.toml:10` |
+| Patch registry **already built** — phases, guards, tripwires | `vllm_neuron/vllm/patches/{registry,guards,tripwires,node_topology}.py` |
+| ~~Guards validated against 0.21~~ → **validated against 0.26.0**, tripwires executed | `patches/guards.py` `VALIDATED_VLLM_VERSION = "0.26.0"` |
+| Test harness bootstrapped | `test/unit/…`, `test/vllm_neuron/…` |
+| ~~`InputBatch` constructed in one place~~ → derivation extracted | `vllm/worker/input_batch_params.py` |
 | `initialize_kv_cache` rejects non-Full/SWA specs | `neuron_model_runner.py:7625`, raises at `:7767`, `:7778` |
 | 512-d attention: CTE falls back to torch, segmented **raises** | `attention_cte.py:16,40`; `attention_segmented_cte.py:36,440,596` |
 | Synthetic model exists and is env-gated | `model/synthetic/`, `model/registry.py:29-35` |
@@ -109,22 +148,45 @@ load, or run too slowly to matter.
 
 ### Where these tiers can actually run
 
-The development machine this plan was written on is **macOS with no Neuron hardware, and currently no
-`vllm`, `torch`, or `pytest` installed**. That is not a footnote — it decides which phases can be
-worked locally at all:
+**This table was re-measured, and the earlier version of it was wrong.** The plan was originally
+written against a macOS box with no `vllm`, `torch`, or `pytest`. The current development machine is
+**Linux (Debian, Python 3.13) with `torch==2.11.0+cu130`, `vllm==0.26.0` and `transformers==5.15.0`
+already installed in `.venv`**, no CUDA device and no Neuron hardware. That difference is what
+unblocked P0.2–P0.4.
 
-| Tier | Available locally? | Needs |
+The environment has since been rebuilt on **Python 3.12.13** (`.venv`, with the previous 3.13 tree
+preserved at `.venv313-backup`) specifically to clear the `neuronx-cc` ABI gap. Current state:
+`torch 2.11.0`, `vllm 0.26.0`, `transformers 5.15.0`, `nki 0.5.0`, `neuronx-cc 2.26.6360.0`.
+
+| Tier | Available locally? | Evidence / blocker |
 |---|---|---|
-| **T0-bare** — dependency-free Python (guards, registry, config normalization, bound arithmetic) | **yes** | pytest only |
-| **T0-full** — CPU mode with torch + vllm | **no** | Linux + `vllm==0.26.0` + torch install |
-| **T1** simulator | **no** | Linux |
-| **T2** CPU compilation | **no** | Linux + Neuron compiler |
-| **T3** on-device | **no** | Trn2 instance |
+| **T0-bare** — dependency-free Python | **yes** | pytest only |
+| **T0-full** — CPU mode with torch + vllm | **yes** | `vllm_neuron.functional` and `NeuronModelRunner` both import (`NEURON_PLATFORM_TARGET_OVERRIDE=trn2` required) |
+| **T1** simulator | **yes** | `nki.simulator.simulate_kernel` imports |
+| **T2** CPU compilation | **yes** | `neuronx-cc 2.26.6360.0` on the PATH |
+| **T3** on-device | **no** | Trn2 instance — the only remaining hardware gate |
 
-Consequence: **P0, P1, P2, P6, P7b, P8, and P9 cannot be completed on the development machine.** They
-need a Linux CI/dev box for T0-full/T1/T2 and a Trn2 instance for T3. Work that *is* local is the
-dependency-free tier — which the existing `test/unit/conftest.py` was already built to serve, loading
-vllm-free modules straight from their file paths.
+Four practical notes, each of which cost time to discover:
+
+- **`nki` must come from the Neuron index.** PyPI's `nki` is a placeholder whose `__init__` raises
+  `ImportError("WRONG PACKAGE...")`. Install with
+  `--index-url https://pip.repos.neuron.amazonaws.com --index-strategy unsafe-best-match`. Passing
+  `--extra-index-url` silently resolves the stub instead.
+- **`nkilib` ships inside `neuronx-cc`** (884 entries in the wheel), not as its own package — and the
+  published `vllm-neuron` declares neither `nki` nor `nkilib`, so this is invisible from the
+  requirements files. `neuronx-cc` publishes `cp310`/`cp311`/`cp312` wheels only, which is the whole
+  reason for the 3.12 pin.
+- **`neuronx-cc` downgrades `networkx` to 2.8.8.** Noted in case a later dependency needs 3.x.
+- **A CUDA box is a *third* environment.** P4's oracle table names "GPU reference capture" for the
+  fused MLA path and full-layer logits. The dev machine has an RTX 3080 Ti (12 GB, sm_86) — ample for
+  P4's tiny configs, but the installed cu130 torch cannot drive driver 550, and upstream's
+  tilelang/fused paths may require Hopper. Pure-PyTorch extracted oracles run locally; the fused
+  capture may not.
+
+Consequence, revised again: **only T3 is remote.** P1, P2.a–P2.c, P3, P4 (bar the fused-path
+capture), P5 and P6's T0 clause are all local work. Still needing Trn2: **P2.d, P6's T3 clause, P7b,
+P8, P9**, plus the deferred shipped-model regression. Critically, **P2.c — whether `head_dim=512`
+compiles at all, the project's largest schedule risk — no longer needs hardware.**
 
 **Design implication, not just a logistics note:** components on the critical path should be written
 dependency-free wherever the physics allows. Config normalization, layer selection, the P5 bound
@@ -167,12 +229,15 @@ v3's Workstream A in full.
 - Capture **pre-upgrade baseline logits** for GPT-OSS and Qwen3-VL. A3.3-class drift is silent; this
   baseline must exist before the pin moves or it cannot be created afterwards.
 
-### P0.2 Re-validate the existing patch registry at 0.26
-The hard part is done. What is left:
-- Bump `guards.py:39 VALIDATED_VLLM_VERSION` to `0.26.0` **only after** every tripwire passes against
-  the real 0.26 tree — the constant is the claim, not a formality.
-- Run `test/vllm_neuron/test_upstream_compat.py` against 0.26 and extend it where a startup guard can
-  only prove a necessary condition (the file already documents which those are).
+### P0.2 Re-validate the existing patch registry at 0.26 — **done**
+- ✅ `VALIDATED_VLLM_VERSION` bumped to `0.26.0`, after all 4 tripwires executed clean against the
+  installed 0.26 tree. The gate is now **automated**, not a manual ritual:
+  `test_every_registered_tripwire_passes_against_installed_vllm` runs the real tripwire bodies, and
+  `test_validated_version_matches_installed` fails the moment vLLM drifts past the validated version.
+- ✅ `test/vllm_neuron/test_upstream_compat.py` passes against 0.26. One genuine break was found and
+  fixed **in the test, not the plugin**: 0.26 made `SchedulerConfig` a pydantic model requiring
+  `max_model_len` and `is_encoder_decoder`. The plugin's actual assumption — that upstream still
+  resolves its default scheduler to the two paths in `UPSTREAM_DEFAULT_SCHEDULER_PATHS` — **holds**.
 - Finish migrating any remaining scattered patch sites in `platform.py`, `neuron_parallel_state.py`,
   `neuron_worker.py` into a registered `Phase`. Keep the phase separation — `apply_port_hold_patch()`
   must stay at import time for spawn-mode survival, all2all registration must stay inside
@@ -180,30 +245,61 @@ The hard part is done. What is left:
 - Confirm the `in_the_same_node_as` deduplication landed (`node_topology.py` exists; verify
   `neuron_worker.py:486-490` and `neuron_parallel_state.py:818-822` no longer carry duplicate bodies).
 
-### P0.3 The two real breaks that block model execution
-1. **`InputBatch` construction** (`neuron_model_runner.py:7658`). Upstream dropped `pin_memory` (now
-   module-level `PIN_MEMORY`), made `max_num_blocks_per_req` required, added `slot_mapping_modes`.
-   Add construction tests for one cache group **and for a synthetic heterogeneous multi-group
-   config** — the latter is what P1 depends on.
-2. **Re-sync the two line-for-line upstream ports.** `GPUModelRunner` moved ~1900/7900 lines and
-   `Scheduler` ~1050/2900 between the tags; both drift silently.
-   - `NeuronModelRunner._update_states` (`neuron_model_runner.py:1815-2036`) — re-diff field by
-     field, especially `scheduler_output.scheduled_cached_reqs.*` and `CachedRequestState`.
-   - `NeuronAsyncScheduler._update_after_schedule` (`core/scheduler.py:943-1023`).
-   - Comment each port with the pinned upstream revision and the intentional Neuron deltas.
+### P0.3 The two real breaks that block model execution — **done**
+1. ✅ **`InputBatch` construction.** All three predicted breaks were real: `pin_memory` removed,
+   `max_num_blocks_per_req` now required, `slot_mapping_modes` added. The per-group derivation now
+   lives in **`vllm_neuron/vllm/worker/input_batch_params.py`**, deliberately split out of the runner:
+   it needs only vLLM's cache interfaces, whereas importing the runner drags in
+   `vllm_neuron.functional → nki → nkilib`, which is unavailable without the Neuron SDK. Splitting it
+   is what makes the heterogeneous case testable *now* rather than on hardware.
 
-### P0.4 Deferred from the development gate — and what that costs
-- **The NIXL connector rewrite** (v3 §A3.1 — the pull/push split, ~15 private parent attributes).
-  Large, and DeepSeek bring-up does not need it. **Disable DI and fail loudly** at configuration time
-  rather than silently degrading.
+   Tested for one cache group and for a heterogeneous multi-group config — and the tests construct a
+   **real `InputBatch`** (SWA @16 + latent MLA @32 `head_size=512` + Full @64), because agreeing with
+   our own helper proves nothing about whether upstream accepts the result. Also covers c4/c128
+   `compress_ratio` groups coexisting, encoder-only groups being skipped without shifting later
+   indices, and the positional-alignment invariant across all four lists.
+
+2. ✅ **Both ports re-synced.** Verified field by field against 0.26: `CachedRequestData` still
+   supplies `req_ids` / `resumed_req_ids` / `new_block_ids` / `num_computed_tokens` /
+   `num_output_tokens`; `CachedRequestState` still accepts every keyword the runner passes, plus
+   `prev_num_draft_len`; `Request` still carries `is_prefill_chunk`, `num_output_placeholders`,
+   `spec_token_ids`, `num_computed_tokens`; `SchedulerOutput` still carries
+   `pending_structured_output_tokens`. **Neither port needed a code change.**
+
+   Rather than leave that as a one-off diff, `TestPortedUpstreamSurfaces` now asserts each surface,
+   including that `AsyncScheduler` still overrides `_update_after_schedule` — if upstream drops that
+   override, the Neuron port's deliberate bypass of it silently becomes meaningless.
+
+### P0.4 Deferred from the development gate — and what that costs — **rejection done**
+- **The NIXL connector rewrite** (v3 §A3.1) is deferred, and the §A3.1 diagnosis is **confirmed by
+  execution**, not inference: 0.26 exports `NixlPullConnector` / `NixlPushConnector` with separate
+  scheduler and worker classes, and `NixlConnectorWorker` — the class `NeuronNixlConnector`
+  subclasses — is gone. The module raises `ImportError` on import at 0.26.
+- ✅ **DI now fails loudly**, via `vllm_neuron/vllm/di_support.py`. Two entry points, because a
+  config-time-only guard would have missed the realistic one:
+  - **Import time.** With `kv_connector_module_path` set — the documented invocation — vLLM imports
+    the connector during `VllmConfig` *construction*, before any platform hook runs. The connector
+    now catches that `ImportError` and re-raises `UnsupportedDIConfigError` naming the missing symbol,
+    the version that removed it, and how to run without it, with the original `ImportError` chained
+    for whoever restores the port.
+  - **Config time.** `check_and_update_config` rejects unsupported connectors before the early
+    `model_config is None` return, so every configuration path is covered.
+- **Scoped deliberately to `NeuronNixlConnector`.** The Neuron decode-bench connector subclasses
+  upstream's `decode_bench_connector`, which 0.26 left intact, and still imports cleanly — blanket-
+  disabling DI would have removed a working feature on the strength of an unrelated breakage. A test
+  pins that scope.
 - v3 findings 4 and 6 (deployment-only).
 
 ### P0.5 Two distinct gates — do not conflate them
 
-**Development gate (unblocks P1).** Deps resolve; imports smoke-test; every tripwire passes at 0.26
-and `VALIDATED_VLLM_VERSION` is bumped; `InputBatch` and scheduler tests pass; GPT-OSS and Qwen3-VL
-serve at **T3** with acceptable logit drift against the P0.1 baseline. NIXL deferred, DI rejected at
-config time. No DeepSeek code exists yet.
+**Development gate (unblocks P1).** Deps resolve ✅; imports smoke-test ✅; every tripwire passes at
+0.26 and `VALIDATED_VLLM_VERSION` is bumped ✅; `InputBatch` and scheduler tests pass ✅; NIXL
+deferred and DI rejected at config time ✅; **GPT-OSS and Qwen3-VL serve at T3 with acceptable logit
+drift against the P0.1 baseline — outstanding, needs Trn2.**
+
+That last clause is the whole of what remains, and it is not a formality: it is the only item that
+would catch a 0.26 regression in a *supported* model, which is exactly the risk the pin move
+introduces. P1 design work can proceed in parallel, but P0 is not closed until it runs.
 
 **Release gate (publishing `0.26.0.1.0.0` as a normal replacement for 0.21).** Everything above,
 **plus NIXL restored and 1P1D passing** — or the artifact is published as explicitly
@@ -357,8 +453,10 @@ layers, following `docs/model-dev/onboarding-models.md:864-915` (random model, `
 *Gate: one decoded token at **T0**.*
 
 ### P3b — tiny multi-layer model, all structural variants
-Extend to a model containing at minimum: an **SWA + hash-MoE** layer (ratio 0, layers 0–2 semantics),
-a **c4 + routed-MoE** layer, and a **c128 + routed-MoE** layer. This is what makes P1's heterogeneous
+Extend to a model containing at minimum: a **c128 + hash-MoE** layer (the default V4 layers 0–2
+combination), an **SWA layer**, a **c4 + routed-MoE** layer, and a **c128 + routed-MoE** layer.
+Attention and MLP kinds are independently selected; no implementation may infer one from the other.
+This is what makes P1's heterogeneous
 cache real — until three different cache layouts coexist in one model, the heterogeneity is
 hypothetical.
 

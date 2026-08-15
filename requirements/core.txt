@@ -8,8 +8,14 @@ vllm==0.26.0
 # Pin <0.137: 0.137's `_IncludedRouter` breaks prometheus-fastapi-instrumentator
 fastapi[standard]>=0.115.0,<0.137
 
-# Force transformers v5 upgrade
-transformers>=5.5.3,<6.0.0
+# Force transformers v5 upgrade.
+# Floor: 5.5.3 is vLLM 0.24+'s requirement.
+# Ceiling: 5.15.0 is the newest version this plugin has actually been exercised
+# against (import + test/vllm_neuron compatibility suite at vLLM 0.26.0). An
+# open <6.0.0 range would let a minor release change config normalization or
+# model defaults with no signal -- the drift the patch tripwires exist to catch.
+# Raise the ceiling deliberately, after re-running that suite.
+transformers>=5.5.3,<5.16
 
 # Prometheus metrics
 prometheus_client

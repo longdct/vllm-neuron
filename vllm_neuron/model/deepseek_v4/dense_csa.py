@@ -45,6 +45,7 @@ __all__ = [
     "DenseCsaUnsupportedError",
     "check_admission",
     "eligible_entries",
+    "geometry_from_config",
     "max_dense_csa_tokens",
     "model_bound",
 ]
@@ -107,6 +108,37 @@ class CompressorGeometry:
     @property
     def is_sliding_window(self) -> bool:
         return self.compress_ratio == 0
+
+
+def geometry_from_config(config, layer_type: str) -> CompressorGeometry:
+    """Derive entry-emission geometry from a pinned DeepSeek-V4 config.
+
+    Transformers 5.15 emits one entry after each complete ``compress_rate``
+    group and carries the incomplete suffix. CSA combines two adjacent groups
+    when computing an entry, but that overlap does not delay emission: its
+    eligible-entry cadence remains one per c4 group.
+    """
+    if layer_type == "sliding_attention":
+        return CompressorGeometry(0, 0, 0, 0, 0)
+    rates = getattr(config, "compress_rates", None)
+    if not isinstance(rates, dict) or layer_type not in rates:
+        raise DenseCsaUnsupportedError(
+            f"no pinned compressor rate for layer type {layer_type!r}"
+        )
+    rate = rates[layer_type]
+    if not isinstance(rate, int) or isinstance(rate, bool) or rate < 1:
+        raise DenseCsaUnsupportedError(
+            f"invalid compressor rate {rate!r} for layer type {layer_type!r}"
+        )
+    return CompressorGeometry(
+        compress_ratio=rate,
+        stride=rate,
+        # Entry-emission completion width. CSA's value computation has a
+        # 2*rate receptive field but still emits every complete rate-token group.
+        kernel_width=rate,
+        initial_offset=0,
+        reserved_entries=0,
+    )
 
 
 def eligible_entries(

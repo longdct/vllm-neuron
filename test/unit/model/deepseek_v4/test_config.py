@@ -20,15 +20,25 @@ import pytest
 # the normalizer's handling of the shape, not the checkpoint's contents.
 RATIOS = [0, 0, 4, 128, 4, 128, 0]
 
-LAYER_TYPES = [
-    "sliding_attention",
-    "sliding_attention",
-    "compressed_attention",
-    "compressed_attention",
-    "compressed_attention",
-    "compressed_attention",
-    "sliding_attention",
-]
+#: The real vocabulary, verified against Transformers 5.15.0
+#: (``DEEPSEEK_V4_LAYER_TYPES`` / ``_COMPRESS_RATIO_TO_LAYER_TYPE``). Note that
+#: the compressed types encode their ratio in the *name* -- there is no single
+#: "compressed_attention" spelling -- which is why this list is derived from
+#: RATIOS rather than written out independently.
+_RATIO_TO_LAYER_TYPE = {
+    0: "sliding_attention",
+    4: "compressed_sparse_attention",
+    128: "heavily_compressed_attention",
+}
+
+LAYER_TYPES = [_RATIO_TO_LAYER_TYPE[r] for r in RATIOS]
+
+#: Keyed by layer *type*, not by layer -- 2 entries for 7 layers. Matches
+#: upstream's ``default_compress_rates``.
+COMPRESS_RATES = {
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
 
 
 def base_fields(**overrides):
@@ -61,9 +71,12 @@ def raw_form(**overrides):
 
 def normalized_form(**overrides):
     """Normalized Transformers form: ``layer_types`` + ``compress_rates``."""
-    return base_fields(
-        layer_types=list(LAYER_TYPES), compress_rates=list(RATIOS), **overrides
-    )
+    fields = {
+        "layer_types": list(LAYER_TYPES),
+        "compress_rates": dict(COMPRESS_RATES),
+    }
+    fields.update(overrides)
+    return base_fields(**fields)
 
 
 class TestFormEquivalence:
@@ -92,7 +105,7 @@ class TestFormEquivalence:
         config = base_fields(
             compress_ratios=list(RATIOS),
             layer_types=list(LAYER_TYPES),
-            compress_rates=list(RATIOS),
+            compress_rates=dict(COMPRESS_RATES),
         )
         assert deepseek_v4_config.normalize_layer_specs(config) == (
             deepseek_v4_config.normalize_layer_specs(raw_form())
@@ -160,12 +173,52 @@ class TestUnrecognizedForms:
         with pytest.raises(deepseek_v4_config.DeepseekV4ConfigError, match="neither"):
             deepseek_v4_config.normalize_layer_specs(base_fields())
 
-    @pytest.mark.parametrize("dropped", ["layer_types", "compress_rates"])
-    def test_half_of_the_normalized_form_raises(self, deepseek_v4_config, dropped):
+    def test_compress_rates_without_layer_types_raises(self, deepseek_v4_config):
+        """``compress_rates`` alone cannot say which layer is which.
+
+        It is keyed by layer *type*, so on its own it carries no per-layer
+        information at all -- two entries for however many layers.
+        """
         config = normalized_form()
-        del config[dropped]
+        del config["layer_types"]
         with pytest.raises(
-            deepseek_v4_config.DeepseekV4ConfigError, match="requires both"
+            deepseek_v4_config.DeepseekV4ConfigError, match="without 'layer_types'"
+        ):
+            deepseek_v4_config.normalize_layer_specs(config)
+
+    def test_layer_types_without_compress_rates_is_valid(self, deepseek_v4_config):
+        """The reverse is fine: the ratios default per type.
+
+        Upstream defaults ``compress_rates`` in ``__post_init__``, and the
+        per-type fallback here matches those defaults -- so a config carrying only
+        ``layer_types`` is complete, not half-specified.
+        """
+        config = normalized_form()
+        del config["compress_rates"]
+        assert deepseek_v4_config.normalize_layer_specs(config) == (
+            deepseek_v4_config.normalize_layer_specs(normalized_form())
+        )
+
+    def test_compress_rates_override_is_read_then_range_checked(
+        self, deepseek_v4_config
+    ):
+        """The dict wins over the per-type fallback -- and is still range-checked.
+
+        Upstream permits retuning a type's ratio (``compress_rate_csa`` folds in
+        this way), so the value genuinely comes from the dict rather than the
+        fallback table. But this implementation only has cache layouts for
+        0/4/128, so a retuned ratio must be *rejected*, not silently laid out as
+        if it were the default. Proving both halves at once: the override is
+        read (or the error would not mention 8) and then refused.
+        """
+        config = normalized_form(
+            compress_rates={
+                "compressed_sparse_attention": 8,
+                "heavily_compressed_attention": 128,
+            }
+        )
+        with pytest.raises(
+            deepseek_v4_config.DeepseekV4ConfigError, match=r"unsupported.*\[8\]"
         ):
             deepseek_v4_config.normalize_layer_specs(config)
 
@@ -188,21 +241,43 @@ class TestUnrecognizedForms:
         config = base_fields(
             compress_ratios=conflicting,
             layer_types=list(LAYER_TYPES),
-            compress_rates=list(RATIOS),
+            compress_rates=dict(COMPRESS_RATES),
         )
         with pytest.raises(
             deepseek_v4_config.DeepseekV4ConfigError, match="disagree"
         ):
             deepseek_v4_config.normalize_layer_specs(config)
 
-    def test_layer_type_inconsistent_with_its_rate_raises(self, deepseek_v4_config):
-        """The two encodings of one fact must agree."""
-        types = list(LAYER_TYPES)
-        types[0] = "compressed_attention"  # but compress_rates[0] == 0
-        config = normalized_form()
-        config["layer_types"] = types
+    def test_a_compression_ratio_for_sliding_layers_raises(self, deepseek_v4_config):
+        """``sliding_attention`` means uncompressed; a rate for it is contradictory.
+
+        This replaces an earlier test that checked ``layer_types`` against a
+        per-layer ``compress_rates`` list. That cross-check was an artifact of
+        misreading the field: ``compress_rates`` is keyed by type, so
+        ``layer_types`` is the *sole* per-layer encoding and there is no second
+        one to disagree with. The one genuine contradiction the shapes still
+        allow is a rate attached to the uncompressed type.
+        """
+        config = normalized_form(
+            compress_rates={**COMPRESS_RATES, "sliding_attention": 4}
+        )
         with pytest.raises(
-            deepseek_v4_config.DeepseekV4ConfigError, match="inconsistent"
+            deepseek_v4_config.DeepseekV4ConfigError, match="uncompressed sliding"
+        ):
+            deepseek_v4_config.normalize_layer_specs(config)
+
+    def test_compress_rates_as_a_list_raises_with_a_pointed_message(
+        self, deepseek_v4_config
+    ):
+        """The exact mistake this module previously made, now guarded.
+
+        A per-layer list is the *legacy* ``compress_ratios`` field. Accepting one
+        here would zip type-keyed values positionally against layers and yield
+        silently wrong ratios, so it raises and names the confusion.
+        """
+        config = normalized_form(compress_rates=list(RATIOS))
+        with pytest.raises(
+            deepseek_v4_config.DeepseekV4ConfigError, match="must be a mapping"
         ):
             deepseek_v4_config.normalize_layer_specs(config)
 

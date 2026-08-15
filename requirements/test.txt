@@ -1,6 +1,7 @@
 torch
 numpy
-transformers>=5.5.3,<6.0.0
+# Keep in lockstep with requirements/core.txt -- see the rationale there.
+transformers>=5.5.3,<5.16
 pytest
 pytest-cov
 pytest-forked

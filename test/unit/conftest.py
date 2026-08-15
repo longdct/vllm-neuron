@@ -103,6 +103,15 @@ def scheduler_selection() -> ModuleType:
 
 
 @pytest.fixture(scope="session")
+def di_support() -> ModuleType:
+    """The disaggregated-inference support decision, loaded without vllm."""
+    return load_neuron_module(
+        "vllm_neuron.vllm.di_support",
+        "vllm_neuron/vllm/di_support.py",
+    )
+
+
+@pytest.fixture(scope="session")
 def deepseek_v4_config() -> ModuleType:
     """The DeepSeek-V4 config normalizer, loaded without torch or vllm."""
     return load_neuron_module(

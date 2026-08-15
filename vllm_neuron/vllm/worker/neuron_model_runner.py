@@ -33,6 +33,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -47,6 +48,10 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm_neuron.vllm.worker.input_batch_params import (
+    build_input_batch_group_params,
+    mla_cache_shape,
+)
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
     KVConnectorOutput,
@@ -7644,26 +7649,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # for each attention group. These builders are responsible for creating
         # the attention metadata that kernels need during forward passes.
 
-        # Extract block sizes for each KV cache group (one per group for InputBatch)
-        block_sizes = [
-            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
-        ]
+        # Per-group InputBatch parameters. Derived by a module-level helper so the
+        # heterogeneous-group case can be tested without standing up a runner --
+        # that case is what the DeepSeek-V4 cache work depends on.
+        group_params = build_input_batch_group_params(
+            kv_cache_config,
+            self.vllm_config,
+            self.max_model_len,
+            is_encoder_decoder=self.model_config.is_encoder_decoder,
+        )
         logger.info(
-            "KV cache block_size resolved: cache_config=%s, per_group=%s",
+            "KV cache block_size resolved: cache_config=%s, per_group=%s, "
+            "max_num_blocks_per_req=%s, slot_mapping_modes=%s",
             self.vllm_config.cache_config.block_size,
-            block_sizes,
+            group_params.block_sizes,
+            group_params.max_num_blocks_per_req,
+            [mode.value for mode in group_params.slot_mapping_modes],
         )
 
-        # Initialize InputBatch with block_sizes list matching the number of KV cache groups
+        # Initialize InputBatch with per-group lists matching the KV cache groups.
+        #
+        # vLLM 0.26 notes: ``pin_memory`` is gone -- InputBatch reads the
+        # module-level ``PIN_MEMORY`` itself -- and ``max_num_blocks_per_req``
+        # became required, so it can no longer be left to a default.
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_batched_tokens,
             device=self.device,
-            pin_memory=self.pin_memory,
             vocab_size=self.vocab_size,
-            block_sizes=block_sizes,
-            kernel_block_sizes=block_sizes,
+            block_sizes=group_params.block_sizes,
+            kernel_block_sizes=group_params.kernel_block_sizes,
+            max_num_blocks_per_req=group_params.max_num_blocks_per_req,
+            slot_mapping_modes=group_params.slot_mapping_modes,
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
             # Neuron doesn't support pooling models yet
@@ -7683,8 +7701,32 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
 
+            # MLA stores one latent vector per storage position, not a K/V
+            # pair. MLAAttentionSpec subclasses FullAttentionSpec, so this must
+            # precede the conventional-attention branch.
+            if isinstance(kv_cache_spec, MLAAttentionSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    latent_shape = mla_cache_shape(kv_cache_spec, num_blocks)
+                    from vllm_neuron.envs import is_native_backend
+
+                    if is_native_backend():
+                        latent = torch.zeros(
+                            latent_shape,
+                            dtype=kv_cache_spec.dtype,
+                            device=raw_tensor.device,
+                        )
+                    else:
+                        latent = raw_tensor.view(kv_cache_spec.dtype).view(latent_shape)
+                    # Cache lists are layer-facing containers; MLA deliberately
+                    # contains one tensor rather than a dummy unused V tensor.
+                    kv_caches[layer_name] = [latent]
+                    self._kv_cache_full_tensors[layer_name] = latent
+
             # This is the case that all layers have the same kv_hidden_size.
-            if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
+            elif isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
@@ -7759,6 +7801,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     num_kv_heads = kv_cache_layer_spec.num_kv_heads
                     head_size = kv_cache_layer_spec.head_size
 
+                    if isinstance(kv_cache_layer_spec, MLAAttentionSpec):
+                        latent_shape = mla_cache_shape(kv_cache_layer_spec, num_blocks)
+                        typed_tensor = raw_tensor.view(kv_cache_layer_spec.dtype).view(
+                            latent_shape
+                        )
+                        kv_caches[layer_name] = [typed_tensor]
+                        self._kv_cache_full_tensors[layer_name] = typed_tensor
+                        continue
                     if isinstance(
                         kv_cache_layer_spec, (FullAttentionSpec, SlidingWindowSpec)
                     ):

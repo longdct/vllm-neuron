@@ -35,7 +35,13 @@ from typing import Any
 
 # Bumped by hand when the plugin is validated against a new vLLM release, so the
 # error text can name the version the guards were written against.
-VALIDATED_VLLM_VERSION = "0.21.0"
+#
+# This is a claim, not a formality: it may only move once every tripwire in
+# ``tripwires.py`` executes clean against an installed tree of that version *and*
+# ``test/vllm_neuron/test_upstream_compat.py`` passes against it. Both were run
+# against vllm 0.26.0 before this was set. ``test_validated_version_matches_installed``
+# keeps the claim honest by failing when the installed version drifts past it.
+VALIDATED_VLLM_VERSION = "0.26.0"
 
 
 class PatchError(RuntimeError):

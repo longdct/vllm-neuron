@@ -27,10 +27,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     NixlAgentMetadata,
     NixlHandshakePayload,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
-    NixlConnector,
-    NixlConnectorWorker,
-)
+try:
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.connector import (
+        NixlConnector,
+        NixlConnectorWorker,
+    )
+except ImportError as exc:  # pragma: no cover - exercised by test_di_support
+    # vLLM 0.26 removed NixlConnectorWorker, splitting the monolithic connector
+    # into NixlPullConnector / NixlPushConnector. Re-raise with the cause and a
+    # way forward: vLLM imports this module during VllmConfig construction (via
+    # kv_connector_module_path), so a bare ImportError here reaches the operator
+    # as an unexplained traceback from inside config validation, before the
+    # platform's own check_and_update_config guard can run.
+    from vllm_neuron.vllm.di_support import unsupported_nixl_connector_error
+
+    raise unsupported_nixl_connector_error() from exc
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import ReadSpec
 from vllm.logger import init_logger
 
