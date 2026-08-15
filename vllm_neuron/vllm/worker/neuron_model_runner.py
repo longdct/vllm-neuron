@@ -52,6 +52,7 @@ from vllm_neuron.vllm.worker.input_batch_params import (
     build_input_batch_group_params,
     mla_cache_shape,
 )
+from vllm_neuron.vllm.worker.kv_spec_conversion import layer_spec_to_vllm_spec
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
     KVConnectorOutput,
@@ -7878,26 +7879,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
-            # Use SlidingWindowSpec for SWA layers so HMA can create separate
-            # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
-            # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
-                spec = FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                    sliding_window=layer.sliding_window_size,
-                    attention_chunk_size=layer.chunk_size,
-                )
-            else:
-                spec = SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                    sliding_window=layer.sliding_window_size,
-                )
+            spec = layer_spec_to_vllm_spec(layer, block_size, kv_cache_dtype)
             all_kv_cache_specs[layer_name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():
