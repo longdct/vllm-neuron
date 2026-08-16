@@ -250,12 +250,13 @@ v3's Workstream A in full.
   fixed **in the test, not the plugin**: 0.26 made `SchedulerConfig` a pydantic model requiring
   `max_model_len` and `is_encoder_decoder`. The plugin's actual assumption — that upstream still
   resolves its default scheduler to the two paths in `UPSTREAM_DEFAULT_SCHEDULER_PATHS` — **holds**.
-- Finish migrating any remaining scattered patch sites in `platform.py`, `neuron_parallel_state.py`,
-  `neuron_worker.py` into a registered `Phase`. Keep the phase separation — `apply_port_hold_patch()`
-  must stay at import time for spawn-mode survival, all2all registration must stay inside
-  `check_and_update_config`.
-- Confirm the `in_the_same_node_as` deduplication landed (`node_topology.py` exists; verify
-  `neuron_worker.py:486-490` and `neuron_parallel_state.py:818-822` no longer carry duplicate bodies).
+- ✅ **Patch-site audit complete.** Zero-argument compatibility tripwires use registered phases;
+  parameterized/lifecycle patches remain at their required call sites and record application through
+  the registry. `apply_port_hold_patch()` remains at import time for spawn-mode survival, while
+  all2all registration remains inside `check_and_update_config`.
+- ✅ **`in_the_same_node_as` deduplication confirmed.** Both `neuron_worker.py` and
+  `neuron_parallel_state.py` call the single implementation in `patches/node_topology.py`; neither
+  carries a duplicate patch body.
 
 ### P0.3 The two real breaks that block model execution — **done**
 1. ✅ **`InputBatch` construction.** All three predicted breaks were real: `pin_memory` removed,
@@ -701,10 +702,11 @@ Unchanged from v3; listed so nothing is lost:
 
 ## Test and CI
 
-There is now a **partial** harness (`test/unit/`, `test/vllm_neuron/test_upstream_compat.py`,
-uncommitted) where v3 recorded none. `ci/` still does not exist despite `pyproject.toml:46-50`
-referencing it, and `.github/workflows/` holds only issue-labeling automation. Building it out
-remains part of the work.
+The local harness is complete for the implemented T0/T1 surfaces (`test/unit/` and
+`test/vllm_neuron/`) and is committed. `pyproject.toml`'s `ci/*` entry is a coverage omit pattern,
+not a promise that a `ci/` package exists. Repository-wide hosted CI policy is outside this
+DeepSeek implementation plan; the reproducible local commands and Trainium artifact requirements
+below are the gates used here.
 
 - **T0 (CPU/unit)** — config-form equivalence and validation; weight-name/shape mapping; mHC/Sinkhorn;
   compressor chunk boundaries and lifecycle; exact MoE routing; synthetic cache allocation and
