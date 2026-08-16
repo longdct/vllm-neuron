@@ -90,3 +90,58 @@ def require_weight_shape(
         raise ValueError(
             f"DeepSeek-V4 weight {name!r} has shape {loaded_shape}, expected {expected_shape}"
         )
+
+
+def load_checkpoint_weights(
+    module,
+    weights,
+    *,
+    expert_dtype: ExpertDType = "bf16",
+) -> set[str]:
+    """Load a checkpoint iterator through the mapped/fused parameter contract."""
+    torch = __import__("torch")
+    params = dict(module.named_parameters())
+    loaded_params: set[str] = set()
+    loaded_destinations: set[tuple[str, int | None]] = set()
+    source_names: set[str] = set()
+
+    for source_name, loaded_weight in weights:
+        if source_name in source_names:
+            raise ValueError(f"duplicate DeepSeek-V4 checkpoint weight {source_name!r}")
+        source_names.add(source_name)
+        mapped_name = map_checkpoint_name(source_name, expert_dtype)
+        stacked = resolve_stacked_shard(mapped_name)
+        target_name = stacked.parameter_name if stacked else mapped_name
+        shard_id = stacked.shard_id if stacked else None
+        destination = (target_name, shard_id)
+        if destination in loaded_destinations:
+            raise ValueError(
+                f"multiple DeepSeek-V4 weights map to destination {destination!r}"
+            )
+        if target_name not in params:
+            raise ValueError(
+                f"DeepSeek-V4 checkpoint weight {source_name!r} maps to missing "
+                f"parameter {target_name!r}"
+            )
+
+        parameter = params[target_name]
+        weight_loader = getattr(parameter, "weight_loader", None)
+        with torch.no_grad():
+            if stacked is not None:
+                if weight_loader is None:
+                    raise ValueError(
+                        f"fused DeepSeek-V4 parameter {target_name!r} has no shard loader"
+                    )
+                weight_loader(parameter, loaded_weight, shard_id)
+            elif weight_loader is not None:
+                weight_loader(parameter, loaded_weight)
+            else:
+                require_weight_shape(
+                    source_name,
+                    tuple(loaded_weight.shape),
+                    tuple(parameter.shape),
+                )
+                parameter.copy_(loaded_weight)
+        loaded_destinations.add(destination)
+        loaded_params.add(target_name)
+    return loaded_params

@@ -2,8 +2,11 @@
 
 import pytest
 
+torch = pytest.importorskip("torch")
+
 from vllm_neuron.model.deepseek_v4.weight_loaders import (
     StackedShard,
+    load_checkpoint_weights,
     map_checkpoint_name,
     require_weight_shape,
     resolve_stacked_shard,
@@ -80,3 +83,70 @@ def test_shape_drift_fails_before_copy():
     require_weight_shape("head.weight", (32, 16), (32, 16))
     with pytest.raises(ValueError, match=r"head\.weight.*\(31, 16\).+\(32, 16\)"):
         require_weight_shape("head.weight", (31, 16), (32, 16))
+
+
+class FakeAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fused_wqa_wkv = torch.nn.Linear(3, 4, bias=False)
+        parameter = self.fused_wqa_wkv.weight
+
+        def load_shard(target, source, shard_id):
+            target[shard_id * 2 : shard_id * 2 + 2].copy_(source)
+
+        parameter.weight_loader = load_shard
+
+
+class FakeLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = FakeAttention()
+
+
+class FakeInnerModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = torch.nn.Embedding(5, 3)
+        self.layers = torch.nn.ModuleList([FakeLayer()])
+
+
+class FakeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = FakeInnerModel()
+        self.lm_head = torch.nn.Linear(3, 5, bias=False)
+
+
+def test_loader_copies_plain_and_dispatches_fused_shards():
+    model = FakeModel()
+    embed = torch.arange(15, dtype=torch.float32).view(5, 3)
+    q = torch.full((2, 3), 2.0)
+    kv = torch.full((2, 3), 3.0)
+    loaded = load_checkpoint_weights(
+        model,
+        [
+            ("embed.weight", embed),
+            ("layers.0.attn.wq_a.weight", q),
+            ("layers.0.attn.wkv.weight", kv),
+        ],
+    )
+    assert loaded == {
+        "model.embed_tokens.weight",
+        "model.layers.0.attn.fused_wqa_wkv.weight",
+    }
+    torch.testing.assert_close(model.model.embed_tokens.weight, embed)
+    torch.testing.assert_close(model.model.layers[0].attn.fused_wqa_wkv.weight[:2], q)
+    torch.testing.assert_close(model.model.layers[0].attn.fused_wqa_wkv.weight[2:], kv)
+
+
+def test_loader_rejects_missing_target_shape_drift_and_duplicate_sources():
+    model = FakeModel()
+    with pytest.raises(ValueError, match="maps to missing parameter"):
+        load_checkpoint_weights(model, [("norm.weight", torch.ones(3))])
+    with pytest.raises(ValueError, match="has shape"):
+        load_checkpoint_weights(model, [("head.weight", torch.ones(4, 3))])
+    with pytest.raises(ValueError, match="duplicate.*head.weight"):
+        load_checkpoint_weights(
+            model,
+            [("head.weight", torch.ones(5, 3))] * 2,
+        )
