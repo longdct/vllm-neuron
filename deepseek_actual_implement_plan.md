@@ -43,7 +43,7 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | **Ported-surface guards** (`_update_states`, `_update_after_schedule`) | **P0.3.2** | **done** — both ports verified field-by-field against 0.26 and guarded by tests |
 | **DI rejected loudly** (`vllm/di_support.py`) | **P0.4** | **done** — 9 tests; rejection fires on the import path *and* at config time |
 | **Config normalization + validation** (`model/deepseek_v4/config.py`) | **P3a.1** | **done and oracle-verified** — 33 unit tests + 12 against the real `DeepseekV4Config` (Transformers 5.15.0). Three assumptions were wrong and are now corrected; see below |
-| **Dense-CSA bound + admission guard** (`model/deepseek_v4/dense_csa.py`) | **P5** | **arithmetic done** — 40 tests; compressor constants still required as inputs |
+| **Dense-CSA bound + admission guard** (`model/deepseek_v4/dense_csa.py`) | **P5** | **T0 done** — constants derived from Transformers 5.15 and max-total request admission wired |
 | **Per-rank memory accounting model** (`model/memory_budget.py`) | **P7a** | **done** — 32 tests; needs GPT-OSS calibration to pass its gate |
 | Encoder-decoder cache sizing risk (R1) | **P0.3** | **mitigated** — rejected before block-table construction until the runner grows `max_encoder_len` |
 | Kernel/page block-size assumption (R2) | **P1 prerequisite** | **settled for the current backend** — QKV scatter and segmented gather address the page block directly; equality is guarded |
@@ -51,9 +51,11 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | Single-tensor latent MLA allocation | **P1.2** | **done in runner** — compressed physical shape uses `storage_block_size`; no dummy V tensor |
 | Prefix/speculative feature guards | **P1.6** | **rejection done** — DeepSeek-V4 rejects both at configuration time; successful lifecycle semantics remain backlog |
 | Real heterogeneous lifecycle matrix | **P1.6/P1.7** | **T0 done** — vLLM managers cover allocation, continuation, decode eviction, reorder/compaction identity, completion, abort, and remapping; synthetic model declares every layout |
-| 512-d portable MLA reference | **P2.a** | **partial** — fp32-oracle prefill/decode math landed; full projection/RoPE/cache-composition fixture remains |
+| 512-d portable MLA reference | **P2.a** | **T0 done** — fp32 prefill/decode, partial/inverse RoPE, sinks, paged gathers, SWA/compressed composition, and representative buckets |
 | Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — oracle-backed component math landed; decoder/model integration remains |
 | Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — all independent attention/MLP variants, one-token decode, exact chunk invariance, and abort isolation; production loader/runner integration remains |
+| Transformers component oracles | **P4** | **partial** — config, Sinkhorn, routed selection/weights, and hash lookup match 5.15; actual compressor/MLA/full-layer fixtures remain |
+| Streaming conversion into final shards | **P7a** | **prototype done** — one source tensor and converted tensor at a time with explicit temporary peak; native FP8/FP4 layouts remain P9 |
 | Pinned compressor geometry | **P5** | **derived** — Transformers 5.15 complete-window emission proves c4's default bound is 2051 total tokens; runtime request wiring remains |
 | Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
 
