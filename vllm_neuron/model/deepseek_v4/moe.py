@@ -25,3 +25,24 @@ def hash_experts(input_ids: torch.Tensor, tid2eid: torch.Tensor) -> torch.Tensor
     if input_ids.min() < 0 or input_ids.max() >= tid2eid.shape[0]:
         raise ValueError("token id is outside tid2eid")
     return tid2eid[input_ids]
+
+
+def hash_topk(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    routed_scaling_factor: float = 1.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Hash-selected expert ids with learned gate weights from unmodified scores."""
+    if logits.shape[-1] <= 0 or logits.numel() // logits.shape[-1] != input_ids.numel():
+        raise ValueError("hash routing logits and token ids are not aligned")
+    ids = hash_experts(input_ids.reshape(-1), tid2eid).long()
+    if ids.ndim != 2 or ids.shape[0] != input_ids.numel():
+        raise ValueError("tid2eid must provide a fixed top-k row for every token")
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    if ids.numel() and ids.max() >= flat_logits.shape[-1]:
+        raise ValueError("tid2eid selects an expert outside the gate logits")
+    scores = F.softplus(flat_logits.float()).sqrt()
+    weights = scores.gather(1, ids)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    return ids, (weights * routed_scaling_factor).to(logits.dtype)

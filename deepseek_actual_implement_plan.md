@@ -58,7 +58,7 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | Independent per-layer component factory | **P3a/P3b** | **done** — c4/c128/SWA attention and hash/routed MoE resolve independently from normalized layer specs; production component classes still need integration |
 | Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — oracle-backed component math landed; decoder/model integration remains |
 | Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — all independent attention/MLP variants, one-token decode, exact chunk invariance, and abort isolation; production loader/runner integration remains |
-| Transformers component oracles | **P4** | **partial** — config, Sinkhorn, routed selection/weights, hash lookup, complete c4/c128 compressors, and shared-expert prefill/decode fallback are covered; fused MLA and full-layer fixtures remain |
+| Transformers component oracles | **P4** | **partial** — config, Sinkhorn, routed and hash selection/learned weights, complete c4/c128 compressors, and shared-expert prefill/decode fallback are covered; fused MLA and full-layer fixtures remain |
 | Streaming conversion into final shards | **P7a** | **prototype done** — one source tensor and converted tensor at a time with explicit temporary peak; native FP8/FP4 layouts remain P9 |
 | Pinned compressor geometry and request admission | **P5** | **T0 done** — Transformers 5.15 complete-window emission proves c4's 2051-token bound; `NeuronPlatform.validate_request` enforces prompt plus `max_tokens` before scheduling |
 | Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
@@ -81,7 +81,7 @@ In the default V4 config, layers 0–2 are `hash_moe` *and* `heavily_compressed_
 layers are **not** the sliding-window layers, contrary to this plan's earlier "SWA + hash-MoE (ratio 0,
 layers 0–2)" phrasing in P3b. A test pins the independence so it cannot be re-derived by inference.
 
-Suite: **312 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
+Suite: **314 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
 torch, and the `test/vllm_neuron/` tier runs against a real vLLM 0.26.0 and a real
 `DeepseekV4Config`. The `InputBatch` tests provide an explicit CPU `DeviceConfig`, so they no longer
 depend on `VLLM_NEURON_CPU_MODE` merely to construct the fixture. New modules are mutation-checked —

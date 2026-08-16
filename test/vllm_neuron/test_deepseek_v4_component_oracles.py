@@ -20,7 +20,7 @@ from vllm_neuron.model.deepseek_v4.compressor import (
     finalize_compressed_entries,
 )
 from vllm_neuron.model.deepseek_v4.mhc import sinkhorn_positive
-from vllm_neuron.model.deepseek_v4.moe import hash_experts, routed_topk
+from vllm_neuron.model.deepseek_v4.moe import hash_experts, hash_topk, routed_topk
 
 
 def tiny_config():
@@ -85,6 +85,35 @@ def test_hash_expert_ids_match_transformers_table_lookup():
     oracle.tid2eid.copy_(table)
     tokens = torch.tensor([0, 7, 31])
     assert torch.equal(hash_experts(tokens, oracle.tid2eid), oracle.tid2eid[tokens])
+
+
+def test_hash_selection_and_learned_weights_match_transformers():
+    config = tiny_config()
+    oracle = DeepseekV4HashRouter(config)
+    table = torch.tensor(
+        [[row % 4, (row + 2) % 4] for row in range(config.vocab_size)]
+    )
+    generator = torch.Generator().manual_seed(19)
+    with torch.no_grad():
+        oracle.tid2eid.copy_(table)
+        oracle.weight.copy_(torch.randn(oracle.weight.shape, generator=generator))
+    hidden = torch.randn(2, 3, config.hidden_size, generator=generator)
+    # Non-monotonic IDs pin flattening/alignment across batch and sequence.
+    input_ids = torch.tensor([[7, 0, 31], [4, 12, 1]])
+    logits, expected_weights, expected_ids = oracle(hidden, input_ids)
+    actual_ids, actual_weights = hash_topk(
+        logits,
+        input_ids,
+        oracle.tid2eid,
+        config.routed_scaling_factor,
+    )
+    assert torch.equal(actual_ids, expected_ids)
+    torch.testing.assert_close(actual_weights, expected_weights)
+
+
+def test_hash_routing_rejects_token_logit_misalignment():
+    with pytest.raises(ValueError, match="not aligned"):
+        hash_topk(torch.zeros(3, 4), torch.tensor([1, 2]), torch.zeros(8, 2))
 
 
 def test_hca_compressor_matches_extracted_transformers_math_across_chunks():
