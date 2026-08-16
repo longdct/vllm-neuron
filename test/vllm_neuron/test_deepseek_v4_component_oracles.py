@@ -12,6 +12,10 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4TopKRouter,
 )
 
+from vllm_neuron.model.deepseek_v4.compressor import (
+    compress_csa_chunk,
+    compress_hca_chunk,
+)
 from vllm_neuron.model.deepseek_v4.mhc import sinkhorn_positive
 from vllm_neuron.model.deepseek_v4.moe import hash_experts, routed_topk
 
@@ -78,3 +82,68 @@ def test_hash_expert_ids_match_transformers_table_lookup():
     oracle.tid2eid.copy_(table)
     tokens = torch.tensor([0, 7, 31])
     assert torch.equal(hash_experts(tokens, oracle.tid2eid), oracle.tid2eid[tokens])
+
+
+def test_hca_compressor_matches_extracted_transformers_math_across_chunks():
+    generator = torch.Generator().manual_seed(21)
+    ratio, head_dim = 4, 7
+    kv = torch.randn(2, 11, head_dim, generator=generator)
+    gate = torch.randn(2, 11, head_dim, generator=generator)
+    bias = torch.randn(ratio, head_dim, generator=generator)
+    usable = 8
+    windows = kv[:, :usable].view(2, 2, ratio, head_dim)
+    logits = gate[:, :usable].view_as(windows) + bias
+    expected = (windows * logits.softmax(dim=2, dtype=torch.float32)).sum(dim=2)
+
+    state = None
+    outputs = []
+    offset = 0
+    for size in (3, 2, 6):
+        output, state = compress_hca_chunk(
+            kv[:, offset : offset + size],
+            gate[:, offset : offset + size],
+            bias,
+            state,
+        )
+        outputs.append(output)
+        offset += size
+    torch.testing.assert_close(torch.cat(outputs, dim=1), expected)
+    assert state.total_tokens == 11
+    assert state.kv_carry.shape == (2, 3, head_dim)
+
+
+def test_csa_compressor_matches_extracted_transformers_overlap_math():
+    generator = torch.Generator().manual_seed(22)
+    ratio, head_dim = 4, 5
+    kv = torch.randn(1, 13, 2 * head_dim, generator=generator)
+    gate = torch.randn(1, 13, 2 * head_dim, generator=generator)
+    bias = torch.randn(ratio, 2 * head_dim, generator=generator)
+    windows = kv[:, :12].view(1, 3, ratio, 2 * head_dim)
+    logits = gate[:, :12].view_as(windows) + bias
+    combined_kv = kv.new_zeros((1, 3, 2 * ratio, head_dim))
+    combined_gate = gate.new_full((1, 3, 2 * ratio, head_dim), float("-inf"))
+    combined_kv[:, :, ratio:] = windows[..., head_dim:]
+    combined_gate[:, :, ratio:] = logits[..., head_dim:]
+    combined_kv[:, 1:, :ratio] = windows[:, :-1, :, :head_dim]
+    combined_gate[:, 1:, :ratio] = logits[:, :-1, :, :head_dim]
+    expected = (
+        combined_kv
+        * combined_gate.softmax(dim=2, dtype=torch.float32).to(combined_kv.dtype)
+    ).sum(dim=2)
+
+    state = None
+    outputs = []
+    offset = 0
+    for size in (5, 3, 5):
+        output, state = compress_csa_chunk(
+            kv[:, offset : offset + size],
+            gate[:, offset : offset + size],
+            bias,
+            state,
+        )
+        outputs.append(output)
+        offset += size
+    torch.testing.assert_close(torch.cat(outputs, dim=1), expected)
+    assert state.total_tokens == 13
+    assert state.kv_carry.shape == (1, 1, 2 * head_dim)
+    torch.testing.assert_close(state.overlap_kv, windows[:, -1, :, :head_dim])
