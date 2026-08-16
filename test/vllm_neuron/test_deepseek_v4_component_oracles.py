@@ -11,6 +11,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4CSACompressor,
     DeepseekV4HCACompressor,
     DeepseekV4HashRouter,
+    DeepseekV4HyperConnection,
     DeepseekV4TopKRouter,
 )
 
@@ -19,7 +20,11 @@ from vllm_neuron.model.deepseek_v4.compressor import (
     compress_hca_chunk,
     finalize_compressed_entries,
 )
-from vllm_neuron.model.deepseek_v4.mhc import sinkhorn_positive
+from vllm_neuron.model.deepseek_v4.mhc import (
+    apply_hyperconnection,
+    hyperconnection_reference,
+    sinkhorn_positive,
+)
 from vllm_neuron.model.deepseek_v4.moe import hash_experts, hash_topk, routed_topk
 
 
@@ -47,6 +52,43 @@ def test_sinkhorn_projection_matches_extracted_transformers_math():
         expected = expected / (expected.sum(dim=-1, keepdim=True) + eps)
         expected = expected / (expected.sum(dim=-2, keepdim=True) + eps)
     torch.testing.assert_close(sinkhorn_positive(positive, 20, eps), expected)
+
+
+def test_full_hyperconnection_matches_transformers_module():
+    config = tiny_config()
+    generator = torch.Generator().manual_seed(18)
+    oracle = DeepseekV4HyperConnection(config).eval()
+    with torch.no_grad():
+        for parameter in oracle.parameters():
+            parameter.copy_(torch.randn(parameter.shape, generator=generator) * 0.1)
+    streams = torch.randn(
+        2,
+        3,
+        config.hc_mult,
+        config.hidden_size,
+        generator=generator,
+    )
+    expected_post, expected_comb, expected_collapsed = oracle(streams)
+    post, comb, collapsed = hyperconnection_reference(
+        streams,
+        oracle.fn,
+        oracle.base,
+        oracle.scale,
+        norm_eps=config.rms_norm_eps,
+        hc_eps=config.hc_eps,
+        iterations=config.hc_sinkhorn_iters,
+    )
+    torch.testing.assert_close(post, expected_post)
+    torch.testing.assert_close(comb, expected_comb)
+    torch.testing.assert_close(collapsed, expected_collapsed)
+
+    update = torch.randn(2, 3, config.hidden_size, generator=generator)
+    expected_streams = expected_post.unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
+        expected_comb.transpose(-1, -2), streams
+    )
+    torch.testing.assert_close(
+        apply_hyperconnection(streams, update, post, comb), expected_streams
+    )
 
 
 def test_routed_moe_selection_and_weights_match_transformers():

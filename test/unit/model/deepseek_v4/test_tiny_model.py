@@ -26,6 +26,11 @@ def test_all_structural_variants_forward_and_decode(model):
     assert decoded.shape == (1, model.config.vocab_size)
     assert state.num_tokens == 5
     assert torch.isfinite(decoded).all()
+    assert model.config.hc_mult == 4
+    assert all(
+        layer.attn_hc.fn.shape[1] == 4 * model.config.hidden_size
+        for layer in model.layers
+    )
 
 
 @pytest.mark.parametrize("chunks", [(5,), (1, 4), (2, 1, 2)])

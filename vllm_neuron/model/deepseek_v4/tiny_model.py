@@ -10,7 +10,8 @@ from torch import nn
 
 from .attention import mla_attention_reference
 from .compressor import CompressorState, compress_chunk
-from .moe import routed_topk
+from .mhc import apply_hyperconnection, hyperconnection_reference
+from .moe import hash_topk, routed_topk
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,10 @@ class TinyDeepseekV4Config:
     latent_size: int = 512
     num_experts: int = 4
     topk: int = 2
+    hc_mult: int = 4
+    hc_sinkhorn_iters: int = 20
+    rms_norm_eps: float = 1e-6
+    hc_eps: float = 1e-6
     layers: tuple[TinyLayerConfig, ...] = (
         TinyLayerConfig(128, "hash_moe"),
         TinyLayerConfig(0, "routed_moe"),
@@ -69,24 +74,73 @@ class TinyMoE(nn.Module):
         self.correction_bias = nn.Parameter(torch.zeros(config.num_experts))
         self.register_buffer(
             "tid2eid",
-            torch.arange(config.vocab_size).remainder(config.num_experts)[:, None],
+            torch.stack(
+                [
+                    (torch.arange(config.vocab_size) + slot).remainder(
+                        config.num_experts
+                    )
+                    for slot in range(config.topk)
+                ],
+                dim=1,
+            ),
         )
         self.topk = config.topk
 
     def forward(self, hidden: torch.Tensor, token_id: torch.Tensor) -> torch.Tensor:
+        logits = self.gate(hidden)
         if self.kind == "hash_moe":
-            expert_id = int(self.tid2eid[token_id].reshape(-1)[0])
-            routed = self.experts[expert_id](hidden)
+            ids, weights = hash_topk(logits, token_id, self.tid2eid)
         else:
-            ids, weights = routed_topk(
-                self.gate(hidden), self.correction_bias, self.topk
-            )
-            routed = torch.zeros_like(hidden)
-            for slot in range(self.topk):
-                routed += self.experts[int(ids[0, slot])](hidden) * weights[
-                    :, slot : slot + 1
-                ]
+            ids, weights = routed_topk(logits, self.correction_bias, self.topk)
+        routed = torch.zeros_like(hidden)
+        for slot in range(self.topk):
+            routed += self.experts[int(ids[0, slot])](hidden) * weights[
+                :, slot : slot + 1
+            ]
         return routed + self.shared(hidden)
+
+
+class TinyHyperConnection(nn.Module):
+    def __init__(self, config: TinyDeepseekV4Config):
+        super().__init__()
+        hc = config.hc_mult
+        mix = (2 + hc) * hc
+        self.fn = nn.Parameter(torch.randn(mix, hc * config.hidden_size) * 0.02)
+        self.base = nn.Parameter(torch.zeros(mix))
+        self.scale = nn.Parameter(torch.ones(3))
+        self.config = config
+
+    def forward(self, streams: torch.Tensor):
+        return hyperconnection_reference(
+            streams,
+            self.fn,
+            self.base,
+            self.scale,
+            norm_eps=self.config.rms_norm_eps,
+            hc_eps=self.config.hc_eps,
+            iterations=self.config.hc_sinkhorn_iters,
+        )
+
+
+class TinyHyperHead(nn.Module):
+    def __init__(self, config: TinyDeepseekV4Config):
+        super().__init__()
+        hc = config.hc_mult
+        self.fn = nn.Parameter(torch.randn(hc, hc * config.hidden_size) * 0.02)
+        self.base = nn.Parameter(torch.zeros(hc))
+        self.scale = nn.Parameter(torch.ones(1))
+        self.config = config
+
+    def forward(self, streams: torch.Tensor) -> torch.Tensor:
+        flat = streams.flatten(start_dim=-2).float()
+        flat = flat * torch.rsqrt(
+            flat.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
+        )
+        weights = torch.sigmoid(
+            torch.nn.functional.linear(flat, self.fn.float()) * self.scale
+            + self.base
+        ) + self.config.hc_eps
+        return (weights.unsqueeze(-1) * streams).sum(dim=-2).to(streams.dtype)
 
 
 class TinyDecoderLayer(nn.Module):
@@ -102,12 +156,15 @@ class TinyDecoderLayer(nn.Module):
         )
         self.out = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.moe = TinyMoE(config, layer.mlp_kind)
+        self.attn_hc = TinyHyperConnection(config)
+        self.ffn_hc = TinyHyperConnection(config)
         width = max(1, self.ratio)
         self.register_buffer("ape", torch.ones(width) / width)
 
     def forward_token(
-        self, hidden: torch.Tensor, token_id: torch.Tensor, state: TinyLayerState
+        self, streams: torch.Tensor, token_id: torch.Tensor, state: TinyLayerState
     ) -> tuple[torch.Tensor, TinyLayerState]:
+        post, comb, hidden = self.attn_hc(streams)
         projected = self.latent(hidden)
         if self.ratio:
             emitted, compressor = compress_chunk(
@@ -128,9 +185,12 @@ class TinyDecoderLayer(nn.Module):
                 self.value_weight,
                 sliding_window=128 if self.ratio == 0 else None,
             ).view_as(hidden)
-        hidden = hidden + self.out(attended)
-        hidden = hidden + self.moe(hidden, token_id)
-        return hidden, TinyLayerState(compressor=compressor, latent=history)
+        streams = apply_hyperconnection(streams, self.out(attended), post, comb)
+        post, comb, hidden = self.ffn_hc(streams)
+        streams = apply_hyperconnection(
+            streams, self.moe(hidden, token_id), post, comb
+        )
+        return streams, TinyLayerState(compressor=compressor, latent=history)
 
 
 class TinyDeepseekV4ForCausalLM(nn.Module):
@@ -143,6 +203,7 @@ class TinyDeepseekV4ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(
             [TinyDecoderLayer(self.config, layer) for layer in self.config.layers]
         )
+        self.hyper_head = TinyHyperHead(self.config)
         self.head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
 
     def new_state(self) -> TinyModelState:
@@ -157,12 +218,13 @@ class TinyDeepseekV4ForCausalLM(nn.Module):
         logits = []
         for token_id in input_ids:
             hidden = self.embed(token_id).view(1, -1)
+            streams = hidden.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
             next_layers = []
             for layer, layer_state in zip(self.layers, state.layers):
-                hidden, layer_state = layer.forward_token(
-                    hidden, token_id.view(1), layer_state
+                streams, layer_state = layer.forward_token(
+                    streams, token_id.view(1), layer_state
                 )
                 next_layers.append(layer_state)
             state = TinyModelState(next_layers, state.num_tokens + 1)
-            logits.append(self.head(hidden))
+            logits.append(self.head(self.hyper_head(streams)))
         return torch.cat(logits, dim=0), state
