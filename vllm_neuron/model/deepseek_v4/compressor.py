@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from .attention import apply_partial_rotary
+
 
 @dataclass(frozen=True)
 class CompressorState:
@@ -21,6 +23,30 @@ class GatedCompressorState:
     overlap_kv: torch.Tensor | None = None
     overlap_gate: torch.Tensor | None = None
     total_tokens: int = 0
+
+
+def finalize_compressed_entries(
+    compressed: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply V4's weighted RMSNorm and trailing interleaved compressor RoPE."""
+    if compressed.ndim != 3 or norm_weight.shape != (compressed.shape[-1],):
+        raise ValueError("compressed entries must be [batch, entries, head_dim]")
+    if cos.shape != sin.shape or cos.shape[:-1] != compressed.shape[:-1]:
+        raise ValueError("compressor cos/sin shapes do not agree with entries")
+    normalized = compressed.float()
+    variance = normalized.square().mean(dim=-1, keepdim=True)
+    normalized = normalized * torch.rsqrt(variance + eps)
+    normalized = (normalized.to(compressed.dtype) * norm_weight).to(compressed.dtype)
+    return apply_partial_rotary(
+        normalized,
+        cos,
+        sin,
+        rope_dim=2 * cos.shape[-1],
+    )
 
 
 def _join_gated_carry(

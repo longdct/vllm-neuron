@@ -8,6 +8,8 @@ pytest.importorskip("transformers")
 
 from transformers import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4CSACompressor,
+    DeepseekV4HCACompressor,
     DeepseekV4HashRouter,
     DeepseekV4TopKRouter,
 )
@@ -15,6 +17,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
 from vllm_neuron.model.deepseek_v4.compressor import (
     compress_csa_chunk,
     compress_hca_chunk,
+    finalize_compressed_entries,
 )
 from vllm_neuron.model.deepseek_v4.mhc import sinkhorn_positive
 from vllm_neuron.model.deepseek_v4.moe import hash_experts, routed_topk
@@ -147,3 +150,107 @@ def test_csa_compressor_matches_extracted_transformers_overlap_math():
     assert state.total_tokens == 13
     assert state.kv_carry.shape == (1, 1, 2 * head_dim)
     torch.testing.assert_close(state.overlap_kv, windows[:, -1, :, :head_dim])
+
+
+def test_hca_rmsnorm_and_rope_match_actual_transformers_module():
+    config = DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        num_hidden_layers=1,
+        layer_types=["heavily_compressed_attention"],
+        mlp_layer_types=["moe"],
+        num_attention_heads=1,
+        head_dim=16,
+        q_lora_rank=8,
+        compress_rates={
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 4,
+        },
+    )
+    torch.manual_seed(23)
+    oracle = DeepseekV4HCACompressor(config).eval()
+    with torch.no_grad():
+        for parameter in oracle.parameters():
+            parameter.uniform_(-0.25, 0.25)
+    hidden = torch.randn(2, 11, config.hidden_size)
+    token_positions = torch.arange(11).expand(2, -1)
+    expected, _ = oracle(hidden, torch.empty(0), token_positions, None, 0)
+
+    kv = oracle.kv_proj(hidden)
+    gate = oracle.gate_proj(hidden)
+    reduced, state = compress_hca_chunk(kv, gate, oracle.position_bias)
+    entry_positions = torch.arange(reduced.shape[1]) * oracle.compress_rate
+    entry_positions = entry_positions.expand(hidden.shape[0], -1)
+    cos, sin = oracle.rotary_emb(
+        reduced,
+        position_ids=entry_positions,
+        layer_type=oracle.rope_layer_type,
+    )
+    actual = finalize_compressed_entries(
+        reduced,
+        oracle.kv_norm.weight,
+        oracle.kv_norm.variance_epsilon,
+        cos,
+        sin,
+    )
+    torch.testing.assert_close(actual.unsqueeze(1), expected)
+    assert state.kv_carry.shape[1] == 3
+
+
+def test_csa_full_compressed_cache_matches_actual_transformers_module():
+    config = DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        num_hidden_layers=1,
+        layer_types=["compressed_sparse_attention"],
+        mlp_layer_types=["moe"],
+        num_attention_heads=1,
+        head_dim=16,
+        q_lora_rank=8,
+        index_topk=3,
+    )
+
+    class FixedIndexer(torch.nn.Module):
+        def forward(self, hidden, q_residual, positions, cache, layer_idx):
+            batch, sequence = hidden.shape[:2]
+            return torch.zeros(
+                batch, sequence, config.index_topk, dtype=torch.long
+            )
+
+    torch.manual_seed(24)
+    oracle = DeepseekV4CSACompressor(config).eval()
+    with torch.no_grad():
+        for parameter in oracle.parameters():
+            parameter.uniform_(-0.25, 0.25)
+    oracle.indexer = FixedIndexer()
+    hidden = torch.randn(2, 13, config.hidden_size)
+    token_positions = torch.arange(13).expand(2, -1)
+    expected, _ = oracle(hidden, torch.empty(0), token_positions, None, 0)
+
+    kv = oracle.kv_proj(hidden)
+    gate = oracle.gate_proj(hidden)
+    reduced, state = compress_csa_chunk(kv, gate, oracle.position_bias)
+    entry_positions = torch.arange(reduced.shape[1]) * oracle.compress_rate
+    entry_positions = entry_positions.expand(hidden.shape[0], -1)
+    cos, sin = oracle.rotary_emb(
+        reduced,
+        position_ids=entry_positions,
+        layer_type=oracle.rope_layer_type,
+    )
+    actual = finalize_compressed_entries(
+        reduced,
+        oracle.kv_norm.weight,
+        oracle.kv_norm.variance_epsilon,
+        cos,
+        sin,
+    )
+    torch.testing.assert_close(actual.unsqueeze(1), expected)
+    assert state.kv_carry.shape[1] == 1
