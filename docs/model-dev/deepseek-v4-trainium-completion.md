@@ -1,8 +1,10 @@
 # DeepSeek-V4 Trainium completion runbook
 
-This runbook covers only gates that cannot be closed by CPU mode, the NKI
-simulator, or CPU compilation. Do not use Trainium to debug a failing local
-T0/T1/T2 gate.
+This runbook covers the gates that cannot be closed in the repository's current
+local environment. T0, the NKI simulator, backend-config lowering, exact cache
+declaration/binding, and the local regression suite are already green. Full
+FX-to-HLO/NEFF capture is also included here because the available local
+`torch_neuronx` package pins Torch 2.9 while vLLM 0.26 pins Torch 2.11.
 
 ## Required hardware and revisions
 
@@ -31,6 +33,23 @@ Every gate must retain the command, environment, complete log, bucket
 configuration, NEFF inventory and sizes, numerical outputs, comparison report,
 wall time, host peak RSS, and Neuron device peak memory. A green terminal with
 none of these artifacts does not close a gate.
+
+Before spending device time, verify the SDK environment imports the complete
+compile stack without changing the vLLM Torch pin:
+
+```bash
+python - <<'PY'
+import torch
+import torch_xla
+import torch_neuronx
+assert torch.__version__.startswith("2.11."), torch.__version__
+print(torch.__version__, torch_xla.__file__, torch_neuronx.__file__)
+PY
+```
+
+If that assertion or either import fails, stop and select a compatible Neuron
+DLAMI/DLC. Do not downgrade Torch in the vLLM 0.26 environment to make the
+compiler import: that would invalidate the compatibility and regression gates.
 
 ## Campaign 1: shipped-model regression
 
@@ -63,8 +82,9 @@ candidate side can be run, label the artifact `smoke-only` and leave P0.5 open.
 
 ## Campaign 2: 512-d MLA and tiny-model execution
 
-Use only NEFFs produced by the recorded T2 bucket matrix. For every prefill and
-decode bucket:
+First run the recorded T2 graph-capture matrix and retain its HLO, compiler log,
+NEFF, compile duration, and graph size. This closes P2.c only if every required
+prefill/decode bucket produces a NEFF. Then, for every bucket:
 
 1. Load the NEFF on Trn2.
 2. Run the stored P2 T0 input tensors.

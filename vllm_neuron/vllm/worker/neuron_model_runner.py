@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -7705,7 +7706,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             # MLA stores one latent vector per storage position, not a K/V
             # pair. MLAAttentionSpec subclasses FullAttentionSpec, so this must
             # precede the conventional-attention branch.
-            if isinstance(kv_cache_spec, MLAAttentionSpec):
+            if isinstance(kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
@@ -7802,7 +7803,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     num_kv_heads = kv_cache_layer_spec.num_kv_heads
                     head_size = kv_cache_layer_spec.head_size
 
-                    if isinstance(kv_cache_layer_spec, MLAAttentionSpec):
+                    if isinstance(
+                        kv_cache_layer_spec,
+                        (MLAAttentionSpec, SlidingWindowMLASpec),
+                    ):
                         latent_shape = mla_cache_shape(kv_cache_layer_spec, num_blocks)
                         typed_tensor = raw_tensor.view(kv_cache_layer_spec.dtype).view(
                             latent_shape

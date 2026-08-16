@@ -25,6 +25,7 @@ class TinyDeepseekV4Config:
     vocab_size: int = 64
     hidden_size: int = 32
     latent_size: int = 512
+    sliding_window: int = 128
     num_experts: int = 4
     topk: int = 2
     hc_mult: int = 4

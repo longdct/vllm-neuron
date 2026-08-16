@@ -8,6 +8,7 @@ pytest.importorskip("transformers")
 from transformers import DeepseekV4Config
 
 from vllm_neuron.model.deepseek_v4.model import DeepseekV4ForCausalLM
+from vllm_neuron.model.kv_cache import CacheKind
 
 
 def hf_config():
@@ -65,3 +66,42 @@ def test_production_namespace_loader_binds_embedding_and_head():
     assert loaded == {"model.embed_tokens.weight", "lm_head.weight"}
     torch.testing.assert_close(model.model.embed_tokens.weight, embed)
     torch.testing.assert_close(model.lm_head.weight, head)
+
+
+def test_production_model_declares_exact_heterogeneous_cache_inventory():
+    model = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    specs = model.get_kv_spec().layers
+    assert len(specs) == 10  # four SWA + three compressed + three carry caches
+    assert [spec.cache_kind for spec in specs].count(
+        CacheKind.SLIDING_WINDOW_MLA
+    ) == 4
+    assert [
+        spec.compress_ratio for spec in specs if spec.cache_kind is CacheKind.MLA
+    ] == [128, 4, 128]
+    carry = [spec for spec in specs if spec.cache_kind is CacheKind.COMPRESSOR_STATE]
+    assert [
+        (spec.block_size, spec.sliding_window_size, spec.head_size) for spec in carry
+    ] == [
+        (8, 128, 1024),
+        (4, 8, 2048),
+        (8, 128, 1024),
+    ]
+
+
+def test_production_model_strictly_binds_single_tensor_caches():
+    model = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    caches = {
+        spec.name: [torch.empty(1, dtype=spec.dtype)]
+        for spec in model.get_kv_spec().layers
+    }
+    model.bind_kv_cache(caches)
+    assert model._kv_caches == caches
+    missing = dict(caches)
+    missing.pop(next(iter(missing)))
+    with pytest.raises(ValueError, match="missing="):
+        model.bind_kv_cache(missing)
+    bad_arity = dict(caches)
+    name = next(iter(bad_arity))
+    bad_arity[name] = [torch.empty(1), torch.empty(1)]
+    with pytest.raises(ValueError, match="one latent tensor"):
+        model.bind_kv_cache(bad_arity)

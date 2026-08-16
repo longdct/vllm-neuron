@@ -47,22 +47,23 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | **Per-rank memory accounting model** (`model/memory_budget.py`) | **P7a** | **done** — 32 tests; needs GPT-OSS calibration to pass its gate |
 | Encoder-decoder cache sizing risk (R1) | **P0.3** | **mitigated** — rejected before block-table construction until the runner grows `max_encoder_len` |
 | Kernel/page block-size assumption (R2) | **P1 prerequisite** | **settled for the current backend** — QKV scatter and segmented gather address the page block directly; equality is guarded |
-| Upstream heterogeneous lifecycle registration | **P1.1** | **done** — platform hook validates real MLA/c4/c128/SWA/hidden-state/R-SWA specs have upstream managers |
+| Upstream heterogeneous lifecycle registration | **P1.1** | **done** — platform hook validates real single-tensor MLA/c4/c128/SWA/compressor-state and R-SWA specs have upstream managers |
 | Single-tensor latent MLA allocation | **P1.2** | **done in runner** — compressed physical shape uses `storage_block_size`; no dummy V tensor |
 | Prefix/speculative feature guards | **P1.6** | **rejection done** — DeepSeek-V4 rejects both at configuration time; successful lifecycle semantics remain backlog |
 | Real heterogeneous lifecycle matrix | **P1.6/P1.7** | **T0 done** — vLLM managers cover allocation, continuation, decode eviction, reorder/compaction identity, completion, abort, and remapping; synthetic model declares every layout |
 | 512-d portable MLA reference | **P2.a** | **T0 done** — fp32 prefill/decode, partial/inverse RoPE, sinks, paged gathers, SWA/compressed composition, and representative buckets |
 | 512-d NKI simulator prototype | **P2.b** | **T1 done** — causal prefill and decode execute through `nkilib`'s four-tile 512-d kernel and match the fp32 reference |
-| 512-d NKI compilation | **P2.c** | **kernel sub-gate done; phase partial** — four prefill/decode buckets compile to NKI backend configs locally in 0.47–0.58 s; full graph capture/NEFF generation is blocked in this venv by missing `torch_xla`/`torch_neuronx` and a stale `neuronx-cc` launcher shebang |
-| Checkpoint namespace and fused-shard loader | **P3a.2** | **generic loader done; model binding remains** — official mappings, FP4-vs-FP8 scales, fused shard dispatch, target/shape/duplicate rejection, copies, and loaded-parameter accounting are covered at T0 |
+| 512-d NKI compilation | **P2.c** | **kernel sub-gate done; phase partial** — four prefill/decode buckets compile to NKI backend configs locally in 0.47–0.58 s; the relocated `neuronx-cc` launcher is fixed, but full FX→HLO/NEFF generation is SDK-blocked because available `torch_neuronx` pins Torch 2.9 while vLLM 0.26 pins Torch 2.11 |
+| Checkpoint namespace and fused-shard loader | **P3a.2** | **T0 done** — official mappings, FP4-vs-FP8 scales, fused shard dispatch, target/shape/duplicate rejection, model copies, and loaded-parameter accounting are covered |
 | Independent per-layer component factory | **P3a/P3b** | **done** — c4/c128/SWA attention and hash/routed MoE resolve independently from normalized layer specs; production component classes still need integration |
-| Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — full four-stream mHC, compressor, and MoE reference math is oracle-backed; production decoder integration remains |
+| Portable mHC/compressor/MoE primitives | **P3/P4** | **T0 done** — full four-stream mHC, compressor, learned hash/routed MoE, shared experts, and their production-shaped decoder integration are oracle-backed |
 | Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — four-stream mHC at both sublayer sites, independent attention/MLP variants, hyper-head collapse, one-token decode, exact chunk invariance, and abort isolation; production runner integration remains |
-| Production-shaped CPU module hierarchy | **P3a/P3b** | **partial** — normalized HF config builds `model.embed_tokens`, four decoder variants, norm/hyper-head, `lm_head`, chunk-invariant forward/decode, and mapped loading; engine cache ownership and runner signature remain, so registry exposure is intentionally withheld |
+| Production-shaped CPU module hierarchy | **P3a/P3b** | **local integration partial** — normalized HF config builds the full named hierarchy, forward/decode, mapped loading, and exact ten-cache inventory; runner allocation and strict single-tensor binding are covered, but scheduler-metadata-driven cache I/O and graph capture remain, so registry exposure is intentionally withheld |
 | Transformers component oracles | **P4** | **partial** — config, full mHC, routed/hash learned routing, complete c4/c128 compressors, and shared-expert prefill/decode fallback are covered; fused MLA and full-layer fixtures remain |
 | Streaming conversion into final shards | **P7a** | **prototype done** — one source tensor and converted tensor at a time with explicit temporary peak; native FP8/FP4 layouts remain P9 |
 | Pinned compressor geometry and request admission | **P5** | **T0 done** — Transformers 5.15 complete-window emission proves c4's 2051-token bound; `NeuronPlatform.validate_request` enforces prompt plus `max_tokens` before scheduling |
-| Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
+| Local regression suite | **T0** | **322 passed, 6 skipped**; explicit NKI simulator gate remains **2 passed** |
+| Remaining gates | **P2.c/P2.d/P6–P9** | **environment/hardware blocked** — graph capture needs a Torch-2.11-compatible Neuron SDK; numerical execution, memory calibration, full-checkpoint scaling, and native FP8/FP4 require Trn2 |
 
 **P3a.1's three corrected assumptions.** The config normalizer had been written without a Transformers
 5.x install to read; all three of its guesses were wrong, and all three passed its hand-built unit
@@ -82,7 +83,7 @@ In the default V4 config, layers 0–2 are `hash_moe` *and* `heavily_compressed_
 layers are **not** the sliding-window layers, contrary to this plan's earlier "SWA + hash-MoE (ratio 0,
 layers 0–2)" phrasing in P3b. A test pins the independence so it cannot be re-derived by inference.
 
-Suite: **318 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
+Suite: **322 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
 torch, and the `test/vllm_neuron/` tier runs against a real vLLM 0.26.0 and a real
 `DeepseekV4Config`. The `InputBatch` tests provide an explicit CPU `DeviceConfig`, so they no longer
 depend on `VLLM_NEURON_CPU_MODE` merely to construct the fixture. New modules are mutation-checked —
@@ -97,8 +98,9 @@ regression evidence.
 
 **Why P5 and P7a landed before P1–P2.** They were implemented while the original development
 environment lacked the dependencies required by P1/P2. That blocker has since been removed: the
-current Linux/Python 3.12 environment supports T0–T2, so P1, P2.a–P2.c, and the local portions of
-P3–P5 are now actionable in critical-path order. The pinned Transformers implementation has since
+current Linux/Python 3.12 environment supports T0/T1 and NKI backend compilation, so P1, P2.a–P2.b,
+and the local portions of P3–P5 are actionable. Full T2 graph capture is SDK-blocked as recorded
+below. The pinned Transformers implementation has since
 settled P5's emission constants, and runtime admission is wired through the platform request hook. P7a still needs calibration
 against a measured GPT-OSS peak, and P3a still needs weight mapping, decoder/model integration, and
 one-token execution despite its portable component primitives now existing.
@@ -192,10 +194,11 @@ Four practical notes, each of which cost time to discover:
   tilelang/fused paths may require Hopper. Pure-PyTorch extracted oracles run locally; the fused
   capture may not.
 
-Consequence, revised again: **only T3 is remote.** P1, P2.a–P2.c, P3, P4 (bar the fused-path
-capture), P5 and P6's T0 clause are all local work. Still needing Trn2: **P2.d, P6's T3 clause, P7b,
-P8, P9**, plus the deferred shipped-model regression. Critically, **P2.c — whether `head_dim=512`
-compiles at all, the project's largest schedule risk — no longer needs hardware.**
+Consequence: the remaining work cannot be closed in this checkout's environment. Full **P2.c**
+FX→HLO/NEFF capture needs a compatible Neuron SDK environment (it may be run on a configured Trn2
+host); **P2.d, P6's T3 clause, P7b, P8, P9**, and the shipped-model regression require Trn2.
+The local NKI compiler sub-gate already establishes that the four 512-d kernel schedules lower to
+backend configs; it does not claim the full graph/NEFF gate.
 
 **Design implication, not just a logistics note:** components on the critical path should be written
 dependency-free wherever the physics allows. Config normalization, layer selection, the P5 bound

@@ -149,15 +149,19 @@ class NeuronPlatform(Platform):
         makes that upstream contract an executable compatibility check.
         """
         from vllm.v1.kv_cache_interface import (
-            HiddenStateCacheSpec,
             MLAAttentionSpec,
             RSWASpec,
-            SlidingWindowSpec,
+            SlidingWindowMLASpec,
         )
         from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
         required = (
-            MLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=512, dtype=torch.bfloat16),
+            MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+            ),
             MLAAttentionSpec(
                 block_size=128,
                 num_kv_heads=1,
@@ -172,15 +176,26 @@ class NeuronPlatform(Platform):
                 dtype=torch.bfloat16,
                 compress_ratio=128,
             ),
-            SlidingWindowSpec(
+            SlidingWindowMLASpec(
                 block_size=32,
                 num_kv_heads=1,
                 head_size=512,
                 dtype=torch.bfloat16,
                 sliding_window=128,
             ),
-            HiddenStateCacheSpec(
-                block_size=128, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+            SlidingWindowMLASpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=2048,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+            SlidingWindowMLASpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                dtype=torch.float32,
+                sliding_window=128,
             ),
             RSWASpec(
                 block_size=32,
@@ -190,7 +205,11 @@ class NeuronPlatform(Platform):
                 rswa_window=128,
             ),
         )
-        missing = [type(spec).__name__ for spec in required if KVCacheSpecRegistry.get_manager_class(spec) is None]
+        missing = [
+            type(spec).__name__
+            for spec in required
+            if KVCacheSpecRegistry.get_manager_class(spec) is None
+        ]
         if missing:
             raise RuntimeError(
                 "vLLM 0.26 did not register lifecycle managers required by "
