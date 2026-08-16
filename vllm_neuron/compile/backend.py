@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from typing import TYPE_CHECKING, List, Dict, Any
 
@@ -22,6 +23,28 @@ from vllm_neuron.utils.timer import timer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _compiler_command_prefix(neuron_cc: str) -> list[str]:
+    """Return an executable prefix, recovering relocated venv entry points."""
+    try:
+        with open(neuron_cc, "rb") as compiler_file:
+            first_line = compiler_file.readline(4096)
+    except OSError:
+        return [neuron_cc]
+    if not first_line.startswith(b"#!"):
+        return [neuron_cc]
+    interpreter = first_line[2:].strip().split(maxsplit=1)[0].decode(
+        errors="surrogateescape"
+    )
+    if interpreter and not os.path.exists(interpreter):
+        logger.warning(
+            "neuronx-cc launcher references missing interpreter %s; using %s",
+            interpreter,
+            sys.executable,
+        )
+        return [sys.executable, neuron_cc]
+    return [neuron_cc]
 
 
 def model_forward_context(vllm_config: "VllmConfig"):
@@ -393,7 +416,7 @@ def neuroncc_compile(hlo, compiler_workdir, compiler_args=None):
         raise RuntimeError("neuronx-cc compiler binary does not exist")
 
     command = [
-        neuron_cc,
+        *_compiler_command_prefix(neuron_cc),
         "compile",
         hlo_filename,
         "--framework",
