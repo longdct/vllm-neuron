@@ -50,8 +50,10 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | Upstream heterogeneous lifecycle registration | **P1.1** | **done** — platform hook validates real MLA/c4/c128/SWA/hidden-state/R-SWA specs have upstream managers |
 | Single-tensor latent MLA allocation | **P1.2** | **done in runner** — compressed physical shape uses `storage_block_size`; no dummy V tensor |
 | Prefix/speculative feature guards | **P1.6** | **rejection done** — DeepSeek-V4 rejects both at configuration time; successful lifecycle semantics remain backlog |
+| Real heterogeneous lifecycle matrix | **P1.6/P1.7** | **T0 done** — vLLM managers cover allocation, continuation, decode eviction, reorder/compaction identity, completion, abort, and remapping; synthetic model declares every layout |
 | 512-d portable MLA reference | **P2.a** | **partial** — fp32-oracle prefill/decode math landed; full projection/RoPE/cache-composition fixture remains |
 | Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — oracle-backed component math landed; decoder/model integration remains |
+| Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — all independent attention/MLP variants, one-token decode, exact chunk invariance, and abort isolation; production loader/runner integration remains |
 | Pinned compressor geometry | **P5** | **derived** — Transformers 5.15 complete-window emission proves c4's default bound is 2051 total tokens; runtime request wiring remains |
 | Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
 
