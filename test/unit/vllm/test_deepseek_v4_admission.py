@@ -39,3 +39,19 @@ def test_uncapped_request_is_rejected():
         NeuronPlatform.validate_request(
             {"prompt_token_ids": [1, 2]}, SimpleNamespace(max_tokens=None)
         )
+
+
+def test_prompt_embeds_use_their_token_dimension():
+    prompt_embeds = SimpleNamespace(shape=(2000, 64))
+    NeuronPlatform.validate_request(
+        {"prompt_embeds": prompt_embeds}, SimpleNamespace(max_tokens=51)
+    )
+    with pytest.raises(DenseCsaUnsupportedError, match="2052"):
+        NeuronPlatform.validate_request(
+            {"prompt_embeds": prompt_embeds}, SimpleNamespace(max_tokens=52)
+        )
+
+
+def test_missing_prompt_length_is_rejected_before_scheduling():
+    with pytest.raises(ValueError, match="requires prompt token count"):
+        NeuronPlatform.validate_request({}, SimpleNamespace(max_tokens=1))

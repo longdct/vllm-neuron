@@ -59,7 +59,7 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — all independent attention/MLP variants, one-token decode, exact chunk invariance, and abort isolation; production loader/runner integration remains |
 | Transformers component oracles | **P4** | **partial** — config, Sinkhorn, routed selection/weights, hash lookup, and complete c4/c128 compressors (carry, RMSNorm, and RoPE) match 5.15; fused MLA and full-layer fixtures remain |
 | Streaming conversion into final shards | **P7a** | **prototype done** — one source tensor and converted tensor at a time with explicit temporary peak; native FP8/FP4 layouts remain P9 |
-| Pinned compressor geometry | **P5** | **derived** — Transformers 5.15 complete-window emission proves c4's default bound is 2051 total tokens; runtime request wiring remains |
+| Pinned compressor geometry and request admission | **P5** | **T0 done** — Transformers 5.15 complete-window emission proves c4's 2051-token bound; `NeuronPlatform.validate_request` enforces prompt plus `max_tokens` before scheduling |
 | Everything else | P1–P9 | **not implemented**; T0–T2 work is locally actionable, while the named T3 gates remain hardware-blocked |
 
 **P3a.1's three corrected assumptions.** The config normalizer had been written without a Transformers
@@ -80,7 +80,7 @@ In the default V4 config, layers 0–2 are `hash_moe` *and* `heavily_compressed_
 layers are **not** the sliding-window layers, contrary to this plan's earlier "SWA + hash-MoE (ratio 0,
 layers 0–2)" phrasing in P3b. A test pins the independence so it cannot be re-derived by inference.
 
-Suite: **300 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
+Suite: **302 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
 torch, and the `test/vllm_neuron/` tier runs against a real vLLM 0.26.0 and a real
 `DeepseekV4Config`. The `InputBatch` tests provide an explicit CPU `DeviceConfig`, so they no longer
 depend on `VLLM_NEURON_CPU_MODE` merely to construct the fixture. New modules are mutation-checked —
@@ -97,7 +97,7 @@ regression evidence.
 environment lacked the dependencies required by P1/P2. That blocker has since been removed: the
 current Linux/Python 3.12 environment supports T0–T2, so P1, P2.a–P2.c, and the local portions of
 P3–P5 are now actionable in critical-path order. The pinned Transformers implementation has since
-settled P5's emission constants, but runtime admission wiring remains. P7a still needs calibration
+settled P5's emission constants, and runtime admission is wired through the platform request hook. P7a still needs calibration
 against a measured GPT-OSS peak, and P3a still needs weight mapping, decoder/model integration, and
 one-token execution despite its portable component primitives now existing.
 
