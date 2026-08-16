@@ -52,6 +52,8 @@ one token of output from structurally-faithful layers, not a complete subsystem 
 | Prefix/speculative feature guards | **P1.6** | **rejection done** — DeepSeek-V4 rejects both at configuration time; successful lifecycle semantics remain backlog |
 | Real heterogeneous lifecycle matrix | **P1.6/P1.7** | **T0 done** — vLLM managers cover allocation, continuation, decode eviction, reorder/compaction identity, completion, abort, and remapping; synthetic model declares every layout |
 | 512-d portable MLA reference | **P2.a** | **T0 done** — fp32 prefill/decode, partial/inverse RoPE, sinks, paged gathers, SWA/compressed composition, and representative buckets |
+| 512-d NKI simulator prototype | **P2.b** | **T1 done** — causal prefill and decode execute through `nkilib`'s four-tile 512-d kernel and match the fp32 reference |
+| 512-d NKI compilation | **P2.c** | **kernel sub-gate done; phase partial** — four prefill/decode buckets compile to NKI backend configs locally in 0.47–0.58 s; full graph capture and NEFF generation remain required before P2.c passes |
 | Portable mHC/compressor/MoE primitives | **P3/P4** | **partial** — oracle-backed component math landed; decoder/model integration remains |
 | Tiny structural CPU model | **P3a/P3b/P6-T0** | **T0 prototype done** — all independent attention/MLP variants, one-token decode, exact chunk invariance, and abort isolation; production loader/runner integration remains |
 | Transformers component oracles | **P4** | **partial** — config, Sinkhorn, routed selection/weights, and hash lookup match 5.15; actual compressor/MLA/full-layer fixtures remain |
@@ -77,7 +79,7 @@ In the default V4 config, layers 0–2 are `hash_moe` *and* `heavily_compressed_
 layers are **not** the sliding-window layers, contrary to this plan's earlier "SWA + hash-MoE (ratio 0,
 layers 0–2)" phrasing in P3b. A test pins the independence so it cannot be re-derived by inference.
 
-Suite: **248 passed, 4 skipped** — the bare tier remains dependency-free; the component tier uses
+Suite: **280 passed, 6 skipped**, plus **2 explicit T1 simulator tests** — the bare tier remains dependency-free; the component tier uses
 torch, and the `test/vllm_neuron/` tier runs against a real vLLM 0.26.0 and a real
 `DeepseekV4Config`. The `InputBatch` tests provide an explicit CPU `DeviceConfig`, so they no longer
 depend on `VLLM_NEURON_CPU_MODE` merely to construct the fixture. New modules are mutation-checked —
@@ -167,7 +169,7 @@ preserved at `.venv313-backup`) specifically to clear the `neuronx-cc` ABI gap. 
 | **T0-bare** — dependency-free Python | **yes** | pytest only |
 | **T0-full** — CPU mode with torch + vllm | **yes** | `vllm_neuron.functional` and `NeuronModelRunner` both import (`NEURON_PLATFORM_TARGET_OVERRIDE=trn2` required) |
 | **T1** simulator | **yes** | `nki.simulator.simulate_kernel` imports |
-| **T2** CPU compilation | **yes** | `neuronx-cc 2.26.6360.0` on the PATH |
+| **T2** CPU compilation | **partial and actionable** | the Python compiler package builds NKI backend configs, but `neuronx-cc` is not a shell executable on PATH; full graph/NEFF capture is still unproven |
 | **T3** on-device | **no** | Trn2 instance — the only remaining hardware gate |
 
 Four practical notes, each of which cost time to discover:
