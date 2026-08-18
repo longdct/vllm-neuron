@@ -12,8 +12,15 @@ vllm==0.24.0
 # Pin <0.137: 0.137's `_IncludedRouter` breaks prometheus-fastapi-instrumentator
 fastapi[standard]>=0.115.0,<0.137
 
-# Force transformers v5 upgrade
-transformers>=5.5.1,<6.0.0
+# Force transformers v5 upgrade.
+# Floor: 5.5.1 is vLLM 0.24's requirement.
+# Ceiling: 5.15.0 is the newest version the DeepSeek-V4 config normalizer and
+# component oracles have actually been exercised against
+# (test/vllm_neuron/test_deepseek_v4_{config,component}_oracle.py). An open
+# <6.0.0 range would let a minor release change config normalization or model
+# defaults with no signal -- the drift the patch tripwires exist to catch.
+# Raise the ceiling deliberately, after re-running those suites.
+transformers>=5.5.1,<5.16
 
 # Prometheus metrics
 prometheus_client

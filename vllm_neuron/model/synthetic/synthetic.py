@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 
 
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.kv_cache import CacheKind, KVSpec, LayerSpec
 
 SYNTHETIC_MODEL_PATH = str(Path(__file__).parent / "synthetic_config")
 
@@ -42,6 +42,10 @@ class SyntheticConfig:
     vocab_size: int = 128256
     sliding_window: int | None = None
     swa_layers: list[int] | None = None  # e.g. [0, 2, 4]; None = even layers
+    # Optional explicit cache layout per layer. Supported values are ``full``,
+    # ``swa``, ``mla``, ``c4``, ``c128``, ``carry`` and ``rswa``. This is a
+    # test-only surface for exercising heterogeneous allocation without weights.
+    cache_layouts: list[str] | None = None
 
     @property
     def head_dim(self) -> int:
@@ -106,6 +110,13 @@ class SyntheticNeuronModel(nn.Module):
         )
         layers = []
         for i in range(self.config.num_hidden_layers):
+            layout = (
+                self.config.cache_layouts[i]
+                if self.config.cache_layouts is not None
+                else None
+            )
+            if self.config.cache_layouts is not None and len(self.config.cache_layouts) != self.config.num_hidden_layers:
+                raise ValueError("cache_layouts length must equal num_hidden_layers")
             # Determine which layers use SWA: explicit list or default to even layers
             if self.config.swa_layers is not None:
                 is_swa = i in self.config.swa_layers
@@ -116,13 +127,41 @@ class SyntheticNeuronModel(nn.Module):
                 if (self.config.sliding_window and is_swa)
                 else None
             )
+            kwargs: dict[str, Any] = {}
+            if layout in ("mla", "c4", "c128"):
+                kwargs.update(
+                    cache_kind=CacheKind.MLA,
+                    num_kv_heads=1,
+                    head_size=512,
+                    compress_ratio={"mla": 1, "c4": 4, "c128": 128}[layout],
+                    alignment=128,
+                )
+            elif layout == "carry":
+                kwargs.update(
+                    cache_kind=CacheKind.COMPRESSOR_STATE,
+                    sliding_window_size=self.config.sliding_window or 128,
+                )
+            elif layout == "rswa":
+                kwargs.update(
+                    cache_kind=CacheKind.RSWA,
+                    rswa_window=self.config.sliding_window or 128,
+                )
+            elif layout == "swa":
+                kwargs.update(
+                    cache_kind=CacheKind.SLIDING_WINDOW,
+                    sliding_window_size=self.config.sliding_window or 128,
+                )
+            elif layout not in (None, "full"):
+                raise ValueError(f"unsupported synthetic cache layout {layout!r}")
+            else:
+                kwargs["sliding_window_size"] = swa
             layers.append(
                 LayerSpec(
                     name=f"layers.{i}.self_attn",
-                    num_kv_heads=per_rank_kv_heads,
-                    head_size=self.config.head_dim,
+                    num_kv_heads=kwargs.pop("num_kv_heads", per_rank_kv_heads),
+                    head_size=kwargs.pop("head_size", self.config.head_dim),
                     dtype=torch.bfloat16,
-                    sliding_window_size=swa,
+                    **kwargs,
                 )
             )
         return KVSpec(layers=layers)
@@ -130,9 +169,13 @@ class SyntheticNeuronModel(nn.Module):
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
         self._kv_caches = kv_caches
         print(f"[SyntheticKV] bind_kv_cache: {len(kv_caches)} layers", flush=True)
-        for name, (k, v) in kv_caches.items():
+        for name, tensors in kv_caches.items():
+            shapes = ", ".join(
+                f"T{index}={list(tensor.shape)}" for index, tensor in enumerate(tensors)
+            )
+            first = tensors[0]
             print(
-                f"[SyntheticKV]   {name}: K={list(k.shape)} V={list(v.shape)} dtype={k.dtype} device={k.device}",
+                f"[SyntheticKV]   {name}: {shapes} dtype={first.dtype} device={first.device}",
                 flush=True,
             )
 

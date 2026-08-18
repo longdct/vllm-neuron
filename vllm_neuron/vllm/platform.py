@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm_neuron import envs
+from vllm_neuron.vllm.patches import Phase, apply_phase
+from vllm_neuron.vllm.scheduler_selection import resolve_neuron_scheduler_cls
 
 from vllm.platforms import Platform, PlatformEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -139,6 +141,80 @@ class NeuronPlatform(Platform):
     # checkpoint format, so pointing at an MXFP8 checkpoint WITHOUT selecting
     # this path still fails loud.
     _cpu_dequant_quantizations: frozenset[str] = frozenset({"mxfp8"})
+
+    @classmethod
+    def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
+        """Validate the heterogeneous specs DeepSeek-V4 relies on.
+
+        vLLM owns these spec classes and registers their lifecycle managers
+        before invoking this platform hook. Neuron does not introduce a shadow
+        spec: doing so would fork the scheduler semantics. This hook makes that
+        upstream contract an executable compatibility check.
+
+        ``RSWASpec`` is deliberately absent from the required set: it lands in
+        vLLM 0.26 and no DeepSeek-V4 layer declares an R-SWA cache. Only the
+        synthetic model does, and ``kv_spec_conversion`` rejects that path with
+        a NotImplementedError rather than letting it reach a manager lookup.
+        """
+        from vllm.v1.kv_cache_interface import (
+            MLAAttentionSpec,
+            SlidingWindowMLASpec,
+        )
+        from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+        required = (
+            MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+            ),
+            MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                compress_ratio=4,
+            ),
+            MLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                compress_ratio=128,
+            ),
+            SlidingWindowMLASpec(
+                block_size=32,
+                num_kv_heads=1,
+                head_size=512,
+                dtype=torch.bfloat16,
+                sliding_window=128,
+            ),
+            SlidingWindowMLASpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=2048,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+            SlidingWindowMLASpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=1024,
+                dtype=torch.float32,
+                sliding_window=128,
+            ),
+        )
+        missing = [
+            type(spec).__name__
+            for spec in required
+            if KVCacheSpecRegistry.get_manager_class(spec) is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "vLLM did not register lifecycle managers required by "
+                f"Neuron heterogeneous caches: {missing}"
+            )
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1
     _termination_timeout_patched: bool = False
@@ -150,6 +226,7 @@ class NeuronPlatform(Platform):
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
+    _deepseek_dense_csa_bound = None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -310,13 +387,19 @@ class NeuronPlatform(Platform):
         """Configure vLLM for vLLM Neuron platform."""
         cls._reject_v2_model_runner()
 
-        # Patches for bidirectional KV transfer and streaming KV (DI features).
+        # Assert the upstream symbols the platform-config patches below depend on
+        # still look the way they expect. Runs first so drift is reported before
+        # any patch installs itself against a moved target.
+        apply_phase(Phase.PLATFORM_CONFIG)
 
         cls._patch_termination_timeouts()
 
         model_config = vllm_config.model_config
         if model_config is None:
             return
+
+        cls._validate_deepseek_v4_unsupported_features(vllm_config)
+        cls._configure_deepseek_v4_dense_csa_bound(model_config)
 
         # Frontend multimodal patchify runs under vLLM's
         # set_default_torch_num_threads(), which pins torch to OMP_NUM_THREADS or
@@ -421,20 +504,13 @@ class NeuronPlatform(Platform):
 
             get_snapshot_config()
 
-        # Override the default vLLM scheduler with our custom Neuron scheduler
-        # We need to override even if it's already set to the default scheduler
-        if scheduler_config.scheduler_cls is None or scheduler_config.scheduler_cls in (
-            "vllm.v1.core.sched.scheduler.Scheduler",
-            "vllm.v1.core.sched.async_scheduler.AsyncScheduler",
-        ):
-            if scheduler_config.async_scheduling:
-                scheduler_config.scheduler_cls = (
-                    "vllm_neuron.vllm.core.scheduler.NeuronAsyncScheduler"
-                )
-            else:
-                scheduler_config.scheduler_cls = (
-                    "vllm_neuron.vllm.core.scheduler.NeuronScheduler"
-                )
+        # Override the default vLLM scheduler with our custom Neuron scheduler.
+        # We override even when it is already set to an upstream default path.
+        resolved = resolve_neuron_scheduler_cls(
+            scheduler_config.scheduler_cls, scheduler_config.async_scheduling
+        )
+        if resolved is not None:
+            scheduler_config.scheduler_cls = resolved
         else:
             logger.warning(
                 "scheduler_cls already set to non-default: %s, "
@@ -458,6 +534,25 @@ class NeuronPlatform(Platform):
             and getattr(params, "structured_outputs", None) is not None
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
+
+        if cls._deepseek_dense_csa_bound is not None:
+            from vllm_neuron.model.deepseek_v4.dense_csa import check_admission
+
+            prompt_ids = processed_inputs.get("prompt_token_ids")
+            if prompt_ids is None:
+                prompt_embeds = processed_inputs.get("prompt_embeds")
+                if prompt_embeds is None:
+                    raise ValueError(
+                        "DeepSeek-V4 dense-CSA admission requires prompt token count"
+                    )
+                prompt_tokens = prompt_embeds.shape[0]
+            else:
+                prompt_tokens = len(prompt_ids)
+            check_admission(
+                prompt_tokens,
+                getattr(params, "max_tokens", None),
+                cls._deepseek_dense_csa_bound,
+            )
 
         if cls._max_embeds_per_image is None:
             return
@@ -483,6 +578,44 @@ class NeuronPlatform(Platform):
                         f"mm_processor_kwargs) or increase "
                         f"num_vision_tokens_buckets in vision_neuron_config."
                     )
+
+    @classmethod
+    def _validate_deepseek_v4_unsupported_features(cls, vllm_config: "VllmConfig") -> None:
+        """Reject lifecycle features whose compressor-state semantics are unproven."""
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "deepseek_v4":
+            return
+        if getattr(vllm_config.cache_config, "enable_prefix_caching", False):
+            raise NotImplementedError(
+                "DeepSeek-V4 prefix caching is disabled until compressor carry-state "
+                "reuse semantics are implemented and lifecycle-tested"
+            )
+        if vllm_config.speculative_config is not None:
+            raise NotImplementedError(
+                "DeepSeek-V4 speculative decoding is disabled until heterogeneous "
+                "cache fork and rollback are implemented"
+            )
+
+    @classmethod
+    def _configure_deepseek_v4_dense_csa_bound(cls, model_config) -> None:
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "deepseek_v4":
+            cls._deepseek_dense_csa_bound = None
+            return
+        from vllm_neuron.model.deepseek_v4.dense_csa import (
+            CountingMode,
+            geometry_from_config,
+            model_bound,
+        )
+
+        geometries = {
+            index: geometry_from_config(hf_config, layer_type)
+            for index, layer_type in enumerate(hf_config.layer_types)
+        }
+        cls._deepseek_dense_csa_bound = model_bound(
+            geometries, hf_config.index_topk, mode=CountingMode.COMPLETE
+        )
 
     @classmethod
     def _validate_quantization_config(cls, vllm_config) -> None:

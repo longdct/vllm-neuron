@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -48,6 +50,11 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm_neuron.vllm.worker.input_batch_params import (
+    build_input_batch_group_params,
+    mla_cache_shape,
+)
+from vllm_neuron.vllm.worker.kv_spec_conversion import layer_spec_to_vllm_spec
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
     KVConnectorOutput,
@@ -8475,25 +8482,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # for each attention group. These builders are responsible for creating
         # the attention metadata that kernels need during forward passes.
 
-        # Extract block sizes for each KV cache group (one per group for InputBatch)
-        block_sizes = [
-            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
-        ]
+        # Per-group InputBatch parameters. Derived by a module-level helper so the
+        # heterogeneous-group case can be tested without standing up a runner --
+        # that case is what the DeepSeek-V4 cache work depends on.
+        group_params = build_input_batch_group_params(
+            kv_cache_config,
+            self.vllm_config,
+            self.max_model_len,
+            is_encoder_decoder=self.model_config.is_encoder_decoder,
+        )
         logger.info(
-            "KV cache block_size resolved: cache_config=%s, per_group=%s",
+            "KV cache block_size resolved: cache_config=%s, per_group=%s, "
+            "max_num_blocks_per_req=%s",
             self.vllm_config.cache_config.block_size,
-            block_sizes,
+            group_params.block_sizes,
+            group_params.max_num_blocks_per_req,
         )
 
-        # Initialize InputBatch with block_sizes list matching the number of KV cache groups
+        # Initialize InputBatch with per-group lists matching the KV cache groups.
+        #
+        # ``max_num_blocks_per_req`` is passed explicitly rather than left to
+        # InputBatch's default: the default derives it from a single block_size,
+        # which is wrong once the groups are heterogeneous (MLA groups store
+        # block_size // compress_ratio positions per block).
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.max_num_batched_tokens,
             device=self.device,
             vocab_size=self.vocab_size,
-            block_sizes=block_sizes,
-            kernel_block_sizes=block_sizes,
+            block_sizes=group_params.block_sizes,
+            kernel_block_sizes=group_params.kernel_block_sizes,
+            max_num_blocks_per_req=group_params.max_num_blocks_per_req,
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
             is_pooling_model=self.is_pooling_model,
@@ -8524,8 +8544,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
 
+            # MLA stores one latent vector per storage position, not a K/V
+            # pair. MLAAttentionSpec subclasses FullAttentionSpec, so this must
+            # precede the conventional-attention branch.
+            if isinstance(kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    latent_shape = mla_cache_shape(kv_cache_spec, num_blocks)
+                    latent = _shared_dtype_view(
+                        raw_tensor, kv_cache_spec.dtype
+                    ).view(latent_shape)
+                    # Cache lists are layer-facing containers; MLA deliberately
+                    # contains one tensor rather than a dummy unused V tensor.
+                    kv_caches[layer_name] = [latent]
+                    self._kv_cache_full_tensors[layer_name] = latent
+
             # This is the case that all layers have the same kv_hidden_size.
-            if isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
+            elif isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
@@ -8580,6 +8617,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     num_kv_heads = kv_cache_layer_spec.num_kv_heads
                     head_size = kv_cache_layer_spec.head_size
 
+                    if isinstance(
+                        kv_cache_layer_spec,
+                        (MLAAttentionSpec, SlidingWindowMLASpec),
+                    ):
+                        latent_shape = mla_cache_shape(kv_cache_layer_spec, num_blocks)
+                        typed_tensor = raw_tensor.view(kv_cache_layer_spec.dtype).view(
+                            latent_shape
+                        )
+                        kv_caches[layer_name] = [typed_tensor]
+                        self._kv_cache_full_tensors[layer_name] = typed_tensor
+                        continue
                     if isinstance(
                         kv_cache_layer_spec, (FullAttentionSpec, SlidingWindowSpec)
                     ):
@@ -8648,26 +8696,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
-            # Use SlidingWindowSpec for SWA layers so HMA can create separate
-            # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
-            # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
-                spec = FullAttentionSpec(
-                    block_size=block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                    sliding_window=layer.sliding_window_size,
-                    attention_chunk_size=layer.chunk_size,
-                )
-            else:
-                spec = SlidingWindowSpec(
-                    block_size=block_size,
-                    num_kv_heads=layer.num_kv_heads,
-                    head_size=layer.head_size,
-                    dtype=kv_cache_dtype,
-                    sliding_window=layer.sliding_window_size,
-                )
+            spec = layer_spec_to_vllm_spec(layer, block_size, kv_cache_dtype)
             all_kv_cache_specs[layer_name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():

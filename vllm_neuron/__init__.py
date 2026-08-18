@@ -229,13 +229,9 @@ try:
 except (ImportError, KeyError):
     pass
 
-from vllm_neuron.vllm.patches.port_hold_patch import apply_port_hold_patch
+# port_hold and pin_memory are registered against Phase.IMPORT; applying them
+# through the registry keeps them in the same apply-once bookkeeping as every
+# other patch. See vllm_neuron.vllm.patches.import_patches.
+from vllm_neuron.vllm.patches import Phase, apply_phase
 
-apply_port_hold_patch()
-
-# vLLM's pooling path pins host memory via a cached PIN_MEMORY constant; force
-# it off to match NeuronPlatform.is_pin_memory_available() (privateuse1 has no
-# pinned-memory hooks in CPU mode). See the patch module docstring.
-from vllm_neuron.vllm.patches.pin_memory_patch import apply_pin_memory_patch
-
-apply_pin_memory_patch()
+apply_phase(Phase.IMPORT)

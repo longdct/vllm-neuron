@@ -15,7 +15,6 @@ from datetime import timedelta
 from typing import Any
 
 import torch
-import vllm.distributed.parallel_state as parallel_state
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -600,63 +599,28 @@ class NeuronWorker(WorkerBase):
         return {(pp_rank, tp_rank): metadata}
 
     def _patch_in_same_node_as_function(self):
-        # WORKAROUND: Patch in_the_same_node_as() to avoid PyTorch barrier() bug with Neuron device backend
-        #
-        # THE PROBLEM:
-        # vLLM's parallel_state.in_the_same_node_as() function calls torch.distributed.barrier(group=pg)
-        # to synchronize ranks and find ranks that share the same shared memory.
-        # However, PyTorch's barrier() implementation
-        # (in torch/distributed/distributed_c10d.py, line ~4792) unconditionally calls:
-        #     device = torch._C._get_accelerator()
-        # BEFORE checking the backend type or dispatching to the backend-specific barrier implementation.
-        #
-        # For Neuron (which uses PyTorch's PrivateUse1 extension mechanism), _get_accelerator() requires
-        # PrivateUse1HooksInterface to be registered. Since we haven't registered it, this causes:
-        #     RuntimeError: Please register PrivateUse1HooksInterface by `RegisterPrivateUse1HooksInterface` first.
-        #
-        # This error occurs even though:
-        # 1. The process group (pg) is using the Gloo backend (CPU-based)
-        # 2. Gloo's barrier implementation doesn't need device/accelerator information
-        # 3. The barrier would work fine if PyTorch didn't try to detect the device first
-        #
-        # CALL CHAIN WHERE THIS BREAKS:
-        # init_model_parallel_group()
-        #   → GroupCoordinator.__init__()
-        #   → MessageQueue.create_from_process_group()
-        #   → in_the_same_node_as(pg)
-        #   → torch.distributed.barrier(group=pg)
-        #   → torch._C._get_accelerator()  ← CRASH HERE
-        #
-        # THIS WORKAROUND:
-        # We patch in_the_same_node_as() to bypass the barrier() call entirely and calculate
-        # the result based on ParallelConfig, rather than probe the system. This allows:
-        # - MessageQueue to use shared memory for inter-rank communication
-        # - Process group initialization to complete successfully
-        # - Single-node and multi-node distributed inference/training to work
-        #
-        # PROPER SOLUTIONS (either one will work):
-        # 1. Register PrivateUse1HooksInterface for Neuron:
-        #    - Will come with consolidation with Torch Eager
-        # 2. Register vLLM Neuron plugin from a separate python package
-        #    - Will mean that PrivateUse1 is not bound and hence error isn't hit.
-        def patched_in_the_same_node_as(pg, source_rank=0):
-            # Compute ranks_per_node from the cluster-wide world (TP*PP*DP),
-            # not parallel_config.world_size (TP*PP per DP replica). With
-            # DP>1, an EP/cross-DP group spans all nodes, and we need to
-            # map each group-local rank back to its global rank to assign
-            # it to a physical node correctly. Mirrors the patch in
-            # neuron_parallel_state._ensure_vllm_parallel_state.
-            parallel_config = self.vllm_config.parallel_config
-            nnodes = parallel_config.nnodes
-            ranks_per_node = max(parallel_config.world_size_across_dp // nnodes, 1)
-            global_ranks = [
-                torch.distributed.get_global_rank(pg, r)
-                for r in range(torch.distributed.get_world_size(group=pg))
-            ]
-            source_node = global_ranks[source_rank] // ranks_per_node
-            return [g // ranks_per_node == source_node for g in global_ranks]
+        """Install the barrier-free ``in_the_same_node_as`` for this worker.
 
-        parallel_state.in_the_same_node_as = patched_in_the_same_node_as
+        The replacement and the full rationale live in
+        ``vllm_neuron.vllm.patches.node_topology`` -- it was previously duplicated
+        here and in ``neuron_parallel_state._ensure_vllm_parallel_state``.
+
+        ``ranks_per_node`` comes from the cluster-wide world (TP*PP*DP), not
+        ``parallel_config.world_size`` (TP*PP per DP replica): with DP>1 an
+        EP/cross-DP group spans all nodes, so each group-local rank must map back
+        to its global rank to land on the right physical node.
+        """
+        from vllm_neuron.vllm.patches import Phase, apply_phase
+        from vllm_neuron.vllm.patches.node_topology import (
+            install_in_the_same_node_as,
+        )
+
+        apply_phase(Phase.DISTRIBUTED_INIT)
+
+        parallel_config = self.vllm_config.parallel_config
+        nnodes = parallel_config.nnodes
+        ranks_per_node = max(parallel_config.world_size_across_dp // nnodes, 1)
+        install_in_the_same_node_as(ranks_per_node)
 
     def _init_neuron_distributed_environment_and_runtime(
         self,

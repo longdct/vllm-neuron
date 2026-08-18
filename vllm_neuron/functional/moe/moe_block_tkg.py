@@ -63,6 +63,12 @@ def _torch_moe_block_tkg_impl(
     router_bias: Optional[Tensor],
     expert_gate_up_bias: Optional[Tensor],
     expert_down_bias: Optional[Tensor],
+    shared_expert_gate_w: Optional[Tensor],
+    shared_expert_up_w: Optional[Tensor],
+    shared_expert_down_w: Optional[Tensor],
+    shared_expert_gate_bias: Optional[Tensor],
+    shared_expert_up_bias: Optional[Tensor],
+    shared_expert_down_bias: Optional[Tensor],
     eps: float,
     top_k: int,
     router_act_fn: RouterActFnType,
@@ -87,7 +93,8 @@ def _torch_moe_block_tkg_impl(
     (selective mode gets the same result since unselected experts have zero
     affinity).
 
-    Does not support quantization, shared experts, or residual fusion.
+    Does not support quantization or residual fusion. Shared experts use the
+    same normalized input and gate/up/down formulation as the NKI path.
 
     Args:
         inp: [B, S, H] or [T, H] input tensor.
@@ -297,6 +304,41 @@ def _torch_moe_block_tkg_impl(
 
     output = output.to(dtype)
 
+    if shared_expert_gate_w is not None:
+        shared_gate = torch.matmul(
+            hidden_states_norm.to(torch.float32),
+            shared_expert_gate_w.to(torch.float32),
+        )
+        shared_up = torch.matmul(
+            hidden_states_norm.to(torch.float32),
+            shared_expert_up_w.to(torch.float32),
+        )
+        if shared_expert_gate_bias is not None:
+            shared_gate = shared_gate + shared_expert_gate_bias.to(torch.float32)
+        if shared_expert_up_bias is not None:
+            shared_up = shared_up + shared_expert_up_bias.to(torch.float32)
+        if gate_clamp_lower_limit is not None or gate_clamp_upper_limit is not None:
+            shared_gate = shared_gate.clamp(
+                min=gate_clamp_lower_limit, max=gate_clamp_upper_limit
+            )
+        if up_clamp_lower_limit is not None or up_clamp_upper_limit is not None:
+            shared_up = shared_up.clamp(
+                min=up_clamp_lower_limit, max=up_clamp_upper_limit
+            )
+        if hidden_act_fn == ActFnType.SiLU:
+            shared_gate = torch.nn.functional.silu(shared_gate)
+        elif hidden_act_fn == ActFnType.GELU:
+            shared_gate = torch.nn.functional.gelu(shared_gate)
+        elif hidden_act_fn == ActFnType.Swish:
+            shared_gate = shared_gate * torch.sigmoid(shared_gate * 1.702)
+        shared = torch.matmul(
+            shared_gate * shared_up,
+            shared_expert_down_w.to(torch.float32),
+        )
+        if shared_expert_down_bias is not None:
+            shared = shared + shared_expert_down_bias.to(torch.float32)
+        output = output + shared.to(dtype)
+
     if skip_router_logits:
         return output
 
@@ -363,7 +405,7 @@ def moe_block_tkg(
     When using the PyTorch fallback:
         - Uses einsum-based expert computation
         - Supports all input sizes and runs on CPU
-        - No quantization or shared expert support
+        - No quantization support
 
     Dimensions:
         B: Batch size
@@ -531,11 +573,15 @@ def moe_block_tkg(
         return outputs
 
     # --- PyTorch fallback path ---
-    if shared_expert_gate_w is not None or shared_expert_down_w is not None:
-        raise NotImplementedError(
-            "Shared experts are not supported in the PyTorch fallback path "
-            "for moe_block_tkg."
-        )
+    shared_weights = (
+        shared_expert_gate_w,
+        shared_expert_up_w,
+        shared_expert_down_w,
+    )
+    if any(weight is not None for weight in shared_weights) and not all(
+        weight is not None for weight in shared_weights
+    ):
+        raise ValueError("shared expert gate/up/down weights must be provided together")
 
     if (
         expert_gate_up_weights_scale is not None
@@ -573,6 +619,12 @@ def moe_block_tkg(
         router_bias=router_bias,
         expert_gate_up_bias=expert_gate_up_bias,
         expert_down_bias=expert_down_bias,
+        shared_expert_gate_w=shared_expert_gate_w,
+        shared_expert_up_w=shared_expert_up_w,
+        shared_expert_down_w=shared_expert_down_w,
+        shared_expert_gate_bias=shared_expert_gate_bias,
+        shared_expert_up_bias=shared_expert_up_bias,
+        shared_expert_down_bias=shared_expert_down_bias,
         eps=eps,
         top_k=top_k,
         router_act_fn=router_act_fn,

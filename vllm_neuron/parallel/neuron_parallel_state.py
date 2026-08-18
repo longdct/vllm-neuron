@@ -1008,23 +1008,19 @@ def _ensure_vllm_parallel_state(
     )
     vllm_parallel_state._NODE_COUNT = nnodes
 
-    # Patch in_the_same_node_as to avoid barrier() crash on Neuron.
-    # Mirrors NeuronWorker._patch_in_same_node_as_function: torch.distributed
-    # .barrier() calls torch._C._get_accelerator() before backend dispatch,
-    # which fails on Neuron (PrivateUse1 with no PrivateUse1HooksInterface).
-    # Map each group-local rank back to its global rank before assigning a
-    # node, so subgroups (TP/DP/EP) report same-node membership correctly
-    # regardless of how their ranks are laid out across nodes.
-    ranks_per_node = world_size // nnodes
+    # Patch in_the_same_node_as to avoid the barrier() crash on Neuron. The
+    # replacement and the full rationale live in
+    # vllm_neuron.vllm.patches.node_topology -- it was previously duplicated here
+    # and in NeuronWorker._patch_in_same_node_as_function.
+    #
+    # ranks_per_node is derived from the live torch world here, rather than from
+    # ParallelConfig as the worker does, because this path runs where the process
+    # group is already up and the config may not be reachable.
+    from vllm_neuron.vllm.patches import Phase, apply_phase
+    from vllm_neuron.vllm.patches.node_topology import install_in_the_same_node_as
 
-    def patched_in_the_same_node_as(pg, source_rank=0):
-        global_ranks = [
-            dist.get_global_rank(pg, r) for r in range(dist.get_world_size(group=pg))
-        ]
-        source_node = global_ranks[source_rank] // ranks_per_node
-        return [g // ranks_per_node == source_node for g in global_ranks]
-
-    vllm_parallel_state.in_the_same_node_as = patched_in_the_same_node_as
+    apply_phase(Phase.DISTRIBUTED_INIT)
+    install_in_the_same_node_as(max(world_size // nnodes, 1))
 
     _reinit_vllm_model_parallel(tp_size, dp_size, backend, dcp_size)
 
