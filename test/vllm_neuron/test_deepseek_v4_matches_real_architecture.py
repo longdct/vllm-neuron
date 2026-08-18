@@ -19,20 +19,30 @@ attention/MoE and an earlier version of this plugin's layer did not. See
 ``docs/model-dev/deepseek-v4-carry-cache-design.md`` for the fuller account
 and `model.py`'s ``DeepseekV4DecoderLayer` docstring.
 
-**What this does NOT cover** (documented divergences, not bugs to fix here):
+``DeepseekV4Attention`` is now the real multi-head q_lora/kv_proj/partial-RoPE
+MLA architecture (q_a_proj/q_a_norm/q_b_proj, kv_proj/kv_norm, real
+``DeepseekV4RotaryEmbedding``, attention sinks, K=V broadcast via an identity
+"up-projection", and the real architecture's undo-RoPE-on-the-output step),
+cross-validated pre-output-projection both in isolation and through the real
+paged-cache-I/O path (multi-token prefill, real ``bind_kv_cache``). See
+``test_attention_matches_real_module_through_paged_cache_io`` below and
+``model.py``'s ``DeepseekV4Attention`` docstring.
 
-- Attention structure: this plugin's ``DeepseekV4Attention`` is a
-  deliberately simplified single-global-head, no-q_lora, no-RoPE stand-in
-  (see `model.py`'s module docstring) — real DeepSeek-V4 attention is
-  multi-head with q_lora/kv_lora down+up projections and partial RoPE. Not
-  comparable at any granularity finer than "both take a hidden state and
-  return an attention output."
-- Expert FFN internals: this plugin's ``DeepseekV4Expert`` uses a plain
-  unclamped SiLU(gate)*up SwiGLU with ``[hidden, 2*intermediate]``-layout
-  weights; the real ``DeepseekV4Experts``/``DeepseekV4MLP`` clamp
-  gate/up to ``swiglu_limit`` and store weights ``[out, in]``-layout (as
-  ``F.linear`` expects). The *routing decision* (which experts, what
-  weights) is verified here; the expert computation itself is not.
+``DeepseekV4Expert`` (the per-expert FFN, both routed and shared) now matches
+the real ``DeepseekV4Experts``/``DeepseekV4MLP`` exactly too: ``[out,
+in]``-layout ``gate_up_proj``/``down_proj`` driven through ``F.linear``, and
+gate/up clamped to ``swiglu_limit`` before the SiLU*up product -- not the
+earlier unclamped, ``[in, out]``-layout approximation. See
+``test_expert_wrapper_matches_real_module`` below.
+
+**What this does NOT cover** (documented divergence, not a bug to fix here):
+
+- The output projection: the real architecture uses a grouped low-rank
+  ``o_a_proj``/``o_b_proj`` (``DeepseekV4GroupedLinear``); this plugin uses a
+  plain dense ``Linear(num_heads*head_dim, hidden_size)`` instead. A
+  parameter-count optimization, not a defining MLA characteristic, and not
+  yet built here -- comparisons below hook the input to ``o_proj``/
+  ``o_a_proj`` to compare everything upstream of that one difference.
 """
 
 import pytest
@@ -40,6 +50,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
+from torch.nn import functional as F
 from transformers import DeepseekV4Config
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as tm
 
@@ -61,7 +72,7 @@ def hf_config():
         num_experts_per_tok=2,
         vocab_size=64,
         num_hidden_layers=3,
-        num_attention_heads=1,
+        num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=16,
         q_lora_rank=16,
@@ -156,6 +167,48 @@ def test_hash_moe_gate_wrapper_matches_real_hash_router(real_and_dev):
     torch.testing.assert_close(r_weights, m_weights, rtol=0, atol=0)
 
 
+def test_expert_wrapper_matches_real_module(real_and_dev):
+    """DeepseekV4Expert vs. the real DeepseekV4Experts (routed) /
+    DeepseekV4MLP (shared): ``[out, in]``-layout weights through F.linear
+    and swiglu_limit-clamped gate/up, not the earlier unclamped ``[in,
+    out]`` approximation. hf_config()'s intermediate_size (64) happens to
+    equal this plugin's synthetic-geometry choice (hidden_size*2 == 64) for
+    both routed and shared experts, so real and device weights are the same
+    shape here without any resizing.
+    """
+    config, real, device_model = real_and_dev
+    real_mlp = real.model.layers[1].mlp
+    my_moe = device_model.model.layers[1].moe
+
+    hidden = torch.randn(2, 5, config.hidden_size)
+
+    # Routed expert 0: replicate the real per-expert math directly (bypasses
+    # top-k routing/masking, which is already covered by
+    # test_routed_moe_gate_wrapper_matches_real_topk_router).
+    real_experts = real_mlp.experts
+    with torch.no_grad():
+        gate_up = F.linear(hidden, real_experts.gate_up_proj[0])
+        gated = real_experts._apply_gate(gate_up)
+        real_routed_out = F.linear(gated, real_experts.down_proj[0])
+
+        my_moe.experts[0].gate_up_proj.copy_(real_experts.gate_up_proj[0])
+        my_moe.experts[0].down_proj.copy_(real_experts.down_proj[0])
+        my_routed_out = my_moe.experts[0](hidden)
+    torch.testing.assert_close(real_routed_out, my_routed_out, rtol=0, atol=0)
+
+    # Shared expert: real DeepseekV4MLP keeps gate_proj/up_proj separate;
+    # this plugin fuses them into one gate_up_proj.
+    real_shared = real_mlp.shared_experts
+    with torch.no_grad():
+        real_shared_out = real_shared(hidden)
+        my_moe.shared_experts.gate_up_proj.copy_(
+            torch.cat([real_shared.gate_proj.weight, real_shared.up_proj.weight], dim=0)
+        )
+        my_moe.shared_experts.down_proj.copy_(real_shared.down_proj.weight)
+        my_shared_out = my_moe.shared_experts(hidden)
+    torch.testing.assert_close(real_shared_out, my_shared_out, rtol=0, atol=0)
+
+
 def _capture_pre_norm(kv_norm_module):
     captured = {}
 
@@ -213,3 +266,118 @@ def test_compressor_wrapper_matches_real_module(
     )
     torch.testing.assert_close(real_reduced, my_reduced, rtol=0, atol=1e-6)
     torch.testing.assert_close(real_normed, my_normed, rtol=0, atol=1e-6)
+
+
+def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
+    """Cross-checks the *integrated* attention path: real cache I/O, the
+    per-token loop, RoPE applied/undone at the right absolute positions --
+    not just the bare math in isolation. Uses a sliding-only layer (no
+    compressor) to isolate attention; the compressor's own RoPE is already
+    covered by test_compressor_wrapper_matches_real_module.
+
+    Tolerance is not bit-exact (unlike the other tests here): the real
+    module computes one batched causal softmax over the whole prefill
+    chunk, while this plugin's attention (see DeepseekV4Attention's
+    docstring on the per-token loop) computes the same causal attention one
+    token at a time. Same math, different floating-point summation order --
+    expected non-associativity noise, not a logic bug (this is the same
+    kind of difference already documented and tolerated in
+    test_deepseek_v4_model_assembly.py's chunk-invariance test).
+    """
+    config = hf_config()
+    torch.manual_seed(1)
+    # A dedicated sliding-only config: hf_config()'s layer 1 is
+    # sliding_attention but shares num_hidden_layers=3 with compressed
+    # layers, which would build unused compressor caches. A clean 1-layer
+    # config keeps this test focused on attention alone.
+    sliding_config = DeepseekV4Config(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        moe_intermediate_size=config.moe_intermediate_size,
+        num_local_experts=config.num_local_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        vocab_size=config.vocab_size,
+        num_hidden_layers=1,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=1,
+        head_dim=config.head_dim,
+        q_lora_rank=config.q_lora_rank,
+        sliding_window=128,
+        layer_types=["sliding_attention"],
+        mlp_layer_types=["moe"],
+    )
+    real = tm.DeepseekV4ForCausalLM(sliding_config).eval()
+    with torch.no_grad():
+        for p in real.parameters():
+            p.uniform_(-0.1, 0.1)
+    real_attn = real.model.layers[0].self_attn
+
+    device_model = dev.DeepseekV4ForCausalLM.from_configs(sliding_config).eval()
+    my_attn = device_model.model.layers[0].attention
+    with torch.no_grad():
+        my_attn.q_a_proj.weight.copy_(real_attn.q_a_proj.weight)
+        my_attn.q_a_norm.weight.copy_(real_attn.q_a_norm.weight)
+        my_attn.q_b_proj.weight.copy_(real_attn.q_b_proj.weight)
+        my_attn.kv_proj.weight.copy_(real_attn.kv_proj.weight)
+        my_attn.kv_norm.weight.copy_(real_attn.kv_norm.weight)
+        my_attn.sinks.copy_(real_attn.sinks)
+
+    tokens = 5
+    hidden = torch.randn(1, tokens, sliding_config.hidden_size)
+    position_ids = torch.arange(tokens).unsqueeze(0)
+    cos, sin = real.model.rotary_emb(
+        hidden, position_ids=position_ids, layer_type=real_attn.rope_layer_type
+    )
+    position_embeddings = {real_attn.rope_layer_type: (cos, sin)}
+    causal_mask = torch.triu(torch.full((1, 1, tokens, tokens), float("-inf")), diagonal=1)
+
+    captured_real = {}
+    handle_real = real_attn.o_a_proj.register_forward_hook(
+        lambda module, args, output: captured_real.__setitem__("x", args[0])
+    )
+    with torch.no_grad():
+        real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
+    handle_real.remove()
+    real_pre_oproj = captured_real["x"].reshape(
+        1, tokens, sliding_config.num_attention_heads, sliding_config.head_dim
+    )
+
+    specs = device_model.get_kv_spec().layers
+    caches = {
+        s.name: [torch.zeros((64, 1, s.block_size or 32, s.head_size), dtype=s.dtype)]
+        for s in specs
+    }
+    device_model.bind_kv_cache(caches)
+
+    block_table = torch.arange(8, dtype=torch.int32).unsqueeze(0)
+    slot_mapping = torch.arange(tokens, dtype=torch.int64)
+    attn_metadata = {
+        s.name: {
+            "block_table_tensor": block_table,
+            "slot_mapping": slot_mapping,
+            "max_query_len": tokens,
+            "block_size": s.block_size or 32,
+            "max_blocks_per_seq": 8,
+            "decode_token_threshold": 1,
+            "cached_seq_len": torch.tensor([[0]], dtype=torch.int32),
+            "kv_segment_size": 0,
+        }
+        for s in specs
+    }
+
+    captured_mine = {}
+    handle_mine = my_attn.o_proj.register_forward_hook(
+        lambda module, args, output: captured_mine.__setitem__("x", args[0])
+    )
+    with torch.no_grad():
+        my_attn(
+            hidden.squeeze(0),
+            self_attn_name="model.layers.0.self_attn",
+            attn_metadata=attn_metadata,
+        )
+    handle_mine.remove()
+    my_pre_oproj = captured_mine["x"].view(
+        1, tokens, sliding_config.num_attention_heads, sliding_config.head_dim
+    )
+
+    torch.testing.assert_close(real_pre_oproj, my_pre_oproj, rtol=1e-3, atol=5e-4)

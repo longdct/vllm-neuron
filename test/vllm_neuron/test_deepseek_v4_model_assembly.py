@@ -30,7 +30,7 @@ def hf_config():
         num_experts_per_tok=2,
         vocab_size=64,
         num_hidden_layers=4,
-        num_attention_heads=1,
+        num_attention_heads=4,
         num_key_value_heads=1,
         head_dim=16,
         q_lora_rank=16,

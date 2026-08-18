@@ -32,6 +32,7 @@ class TinyDeepseekV4Config:
     hc_sinkhorn_iters: int = 20
     rms_norm_eps: float = 1e-6
     hc_eps: float = 1e-6
+    swiglu_limit: float = 10.0
     layers: tuple[TinyLayerConfig, ...] = (
         TinyLayerConfig(128, "hash_moe"),
         TinyLayerConfig(0, "routed_moe"),

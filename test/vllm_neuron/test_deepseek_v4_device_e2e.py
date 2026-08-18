@@ -20,6 +20,47 @@ Requires ``VLLM_NEURON_CPU_MODE=1`` (no Neuron hardware/compilation needed)
 and explicitly opts the model into the registry via
 ``VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`` -- it stays unregistered by default
 (``vllm_neuron/model/registry.py``).
+
+Passes a real ``generate()`` call end to end. Getting here required three
+fixes beyond the model itself, all documented where they were made:
+
+- A real bug in ``mla_cache_shape`` (``input_batch_params.py``): it ignored
+  ``page_size_padded``, so the physical view of a merged/padded
+  heterogeneous cache group was sized wrong by exactly the padding factor.
+  This is the fix for what the previous version of this test's ``xfail``
+  described.
+- A missing ``@torch.no_grad()`` on ``DeepseekV4ForCausalLM.forward`` (every
+  other model in this plugin has one on its top-level forward; this one
+  didn't, so returned logits carried grad-tracking into the sampler).
+- Two ``additional_config`` overrides below (``async_scheduling=False``,
+  ``on_device_sampling_config=None``): on-device sampling is this plugin's
+  *default* (``on_device_sampling_config`` defaults to a non-``None`` value,
+  and async scheduling unconditionally skips the CPU sampler), which this
+  model does not implement -- it returns bare logits (the "CPU sampling, no
+  ODS" contract). Implementing on-device sampling is separate, unbuilt work.
+
+Run this file alone, or as part of ``test/vllm_neuron/`` alone -- both pass
+cleanly and exercise the real engine end to end. **Do not read anything into
+a failure of this specific test when it runs after ``test/unit/model/``** in
+the same ``pytest`` process (e.g. the combined ``pytest test/unit
+test/vllm_neuron`` invocation): this is a real, pre-existing, order-dependent
+environment bug, not a DeepSeek-V4 regression. ``vllm.platforms`` resolves
+``current_platform`` lazily on first access and then caches it for the rest
+of the process (see the docstring on ``vllm.platforms.__getattr__``, which
+warns about exactly this hazard); something earlier in ``test/unit/model/``
+sometimes causes that first access to happen before this plugin's
+``vllm_neuron:register`` entry point is visible, permanently caching
+``UnspecifiedPlatform`` (empty ``device_type``) instead of ``NeuronPlatform``
+for the remainder of the process, and every later ``vllm.LLM()`` call fails
+in ``DeviceConfig.__post_init__`` with ``RuntimeError: Device string must
+not be empty`` -- before this model's code runs at all. Confirmed present
+already on the pre-existing ``@pytest.mark.xfail(strict=False)`` this test
+used to carry: `--runxfail` on that version shows the exact same exception,
+not the documented one, meaning the xfail was masking this all along rather
+than the KV-cache-shape bug its reason text described. Fixing vLLM's
+plugin-resolution ordering (or this repo's test/unit/conftest.py stubbing,
+a plausible contributor -- see its own module docstring) is a separate,
+pre-existing test-infrastructure concern, out of scope here.
 """
 
 import json
@@ -137,8 +178,26 @@ def _run(tensor_parallel_size: int):
         enable_prefix_caching=False,
         skip_tokenizer_init=True,
         num_gpu_blocks_override=256,
+        # Two independent on-device-sampling assumptions to route around --
+        # this model implements the "CPU sampling (no ODS)" contract (bare
+        # logits return), not on-device sampling, which is real, separate,
+        # unbuilt work and not part of this pass:
+        #  1. Async scheduling (on by default) unconditionally treats the
+        #     model's return value as already-sampled token ids
+        #     (neuron_model_runner.py::_sample's async branch skips the CPU
+        #     sampler entirely) -- forcing sync scheduling restores the CPU
+        #     sampler call.
+        #  2. NeuronConfig.on_device_sampling_config defaults to a
+        #     *non-None* factory value, so `on_device_sampling` is True
+        #     unless explicitly cleared -- even with sync scheduling, a
+        #     True value here still takes the ODS branch inside `_sample`
+        #     and treats bare logits as pre-sampled ids.
+        async_scheduling=False,
         additional_config={
-            "neuron_config": {"num_batched_tokens_buckets": [8, 64]}
+            "neuron_config": {
+                "num_batched_tokens_buckets": [8, 64],
+                "on_device_sampling_config": None,
+            }
         },
     )
     outputs = llm.generate(
@@ -146,29 +205,10 @@ def _run(tensor_parallel_size: int):
         SamplingParams(temperature=0.0, max_tokens=4),
     )
     assert len(outputs) == 1
-    assert len(outputs[0].outputs[0].token_ids) > 0
+    token_ids = outputs[0].outputs[0].token_ids
+    assert len(token_ids) == 4
+    assert all(0 <= t < 64 for t in token_ids)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Progress marker, not a skip: this reaches "
-        "neuron_model_runner.py::initialize_kv_cache's UniformTypeKVCacheSpecs "
-        "branch (`raw_tensor.view(...).view(mla_cache_shape(...))` fails -- "
-        "'shape [2304, 1, 1, 16] is invalid for input of size 147456') for the "
-        "padded/merged heterogeneous cache-group case vLLM's "
-        "_get_kv_cache_groups_uniform_groups builds for DeepSeek-V4's mixed "
-        "SWA/compressed-MLA/compressor-state layout. That merged-group sizing "
-        "path is exercised here for the first time ever (nothing has "
-        "previously registered a heterogeneous-cache model) and needs its own "
-        "fix in neuron_model_runner.py, out of scope for this pass. Two other "
-        "bugs blocking earlier in the same code path -- "
-        "`self.model_config` -> `self.vllm_config.model_config`, and the "
-        "'sparse'/'dense' vs 'hash_moe'/'moe' mlp_layer_types vocabulary clash "
-        "between vLLM's and this plugin's DeepseekV4Config validators -- were "
-        "found and fixed/worked around getting this far. Retry without xfail "
-        "once the view/shape bug above is fixed."
-    ),
-    strict=False,
-)
 def test_deepseek_v4_generates_through_the_real_engine_tp1():
     _run(tensor_parallel_size=1)

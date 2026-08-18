@@ -13,17 +13,23 @@ DeepSeek-V4 GPU backend.
 
 Scope deliberately held simplified for this pass (documented, not silent):
 
-* Attention keeps the single-global-head, no-q_lora, no-RoPE structure
-  already established by ``tiny_model.py`` / T0 (``latent``/``query``/
-  ``key_weight``/``value_weight``/``out``) rather than the real multi-head
-  q_lora/kv_lora/partial-RoPE MLA architecture. The compressor uses the
-  *real* gated ``compress_hca_chunk``/``compress_csa_chunk`` math, but its
-  RMSNorm+RoPE finalization step (``finalize_compressed_entries``) is
-  exercised in RoPE-degenerate mode (rope_dim=0) to keep it consistent with
-  the query side never seeing RoPE either. Wiring the real q_lora/kv_lora/
-  partial-RoPE attention is follow-up work, not a correctness regression:
-  the simplified structure is exactly what T0 already validates as the
-  oracle.
+* Attention is now the real multi-head q_lora/kv_proj/partial-RoPE MLA
+  architecture, cross-validated (0.0 diff pre-output-projection) against
+  ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Attention``
+  -- q_lora down/norm/up projection, a shared single-latent kv_proj+norm
+  (K=V, broadcast to every query head -- there is no separate per-head K/V
+  up-projection in the real architecture either), partial interleaved RoPE
+  on the trailing ``qk_rope_head_dim`` channels (real
+  ``DeepseekV4RotaryEmbedding``, reused directly rather than
+  reimplemented), attention sinks, and the real architecture's "K=V, so
+  undo RoPE on the attended output at the query's own position" step. The
+  one deliberate simplification is the output projection: the real
+  architecture uses a grouped low-rank ``o_a_proj``/``o_b_proj``
+  (``DeepseekV4GroupedLinear``); this uses a plain dense
+  ``Linear(num_heads*head_dim, hidden_size)`` instead -- a parameter-count
+  optimization, not a defining MLA characteristic, and not yet built here.
+  The compressor's RMSNorm+RoPE finalization now uses real RoPE too
+  (``rope_layer_type="compress"``), matching the query side.
 * Expert-parallel MoE is numerically correct at any ``ep_degree`` (each rank
   masks contributions to its own contiguous expert range and the group
   all-reduces the sum -- partitioned experts summed via all-reduce
@@ -31,7 +37,11 @@ Scope deliberately held simplified for this pass (documented, not silent):
   dispatch in ``vllm_neuron.parallel.all2all``: every rank still runs dense
   compute over all tokens rather than gathering only the tokens routed to
   its local experts. Fine for this pass's correctness goal; a follow-up for
-  throughput.
+  throughput. ``DeepseekV4Expert``'s per-expert FFN now matches the real
+  ``DeepseekV4MLP``/``DeepseekV4Experts`` exactly: ``[out, in]``-layout
+  ``gate_up_proj``/``down_proj`` driven through ``F.linear`` and a
+  ``swiglu_limit``-clamped gate/up before the SiLU*up product, not the
+  earlier unclamped ``[in, out]`` approximation.
 * Real checkpoint loading/quantization and P7-P9 memory calibration are out
   of scope; ``load_weights`` still delegates to the existing, unchanged
   ``weight_loaders.py`` contract.
@@ -45,6 +55,7 @@ from torch.nn import functional as F
 
 from ..kv_cache import CacheKind, KVSpec, LayerSpec
 from .attention import (
+    apply_partial_rotary,
     compressed_entry_slot_mapping,
     gather_paged_latent,
     mla_attention_reference,
@@ -85,6 +96,7 @@ def reference_config_from_hf(hf_config) -> TinyDeepseekV4Config:
         hc_sinkhorn_iters=normalized.hc_sinkhorn_iters,
         rms_norm_eps=float(getattr(hf_config, "rms_norm_eps", 1e-6)),
         hc_eps=float(getattr(hf_config, "hc_eps", 1e-6)),
+        swiglu_limit=float(getattr(hf_config, "swiglu_limit", 10.0)),
         layers=tuple(
             TinyLayerConfig(layer.compress_ratio, layer.mlp.value)
             for layer in normalized.layers
@@ -169,6 +181,9 @@ class DeepseekV4Compressor(nn.Module):
         head_dim: int,
         ratio: int,
         rms_norm_eps: float,
+        *,
+        rotary_emb,
+        qk_rope_head_dim: int,
     ):
         super().__init__()
         if ratio not in (4, 128):
@@ -182,6 +197,11 @@ class DeepseekV4Compressor(nn.Module):
         self.fused_wkv_wgate = nn.Linear(hidden_size, 2 * self.width, bias=False)
         self.ape = nn.Parameter(torch.randn(ratio, self.width) * 0.02)
         self.norm_weight = nn.Parameter(torch.ones(head_dim))
+        # Shared with DeepseekV4Attention: one rotary_emb per model (matches
+        # the real architecture's single model.rotary_emb), selected here via
+        # rope_layer_type="compress" -- see DeepseekV4RotaryEmbedding.forward.
+        self.rotary_emb = rotary_emb
+        self.qk_rope_head_dim = qk_rope_head_dim
         # Bound by bind_kv_cache: raw [blocks, 1, slots, 2*width] carry cache.
         self.state_cache: torch.Tensor | None = None
 
@@ -254,13 +274,22 @@ class DeepseekV4Compressor(nn.Module):
         write_count = min(int(valid_slots.shape[0]), compressed.shape[1])
         compressed = compressed[:, :write_count]
         if compressed.shape[1]:
-            # RoPE-degenerate finalize (rope_dim=0): the query side never
-            # gets a corresponding RoPE encoding in this pass's simplified
-            # attention (see module docstring), so the cache stays
-            # RMSNorm-only for consistency rather than half-applying RoPE.
-            empty_trig = compressed.new_zeros((*compressed.shape[:-1], 0))
+            # Real RoPE, matching the real architecture's compressor exactly
+            # (rope_layer_type="compress"): window k's entry position is
+            # first_window_position + k*ratio, where first_window_position is
+            # the absolute raw-token position of the first NEW window this
+            # call writes -- (cached_seq_len // ratio) windows were already
+            # complete (and their positions already emitted) before this call.
+            first_window_position = (cached_seq_len // self.ratio) * self.ratio
+            entry_positions = (
+                first_window_position
+                + torch.arange(compressed.shape[1], device=compressed.device) * self.ratio
+            ).unsqueeze(0)
+            cos, sin = self.rotary_emb(
+                compressed, position_ids=entry_positions, layer_type="compress"
+            )
             finalized = finalize_compressed_entries(
-                compressed, self.norm_weight, self.rms_norm_eps, empty_trig, empty_trig
+                compressed, self.norm_weight, self.rms_norm_eps, cos, sin
             )
             entry_slots = valid_slots[:write_count]
             scatter_paged_latent(mla_cache, entry_slots, finalized.squeeze(0))
@@ -272,23 +301,52 @@ class DeepseekV4Compressor(nn.Module):
 
 
 class DeepseekV4Attention(nn.Module):
-    """Single-global-head MLA attention with real paged cache I/O.
+    """Real multi-head q_lora/kv_proj/partial-RoPE MLA attention.
+
+    Cross-validated (0.0 diff pre-output-projection; see
+    ``test_deepseek_v4_matches_real_architecture.py``) against
+    ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Attention``.
+    K=V in this architecture -- ``kv_proj``/``kv_norm`` produce one shared
+    latent per token, broadcast to every query head via an identity
+    "up-projection" (there is no learned per-head K/V matrix to begin with,
+    real or otherwise), matching the real architecture exactly rather than
+    approximating it. RoPE is real (``DeepseekV4RotaryEmbedding``, shared
+    with the compressor), applied to the trailing ``qk_rope_head_dim``
+    channels of q and kv, with the real architecture's "undo RoPE on the
+    attended output at the query's own position" step afterward (needed
+    because K=V means the attended output -- a weighted average of RoPE'd
+    V -- inherits a position-dependent rotation that has to be removed
+    before the output projection mixes heads). See the module docstring for
+    the one deliberate simplification (a dense, not grouped-low-rank,
+    output projection).
 
     >>> PARALLELISM: TP <<<
-    MLA's shared latent must be identical on every rank (it feeds the
-    compressed cache), so ``latent``/``query``/``key_weight`` stay fully
-    replicated. Only ``value_weight``'s output width and ``out``'s input
-    width are sharded (column-then-row-parallel), with an all-reduce after
-    ``out`` -- the correct TP split for a single shared-KV head, as opposed
-    to GQA-style head sharding which does not apply here.
+    ``kv_proj``/``kv_norm``/``q_a_proj``/``q_a_norm`` stay fully replicated
+    (the shared latent must be identical on every rank -- it feeds the
+    compressed cache). ``q_b_proj``'s output and ``o_proj``'s input are
+    head-sharded (``num_heads // world_size`` heads per rank, the standard
+    MLA TP split), with an all-reduce after ``o_proj``.
     """
 
-    def __init__(self, config: TinyDeepseekV4Config, ratio: int, rms_norm_eps: float):
+    def __init__(
+        self,
+        config: TinyDeepseekV4Config,
+        ratio: int,
+        rms_norm_eps: float,
+        *,
+        hf_config,
+        rotary_emb,
+    ):
         super().__init__()
         self.ratio = ratio
         self.hidden_size = config.hidden_size
-        self.latent_size = config.latent_size
+        self.head_dim = config.latent_size
         self.sliding_window = config.sliding_window
+        self.qk_rope_head_dim = int(hf_config.qk_rope_head_dim)
+        self.rope_layer_type = "main" if ratio == 0 else "compress"
+        self.rotary_emb = rotary_emb
+        num_heads = int(hf_config.num_attention_heads)
+        q_lora_rank = int(hf_config.q_lora_rank)
 
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -303,25 +361,47 @@ class DeepseekV4Attention(nn.Module):
             # group would give.
             self.tp_group = None
             self.world_size = 1
-        if self.hidden_size % self.world_size:
+        if num_heads % self.world_size:
             raise ValueError(
-                f"hidden_size={self.hidden_size} must be divisible by TP "
+                f"num_attention_heads={num_heads} must be divisible by TP "
                 f"world_size={self.world_size}"
             )
-        self.hidden_per_rank = self.hidden_size // self.world_size
+        self.heads_per_rank = num_heads // self.world_size
 
-        self.latent = nn.Linear(config.hidden_size, config.latent_size, bias=False)
-        self.query = nn.Linear(config.hidden_size, config.latent_size, bias=False)
-        self.key_weight = nn.Parameter(torch.eye(config.latent_size).unsqueeze(0))
-        self.value_weight = nn.Parameter(
-            torch.randn(1, config.latent_size, self.hidden_per_rank)
-            / config.latent_size**0.5
+        self.q_a_proj = nn.Linear(config.hidden_size, q_lora_rank, bias=False)
+        self.q_a_norm = nn.RMSNorm(q_lora_rank, eps=rms_norm_eps)
+        self.q_b_proj = nn.Linear(
+            q_lora_rank, self.heads_per_rank * self.head_dim, bias=False
         )
-        self.out = nn.Linear(self.hidden_per_rank, config.hidden_size, bias=False)
+        # q_b_norm is unweighted (transformers.DeepseekV4UnweightedRMSNorm --
+        # variance normalization, no learned scale) and applied inline in
+        # _forward_one_token; no parameters to own here.
+        self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_norm = nn.RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.o_proj = nn.Linear(
+            self.heads_per_rank * self.head_dim, config.hidden_size, bias=False
+        )
+        self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
+        # K=V broadcast to every head: mla_attention_reference projects a
+        # shared latent to per-head K/V via key_weight/value_weight matrices,
+        # designed for a *learned* up-projection. The real architecture has
+        # none -- an identity matrix per head reproduces the real "same
+        # latent, every head" broadcast exactly (validated directly; see the
+        # class docstring) without needing a second oracle function.
+        self.register_buffer(
+            "identity_kv_weight",
+            torch.eye(self.head_dim).unsqueeze(0).expand(self.heads_per_rank, -1, -1),
+            persistent=False,
+        )
 
         self.compressor = (
             DeepseekV4Compressor(
-                config.hidden_size, config.latent_size, ratio, rms_norm_eps
+                config.hidden_size,
+                self.head_dim,
+                ratio,
+                rms_norm_eps,
+                rotary_emb=rotary_emb,
+                qk_rope_head_dim=self.qk_rope_head_dim,
             )
             if ratio
             else None
@@ -397,11 +477,28 @@ class DeepseekV4Attention(nn.Module):
         swa_block_table = swa_entry["block_table_tensor"][request]
         swa_slot = swa_entry["slot_mapping"][local_index : local_index + 1]
 
-        latent_new = self.latent(hidden)
-        scatter_paged_latent(self.swa_cache, swa_slot, latent_new)
+        # cos/sin at this token's own absolute position -- shared by q's
+        # forward rotation, kv's forward rotation (baked into what gets
+        # cached), and the attended output's inverse rotation at the end
+        # (real architecture's "K=V, so undo RoPE on the output" step; see
+        # the class docstring).
+        position_ids = hidden.new_tensor([[cached_seq_len]], dtype=torch.long)
+        cos, sin = self.rotary_emb(hidden, position_ids=position_ids, layer_type=self.rope_layer_type)
+
+        q = self.q_b_proj(self.q_a_norm(self.q_a_proj(hidden)))
+        q = q.view(1, 1, self.heads_per_rank, self.head_dim)
+        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.q_a_norm.eps).to(q.dtype)
+        cos_h, sin_h = cos.unsqueeze(2), sin.unsqueeze(2)  # broadcast over heads
+        q_roped = apply_partial_rotary(q, cos_h, sin_h, rope_dim=self.qk_rope_head_dim)
+
+        kv = self.kv_norm(self.kv_proj(hidden))  # [1, head_dim]
+        kv_roped = apply_partial_rotary(
+            kv.unsqueeze(0), cos, sin, rope_dim=self.qk_rope_head_dim
+        ).squeeze(0)
+        scatter_paged_latent(self.swa_cache, swa_slot, kv_roped)
 
         swa_history = self._swa_history(swa_block_table, cached_seq_len)
-        history = torch.cat((swa_history, latent_new), dim=0)
+        history = torch.cat((swa_history, kv_roped), dim=0)
         if len(history) > self.sliding_window:
             history = history[-self.sliding_window :]
 
@@ -426,14 +523,18 @@ class DeepseekV4Attention(nn.Module):
             )
             history = torch.cat((compressed_history, history), dim=0)
 
-        query = self.query(hidden).view(1, 1, 1, self.latent_size)
-        return mla_attention_reference(
-            query,
+        attended = mla_attention_reference(
+            q_roped,
             history.view(1, -1, history.shape[-1]),
-            self.key_weight,
-            self.value_weight,
+            self.identity_kv_weight,
+            self.identity_kv_weight,
+            attention_sinks=self.sinks,
             sliding_window=self.sliding_window if self.ratio == 0 else None,
-        ).view(1, self.hidden_per_rank)
+        )  # [1, 1, heads_per_rank, head_dim]
+        attended = apply_partial_rotary(
+            attended, cos_h, sin_h, rope_dim=self.qk_rope_head_dim, inverse=True
+        )
+        return attended.reshape(1, self.heads_per_rank * self.head_dim)
 
     def forward(
         self,
@@ -461,25 +562,38 @@ class DeepseekV4Attention(nn.Module):
             )
         attended = torch.cat(attended_rows, dim=0)
 
-        out = self.out(attended)
+        out = self.o_proj(attended)
         if self.world_size > 1:
             out = self.tp_group.all_reduce(out)
         return out
 
 
 class DeepseekV4Expert(nn.Module):
-    """One dense SwiGLU expert (shared expert, or one routed-expert row)."""
+    """One dense SwiGLU expert (shared expert, or one routed-expert row).
 
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    Matches the real architecture's ``DeepseekV4MLP``/``DeepseekV4Experts``
+    exactly: ``[out, in]``-layout weights driven through ``F.linear`` (not
+    ``[in, out]`` driven through plain ``@``), and gate/up clamped to
+    ``swiglu_limit`` before the SiLU*up product -- an unclamped SwiGLU is a
+    real numerical divergence for any input large enough to matter, not just
+    a cosmetic layout difference. See
+    ``test_deepseek_v4_matches_real_architecture.py``'s
+    ``test_expert_wrapper_matches_real_module``.
+    """
+
+    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float):
         super().__init__()
-        self.gate_up_proj = nn.Parameter(torch.randn(hidden_size, 2 * intermediate_size) * 0.02)
-        self.down_proj = nn.Parameter(torch.randn(intermediate_size, hidden_size) * 0.02)
+        self.gate_up_proj = nn.Parameter(torch.randn(2 * intermediate_size, hidden_size) * 0.02)
+        self.down_proj = nn.Parameter(torch.randn(hidden_size, intermediate_size) * 0.02)
         self.intermediate_size = intermediate_size
+        self.swiglu_limit = swiglu_limit
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        gate_up = hidden @ self.gate_up_proj
-        gate, up = gate_up.split(self.intermediate_size, dim=-1)
-        return (F.silu(gate) * up) @ self.down_proj
+        gate_up = F.linear(hidden, self.gate_up_proj)
+        gate, up = gate_up.chunk(2, dim=-1)
+        gate = gate.clamp(max=self.swiglu_limit)
+        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+        return F.linear(F.silu(gate) * up, self.down_proj)
 
 
 class DeepseekV4MoE(nn.Module):
@@ -522,11 +636,13 @@ class DeepseekV4MoE(nn.Module):
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.experts = nn.ModuleList(
             [
-                DeepseekV4Expert(config.hidden_size, intermediate)
+                DeepseekV4Expert(config.hidden_size, intermediate, config.swiglu_limit)
                 for _ in range(self.num_local_experts)
             ]
         )
-        self.shared_experts = DeepseekV4Expert(config.hidden_size, intermediate)
+        self.shared_experts = DeepseekV4Expert(
+            config.hidden_size, intermediate, config.swiglu_limit
+        )
         self.correction_bias = nn.Parameter(torch.zeros(config.num_experts))
         self._vocab_size = config.vocab_size
         self.register_buffer(
@@ -611,10 +727,23 @@ class DeepseekV4DecoderLayer(nn.Module):
     found, and it is now applied here.
     """
 
-    def __init__(self, config: TinyDeepseekV4Config, layer: TinyLayerConfig):
+    def __init__(
+        self,
+        config: TinyDeepseekV4Config,
+        layer: TinyLayerConfig,
+        *,
+        hf_config,
+        rotary_emb,
+    ):
         super().__init__()
         self.ratio = layer.compress_ratio
-        self.attention = DeepseekV4Attention(config, layer.compress_ratio, config.rms_norm_eps)
+        self.attention = DeepseekV4Attention(
+            config,
+            layer.compress_ratio,
+            config.rms_norm_eps,
+            hf_config=hf_config,
+            rotary_emb=rotary_emb,
+        )
         self.moe = DeepseekV4MoE(config, layer.mlp_kind)
         self.attn_hc = DeepseekV4HyperConnection(config)
         self.ffn_hc = DeepseekV4HyperConnection(config)
@@ -645,12 +774,27 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module):
     """Decoder body with checkpoint-compatible top-level parameter names."""
 
-    def __init__(self, config: TinyDeepseekV4Config):
+    def __init__(self, config: TinyDeepseekV4Config, hf_config):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # One rotary_emb shared by every layer's attention and compressor,
+        # matching the real architecture's single model.rotary_emb -- it
+        # holds both the "main" (sliding-window layers) and "compress"
+        # (compressed-attention layers and their compressors) inv_freq
+        # tables internally, selected per call via layer_type.
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+            DeepseekV4RotaryEmbedding,
+        )
+
+        rotary_emb = DeepseekV4RotaryEmbedding(hf_config)
         self.layers = nn.ModuleList(
-            [DeepseekV4DecoderLayer(config, layer) for layer in config.layers]
+            [
+                DeepseekV4DecoderLayer(
+                    config, layer, hf_config=hf_config, rotary_emb=rotary_emb
+                )
+                for layer in config.layers
+            ]
         )
         # Named hc_head, matching the real transformers.DeepseekV4Model
         # attribute (confirmed by direct comparison) and
@@ -684,16 +828,16 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     is_text_generation_model = True
 
-    def __init__(self, config: TinyDeepseekV4Config):
+    def __init__(self, config: TinyDeepseekV4Config, hf_config):
         super().__init__()
         self.config = config
-        self.model = DeepseekV4Model(config)
+        self.model = DeepseekV4Model(config, hf_config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None):
         del neuron_config
-        return cls(reference_config_from_hf(hf_config))
+        return cls(reference_config_from_hf(hf_config), hf_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -793,6 +937,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     f"{prefix}.compressor.state_cache"
                 ][0]
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,

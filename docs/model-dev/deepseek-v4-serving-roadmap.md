@@ -11,16 +11,28 @@
 > Registration is opt-in behind `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`
 > (`registry.py`) — **still not default**, because what follows is still
 > true: real checkpoint loading/quantization (P9) and memory calibration
-> (P7b/P8) are not built, and the attention structure is still the
-> simplified single-global-head, no-q_lora, no-RoPE shape `tiny_model.py`
-> established at T0 rather than the full multi-head q_lora/kv_lora/RoPE MLA
-> architecture — a real checkpoint would not load correctly against it today.
+> (P7b/P8) are not built. (Attention was upgraded to the real multi-head
+> q_lora/kv_lora/RoPE MLA architecture and the expert FFN to the real
+> clamped-SwiGLU, `[out,in]`-layout `DeepseekV4Experts`/`DeepseekV4MLP` shape
+> — see below; the output projection is the one attention piece still
+> simplified, a plain dense `Linear` instead of the real grouped low-rank
+> `o_a_proj`/`o_b_proj`.)
 > An end-to-end `vllm.LLM()` run
-> (`test/vllm_neuron/test_deepseek_v4_device_e2e.py`) reaches real KV-cache
-> initialization and surfaces genuine, previously-undiscovered bugs in the
-> heterogeneous-cache-group runner code path that this effort is the first
-> thing to actually exercise; two are fixed, one remains and is documented
-> on that test's `xfail`.
+> (`test/vllm_neuron/test_deepseek_v4_device_e2e.py`) now completes a real
+> `generate()` call — registration, config resolution, weight loading,
+> heterogeneous KV-cache initialization, forward, and CPU sampling all run
+> through the actual engine. Getting there surfaced and fixed four
+> previously-undiscovered bugs this effort is the first thing to exercise:
+> a real one in `mla_cache_shape` (`input_batch_params.py`) that ignored
+> `page_size_padded` when vLLM pads a merged heterogeneous cache group,
+> sizing the physical tensor view wrong by exactly the padding factor; a
+> missing `@torch.no_grad()` on the model's top-level forward (every other
+> model in this plugin has one); and two config facts specific to this
+> model's CPU-sampling (non-ODS) contract that needed making explicit
+> rather than fixed — on-device sampling is this plugin's *default*
+> (`async_scheduling` and `on_device_sampling_config` both assume it unless
+> told otherwise), and this model doesn't implement it. All four are
+> detailed in the test file's own comments.
 >
 > **Direct comparison against the real architecture**
 > (`test/vllm_neuron/test_deepseek_v4_matches_real_architecture.py`): every
@@ -38,8 +50,31 @@
 > conventions: the final head is `hc_head`, not `hyper_head`, and mHC scale
 > parameters are `hc_scale` everywhere (avoiding the separate collision
 > with `weight_loaders.py`'s FP8-dequant `.scale` convention found earlier).
-> Attention and expert-FFN internals remain the documented, deliberate
-> simplifications — not compared, since they're not meant to match.
+>
+> **Attention was then rewritten to the real multi-head q_lora/kv_lora/
+> partial-RoPE MLA design** (real `q_a_proj`/`q_a_norm`/`q_b_proj`,
+> `kv_proj`/`kv_norm`, the real `DeepseekV4RotaryEmbedding`, attention sinks,
+> K=V broadcast via an identity "up-projection" since this plugin's MLA
+> cache stores one shared latent per token, and the real architecture's
+> undo-RoPE-on-the-output step) and cross-validated against the real module
+> both in isolation and through real paged cache I/O
+> (`test_attention_matches_real_module_through_paged_cache_io`); see
+> [`deepseek-v4-carry-cache-design.md`](deepseek-v4-carry-cache-design.md)
+> for the full account.
+>
+> **The expert FFN (`DeepseekV4Expert`, both routed and shared) was then
+> rewritten to match the real `DeepseekV4Experts`/`DeepseekV4MLP` exactly**:
+> `[out, in]`-layout `gate_up_proj`/`down_proj` driven through `F.linear`
+> (not the earlier `[in, out]`-layout plain `@`), and gate/up clamped to
+> `swiglu_limit` before the SiLU*up product (not the earlier unclamped
+> SwiGLU — a real numerical divergence for any input large enough to hit the
+> clamp, not just a cosmetic layout difference). Cross-validated exactly
+> (0.0 diff) against both the real routed-expert math and the real shared
+> expert in `test_expert_wrapper_matches_real_module`.
+>
+> The output projection (grouped low-rank `o_a_proj`/`o_b_proj`) remains the
+> one documented, deliberate simplification left — not compared, since it's
+> not meant to match.
 >
 > The rest of this document is the original gap analysis and is otherwise
 > unchanged below — read it as history for what was true before this pass,

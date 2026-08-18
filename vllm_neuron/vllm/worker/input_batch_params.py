@@ -57,7 +57,22 @@ class InputBatchGroupParams:
 
 
 def mla_cache_shape(spec, num_blocks: int) -> tuple[int, int, int, int]:
-    """Physical single-tensor MLA layout for one cache layer."""
+    """Physical single-tensor MLA layout for one cache layer.
+
+    ``num_blocks`` here is derived (by the caller, in
+    ``neuron_model_runner.py``) from ``raw_tensor.numel() //
+    spec.page_size_bytes`` -- and ``page_size_bytes`` already returns
+    ``page_size_padded`` when vLLM's heterogeneous-group merging
+    (``kv_cache_utils.py::_get_kv_cache_groups_uniform_groups``) has padded
+    this layer's page size up to match other layers sharing its raw tensor
+    (e.g. a DeepSeek-V4 compress_ratio=128 layer's natural 32B page padded to
+    128B alongside a compress_ratio=4 layer's 1024B one, so both fit the same
+    per-block byte stride). The tensor is *allocated* at that padded size, so
+    the view materialized from it must use the storage_block_size implied by
+    the padding, not the layer's own natural ``block_size // compress_ratio``
+    -- using the natural value here undercounts the view's element count by
+    exactly the padding factor and ``.view()`` raises.
+    """
     if num_blocks < 0:
         raise ValueError("num_blocks must be non-negative")
     if spec.block_size % spec.compress_ratio:
@@ -65,10 +80,20 @@ def mla_cache_shape(spec, num_blocks: int) -> tuple[int, int, int, int]:
             f"MLA block_size={spec.block_size} must be divisible by "
             f"compress_ratio={spec.compress_ratio}"
         )
+    storage_block_size = spec.storage_block_size
+    page_size_padded = getattr(spec, "page_size_padded", None)
+    if page_size_padded is not None:
+        bytes_per_row = spec.num_kv_heads * spec.head_size * spec.dtype.itemsize
+        if page_size_padded % bytes_per_row:
+            raise ValueError(
+                f"MLA page_size_padded={page_size_padded} is not a whole "
+                f"multiple of one storage row ({bytes_per_row} bytes)"
+            )
+        storage_block_size = page_size_padded // bytes_per_row
     return (
         num_blocks,
         spec.num_kv_heads,
-        spec.storage_block_size,
+        storage_block_size,
         spec.head_size,
     )
 

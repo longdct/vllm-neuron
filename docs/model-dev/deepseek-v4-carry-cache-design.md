@@ -85,17 +85,33 @@ replay-based design against incremental state-based chunking directly, for
 arbitrary chunk boundaries including exact multiples of `ratio` (the edge
 case most likely to hide an off-by-one).
 
-### RoPE is deliberately not applied to compressed entries in this pass
+### RoPE is now applied to compressed entries, at their absolute window position
 
-`compressor.py::finalize_compressed_entries` (RMSNorm + partial RoPE) is
-exercised in this pass's RoPE-degenerate mode (`rope_dim=0`, via an empty
-trailing `cos`/`sin` dimension) rather than with a real rotary table. The
-device path's attention keeps the same single-global-head, no-RoPE structure
-`tiny_model.py` already established as the T0 oracle (see `model.py`'s module
-docstring); RoPE-encoding only the compressed cache without a matching
-RoPE-aware query would be a real numerical inconsistency, not a partial
-improvement. Wiring the real multi-head q_lora/kv_lora/partial-RoPE MLA
-attention is follow-up work.
+`compressor.py::finalize_compressed_entries` (RMSNorm + partial RoPE) now runs
+with a real rotary table rather than the earlier RoPE-degenerate mode
+(`rope_dim=0` via an empty trailing `cos`/`sin` dimension). `model.py`'s
+`DeepseekV4Compressor.forward` computes each newly-completed entry's absolute
+position as `first_window_position + arange(new_entries) * ratio` (the token
+index the window *ends* on) and calls the shared
+`DeepseekV4RotaryEmbedding(..., layer_type="compress")` table at those
+positions before finalizing — matching the real architecture's dedicated
+"compress" rope type, which uses a different (shorter) effective sequence
+axis than the "main" per-token rope used for live queries/keys.
+
+The device path's attention was rewritten to match: real multi-head
+`q_a_proj`/`q_a_norm`/`q_b_proj` and `kv_proj`/`kv_norm`, RoPE applied to both
+query and the live (uncompressed) key/value latent at their own absolute
+token position, MQA via K=V broadcast (an identity "up-projection", since
+this plugin's MLA cache stores one shared latent per token rather than
+per-head K/V), attention sinks, and the real architecture's "undo RoPE on the
+attention output" step. See `model.py`'s `DeepseekV4Attention` docstring and
+`test_deepseek_v4_matches_real_architecture.py`'s
+`test_attention_matches_real_module_through_paged_cache_io`, which validates
+this end-to-end through real paged cache I/O against the real `transformers`
+module (not just the bare math in isolation). The one remaining deliberate
+simplification is the output projection: the real architecture's grouped
+low-rank `o_a_proj`/`o_b_proj` is replaced with a plain dense `Linear` — a
+parameter-count optimization, not a defining MLA characteristic.
 
 ## Mid-chunk compression boundaries force a per-token attention loop
 
