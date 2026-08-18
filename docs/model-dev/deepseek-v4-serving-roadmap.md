@@ -1,5 +1,50 @@
 # DeepSeek-V4: what remains before the model can be served
 
+> **Status: Steps 1-3 done, validated against the tiny/synthetic config.**
+> `model.py` now implements the real `attn_metadata`-driven batched forward
+> contract, real `bind_kv_cache`, and real paged cache I/O for the SWA,
+> compressed-MLA, and compressor-carry cache groups (design:
+> [`deepseek-v4-carry-cache-design.md`](deepseek-v4-carry-cache-design.md)).
+> TP scaffolding (column/row-parallel value/out projections) and EP
+> scaffolding (dense-compute-plus-all-reduce, numerically correct at any
+> `ep_degree`) are in place. `factory.py` matches the `ModelRegistry` pattern.
+> Registration is opt-in behind `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`
+> (`registry.py`) — **still not default**, because what follows is still
+> true: real checkpoint loading/quantization (P9) and memory calibration
+> (P7b/P8) are not built, and the attention structure is still the
+> simplified single-global-head, no-q_lora, no-RoPE shape `tiny_model.py`
+> established at T0 rather than the full multi-head q_lora/kv_lora/RoPE MLA
+> architecture — a real checkpoint would not load correctly against it today.
+> An end-to-end `vllm.LLM()` run
+> (`test/vllm_neuron/test_deepseek_v4_device_e2e.py`) reaches real KV-cache
+> initialization and surfaces genuine, previously-undiscovered bugs in the
+> heterogeneous-cache-group runner code path that this effort is the first
+> thing to actually exercise; two are fixed, one remains and is documented
+> on that test's `xfail`.
+>
+> **Direct comparison against the real architecture**
+> (`test/vllm_neuron/test_deepseek_v4_matches_real_architecture.py`): every
+> wrapper module this pass added or touched — `DeepseekV4HyperConnection`,
+> `DeepseekV4HyperHead`, the routed/hash MoE gates, and the HCA/CSA
+> compressor's projection+reduction+norm — matches
+> `transformers.models.deepseek_v4.modeling_deepseek_v4`'s real modules
+> exactly (0.0 diff) once driven by the same weights. That comparison is
+> also what found the one real bug this pass introduced and then fixed: an
+> earlier version of `DeepseekV4DecoderLayer` fed the mHC-collapsed hidden
+> state straight into attention/MoE, omitting the `input_layernorm`/
+> `post_attention_layernorm` the real layer applies first. It also surfaced
+> two harmless naming mismatches, now corrected to match both the real
+> module and the existing `weight_loaders.py` checkpoint-prefix
+> conventions: the final head is `hc_head`, not `hyper_head`, and mHC scale
+> parameters are `hc_scale` everywhere (avoiding the separate collision
+> with `weight_loaders.py`'s FP8-dequant `.scale` convention found earlier).
+> Attention and expert-FFN internals remain the documented, deliberate
+> simplifications — not compared, since they're not meant to match.
+>
+> The rest of this document is the original gap analysis and is otherwise
+> unchanged below — read it as history for what was true before this pass,
+> except where superseded above.
+
 `DeepseekV4ForCausalLM` is not registered with vLLM, and adding it to
 `vllm_neuron/model/registry.py` would not make the model servable. This document
 records why, what carries over, and what has to be built.

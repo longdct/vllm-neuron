@@ -25,6 +25,52 @@ class GatedCompressorState:
     total_tokens: int = 0
 
 
+def carry_gather_length(cached_seq_len: int, ratio: int, *, needs_overlap: bool) -> int:
+    """How many trailing raw-token rows to replay from the state cache.
+
+    The paged compressor-state cache (``CacheKind.COMPRESSOR_STATE``) retains
+    raw per-token ``[kv, gate]`` projections under an ordinary sliding-window
+    lifecycle -- see ``deepseek-v4-carry-cache-design.md``. Rather than
+    deserializing a :class:`GatedCompressorState` from the cache, the device
+    path gathers exactly the rows the state-based functions would have kept
+    as carry and replays them through ``compress_hca_chunk``/
+    ``compress_csa_chunk`` with ``state=None``; ``_join_gated_carry``'s own
+    ``torch.cat((state.kv_carry, kv), dim=1)`` makes the two paths produce
+    identical windows for identical inputs.
+
+    * HCA (``needs_overlap=False``): the only carry ``compress_hca_chunk``
+      keeps is the unconsumed suffix, ``cached_seq_len % ratio`` rows (always
+      < ``ratio``, so it can never itself contain a complete window -- no
+      already-emitted output to discard).
+    * CSA (``needs_overlap=True``): additionally needs the previous complete
+      window's raw rows, purely to re-derive ``overlap_kv``/``overlap_gate``
+      (``compress_csa_chunk`` computes those as ``windows[:, -1, ...]`` --
+      i.e. from raw rows, not a separately-stored reduction). That prepends
+      one full window whose output *was* already emitted; the caller must
+      discard exactly that many leading rows of ``compress_csa_chunk``'s
+      output (see :func:`carry_replay_already_emitted`).
+    """
+    if cached_seq_len < 0:
+        raise ValueError("cached_seq_len must be non-negative")
+    if ratio < 1:
+        raise ValueError("ratio must be positive")
+    unconsumed = cached_seq_len % ratio
+    if needs_overlap and cached_seq_len >= ratio:
+        return min(cached_seq_len, unconsumed + ratio)
+    return unconsumed
+
+
+def carry_replay_already_emitted(cached_seq_len: int, ratio: int, *, needs_overlap: bool) -> int:
+    """Leading output windows to drop after replaying :func:`carry_gather_length` rows.
+
+    Only CSA's overlap-reconstruction prepends a previously-completed
+    window, and only when one exists yet (``cached_seq_len >= ratio``); that
+    window's output was already emitted by an earlier chunk and must not be
+    written to the compressed cache a second time.
+    """
+    return 1 if (needs_overlap and cached_seq_len >= ratio) else 0
+
+
 def finalize_compressed_entries(
     compressed: torch.Tensor,
     norm_weight: torch.Tensor,

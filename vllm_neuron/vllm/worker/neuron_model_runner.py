@@ -8489,7 +8489,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_cache_config,
             self.vllm_config,
             self.max_model_len,
-            is_encoder_decoder=self.model_config.is_encoder_decoder,
+            is_encoder_decoder=self.vllm_config.model_config.is_encoder_decoder,
         )
         logger.info(
             "KV cache block_size resolved: cache_config=%s, per_group=%s, "

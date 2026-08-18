@@ -1,83 +1,72 @@
 # SPDX-License-Identifier: Apache-2.0
+"""DeepSeek-V4's ModelRegistry factory: config validation and delegation.
 
-from types import SimpleNamespace
+Replaces the old ``ComponentRegistry``/``resolve_layer_components`` tests --
+that per-layer dispatch helper had no equivalent in the roadmap's step 5
+factory pattern (``_select_implementation``/``_validate_config``, matching
+``qwen3/factory.py``) and per-layer attention/MLP resolution now happens
+directly inside ``model.py``'s ``DeepseekV4DecoderLayer`` construction,
+covered by ``test/vllm_neuron/test_deepseek_v4_model_assembly.py``'s
+``test_hf_config_builds_device_shaped_multi_variant_model``.
 
-from vllm_neuron.model.deepseek_v4.config import normalize_config
-from vllm_neuron.model.deepseek_v4.factory import (
-    ComponentRegistry,
-    LayerComponents,
-    resolve_layer_components,
-)
+This module imports through the ``vllm_neuron`` package ``__init__``, which
+needs vLLM (same reason this file is excluded from the CPU-only T0 gate on
+the device-validation runbook).
+"""
 
+import pytest
 
-class SlidingAttention: ...
+pytest.importorskip("torch")
+pytest.importorskip("transformers")
+pytest.importorskip("vllm")
 
+from transformers import DeepseekV4Config
 
-class C4Attention: ...
-
-
-class C128Attention: ...
-
-
-class HashMoE: ...
-
-
-class RoutedMoE: ...
-
-
-REGISTRY = ComponentRegistry(
-    SlidingAttention,
-    C4Attention,
-    C128Attention,
-    HashMoE,
-    RoutedMoE,
-)
+from vllm_neuron.model.deepseek_v4.factory import DeepseekV4ForCausalLM
+from vllm_neuron.model.neuron_config import NeuronConfig
 
 
-def config():
-    return normalize_config(
-        SimpleNamespace(
-            num_hidden_layers=4,
-            layer_types=[
-                "heavily_compressed_attention",
-                "sliding_attention",
-                "compressed_sparse_attention",
-                "heavily_compressed_attention",
-            ],
-            compress_rates={
-                "compressed_sparse_attention": 4,
-                "heavily_compressed_attention": 128,
-            },
-            mlp_layer_types=["hash_moe", "moe", "moe", "moe"],
-            sliding_window=128,
-            num_attention_heads=4,
-            num_key_value_heads=1,
-            head_dim=512,
-            n_routed_experts=4,
-            num_experts_per_tok=2,
-            n_shared_experts=1,
-            index_topk=512,
-            hc_mult=4,
-            hc_sinkhorn_iters=20,
-            num_nextn_predict_layers=0,
-            scoring_func="sqrtsoftplus",
-            topk_method="noaux_tc",
-        )
+def hf_config():
+    return DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=16,
+        q_lora_rank=16,
+        layer_types=["heavily_compressed_attention", "sliding_attention"],
+        mlp_layer_types=["moe", "moe"],
     )
 
 
-def test_all_attention_and_mlp_variants_resolve_per_layer():
-    assert resolve_layer_components(config(), REGISTRY) == (
-        LayerComponents(C128Attention, HashMoE),
-        LayerComponents(SlidingAttention, RoutedMoE),
-        LayerComponents(C4Attention, RoutedMoE),
-        LayerComponents(C128Attention, RoutedMoE),
+def test_from_configs_delegates_to_the_real_model():
+    from vllm_neuron.model.deepseek_v4.model import (
+        DeepseekV4ForCausalLM as RealModel,
     )
 
+    model = DeepseekV4ForCausalLM.from_configs(hf_config(), None)
+    assert isinstance(model, RealModel)
 
-def test_attention_kind_never_infers_mlp_kind():
-    resolved = resolve_layer_components(config(), REGISTRY)
-    assert resolved[0].attention is C128Attention
-    assert resolved[0].mlp is HashMoE
-    assert resolved[3].attention is C128Attention
-    assert resolved[3].mlp is RoutedMoE
+
+def test_factory_instance_forwards_through_to_the_real_model():
+    model = DeepseekV4ForCausalLM(hf_config(), None)
+    assert model._model.config.hidden_size == 32
+
+
+@pytest.mark.parametrize("quantization", ["fp8", "mxfp4", "compressed-tensors"])
+def test_validate_config_rejects_quantization_not_yet_implemented(quantization):
+    neuron_config = NeuronConfig(quantization=quantization)
+    with pytest.raises(ValueError, match="quantization"):
+        DeepseekV4ForCausalLM.from_configs(hf_config(), neuron_config)
+
+
+@pytest.mark.parametrize("quantization", [None, "bf16"])
+def test_validate_config_accepts_bf16(quantization):
+    neuron_config = NeuronConfig(quantization=quantization)
+    model = DeepseekV4ForCausalLM.from_configs(hf_config(), neuron_config)
+    assert model is not None

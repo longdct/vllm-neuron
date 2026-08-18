@@ -57,6 +57,78 @@ def gather_paged_latent(
     return gathered[:sequence_length]
 
 
+def scatter_paged_latent(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Write ``values`` into ``[blocks,heads,slots,latent]`` storage in place.
+
+    ``slot_mapping`` is a flat cache-relative slot index per row of ``values``
+    (``blk_idx = slot // storage_block_size``, ``pos_idx = slot %
+    storage_block_size``, matching the convention every other cache write in
+    this plugin uses -- see ``llama3/model.py``'s ``_write_kv_cache``).
+    Entries with ``slot_mapping == -1`` are padding and are not written,
+    exactly like every other paged cache write in this plugin.
+    """
+    if cache.ndim != 4:
+        raise ValueError("cache must be 4-D: [blocks, heads, slots, latent]")
+    if slot_mapping.ndim != 1 or values.ndim != 2:
+        raise ValueError("slot_mapping must be 1-D and values must be 2-D")
+    if slot_mapping.shape[0] != values.shape[0]:
+        raise ValueError("slot_mapping and values must have the same row count")
+    storage_block_size = cache.shape[2]
+    valid = slot_mapping >= 0
+    # Padding rows are dropped rather than redirected to a dummy slot: an
+    # earlier version wrote padding rows back to slot 0 with their
+    # pre-existing value to keep this a plain unconditional index_put_, but
+    # index_put_ makes no ordering guarantee between rows that collide on the
+    # same physical index -- whenever a real row's slot happened to be 0 too,
+    # the padding row's "restore" write could nondeterministically clobber
+    # it. Filtering to the valid rows costs a data-dependent shape (fine here
+    # -- this pass is eager/CPU-mode; see the module docstring's scope note)
+    # but is unconditionally correct.
+    slot_mapping = slot_mapping[valid]
+    values = values[valid]
+    if slot_mapping.numel() == 0:
+        return
+    blk_idx = torch.div(slot_mapping, storage_block_size, rounding_mode="floor")
+    pos_idx = slot_mapping % storage_block_size
+    cache.index_put_(
+        (blk_idx.long(), torch.zeros_like(blk_idx.long()), pos_idx.long()),
+        values.to(cache.dtype),
+    )
+
+
+def compressed_entry_slot_mapping(
+    raw_slot_mapping: torch.Tensor,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Map a per-token raw-cache slot to its compressed-entry storage slot.
+
+    Ported directly from vLLM 0.24's own DeepSeek-V4 GPU backend
+    (``vllm/v1/attention/backends/mla/sparse_swa.py::
+    _compressed_slot_mapping_kernel``): a raw token completes a compressed
+    window exactly when ``(pos + 1) % compress_ratio == 0``, where ``pos`` is
+    its absolute sequence position. Because the runner computes
+    ``raw_slot_mapping`` the same way for every cache group (physical block
+    from ``block_table``, offset ``pos % block_size``) and this group's
+    ``block_size`` is always a multiple of ``compress_ratio`` (enforced by
+    ``kv_spec_conversion.layer_spec_to_vllm_spec``), ``raw_slot_mapping``'s
+    low bits already equal ``pos``'s low bits mod ``compress_ratio`` -- so
+    the same test and the same floor-division apply directly to the slot
+    value, with no need to separately track absolute position here.
+
+    Returns the compressed storage slot (``-1`` for padding and for raw
+    tokens that do not complete a window -- both mean "do not write").
+    """
+    if compress_ratio < 1:
+        raise ValueError("compress_ratio must be positive")
+    valid = (raw_slot_mapping >= 0) & ((raw_slot_mapping + 1) % compress_ratio == 0)
+    entry_slot = torch.div(raw_slot_mapping, compress_ratio, rounding_mode="floor")
+    return torch.where(valid, entry_slot, torch.full_like(raw_slot_mapping, -1))
+
+
 def compose_swa_and_compressed_history(
     local: torch.Tensor,
     compressed: torch.Tensor,
