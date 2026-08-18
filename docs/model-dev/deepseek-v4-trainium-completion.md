@@ -51,6 +51,35 @@ If that assertion or either import fails, stop and select a compatible Neuron
 DLAMI/DLC. Do not downgrade Torch in the vLLM 0.26 environment to make the
 compiler import: that would invalidate the compatibility and regression gates.
 
+The direct NKI portion of P2 can still be tested in a separate SDK environment
+when the complete stack is unavailable. This retires only the standalone kernel
+execution and numerical-risk sub-gate; it does not close FX-to-HLO graph capture
+or vLLM integration:
+
+```bash
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+export NEURON_LOGICAL_NC_CONFIG=2
+python tools/deepseek_v4/run_p2_nki_device.py \
+  --output "${artifact_dir}/p2-device"
+```
+
+The runner uses synthetic BF16 inputs only, executes decode and causal-prefill
+at `head_dim=512`, compares with an FP32 NumPy oracle, and saves every input and
+output in `tensors.npz`. Its result explicitly lists the graph and full-model
+claims that it does not prove.
+
+The same separate SDK environment can run a one-token structural model
+diagnostic after P2:
+
+```bash
+python tools/deepseek_v4/run_p6_tiny_device.py \
+  --output "${artifact_dir}/p6-tiny-device" --tokens 1
+```
+
+This eager path is deliberately not a benchmark. Python-side expert dispatch
+fragments it into many small XLA graphs; its purpose is to expose unsupported
+component operations before the scheduler-integrated graph exists.
+
 ## Campaign 1: shipped-model regression
 
 The pre-upgrade baseline was not captured before the dependency bump. Recover

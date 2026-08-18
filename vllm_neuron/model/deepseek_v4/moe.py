@@ -15,7 +15,11 @@ def routed_topk(
     if logits.shape[-1] != correction_bias.numel() or not 0 < topk <= logits.shape[-1]:
         raise ValueError("invalid expert routing dimensions")
     gates = F.softplus(logits.float()).sqrt()
-    ids = torch.topk(gates + correction_bias.float(), topk, dim=-1).indices
+    # Torch CPU returns a ``torch.return_types.topk`` named tuple while the
+    # Torch-XLA 2.9 bridge returns a plain two-element list. Positional access
+    # is part of both contracts and keeps this portable reference path usable
+    # for the Trn2 component gate.
+    ids = torch.topk(gates + correction_bias.float(), topk, dim=-1)[1]
     weights = torch.gather(gates, -1, ids)
     weights = weights / weights.sum(dim=-1, keepdim=True)
     return ids, (weights * routed_scaling_factor).to(logits.dtype)

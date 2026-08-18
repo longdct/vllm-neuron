@@ -114,6 +114,21 @@ def test_noaux_bias_changes_selection_but_not_selected_gate_values():
     torch.testing.assert_close(weights, expected)
 
 
+def test_routed_topk_accepts_xla_list_result(monkeypatch):
+    original_topk = torch.topk
+
+    def list_topk(*args, **kwargs):
+        result = original_topk(*args, **kwargs)
+        return [result.values, result.indices]
+
+    monkeypatch.setattr(torch, "topk", list_topk)
+    ids, weights = routed_topk(
+        torch.tensor([[4.0, 3.0, 1.0]]), torch.tensor([0.0, -10.0, 10.0]), 2
+    )
+    assert ids.tolist() == [[2, 0]]
+    assert torch.isfinite(weights).all()
+
+
 def test_hash_routing_is_exact_lookup():
     table = torch.tensor([[2, 1], [0, 3], [3, 2]])
     assert hash_experts(torch.tensor([2, 0]), table).tolist() == [[3, 2], [2, 1]]
