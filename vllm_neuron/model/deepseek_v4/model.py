@@ -14,22 +14,21 @@ DeepSeek-V4 GPU backend.
 Scope deliberately held simplified for this pass (documented, not silent):
 
 * Attention is now the real multi-head q_lora/kv_proj/partial-RoPE MLA
-  architecture, cross-validated (0.0 diff pre-output-projection) against
+  architecture end to end, cross-validated (0.0 diff on the final output)
+  against
   ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4Attention``
   -- q_lora down/norm/up projection, a shared single-latent kv_proj+norm
   (K=V, broadcast to every query head -- there is no separate per-head K/V
   up-projection in the real architecture either), partial interleaved RoPE
   on the trailing ``qk_rope_head_dim`` channels (real
   ``DeepseekV4RotaryEmbedding``, reused directly rather than
-  reimplemented), attention sinks, and the real architecture's "K=V, so
-  undo RoPE on the attended output at the query's own position" step. The
-  one deliberate simplification is the output projection: the real
-  architecture uses a grouped low-rank ``o_a_proj``/``o_b_proj``
-  (``DeepseekV4GroupedLinear``); this uses a plain dense
-  ``Linear(num_heads*head_dim, hidden_size)`` instead -- a parameter-count
-  optimization, not a defining MLA characteristic, and not yet built here.
-  The compressor's RMSNorm+RoPE finalization now uses real RoPE too
-  (``rope_layer_type="compress"``), matching the query side.
+  reimplemented), attention sinks, the real architecture's "K=V, so undo
+  RoPE on the attended output at the query's own position" step, and the
+  real grouped low-rank output projection (``o_a_proj``/``o_b_proj``,
+  ``DeepseekV4GroupedLinear`` -- see that class's docstring), not a plain
+  dense ``Linear`` approximation. The compressor's RMSNorm+RoPE
+  finalization also uses real RoPE (``rope_layer_type="compress"``),
+  matching the query side.
 * Expert-parallel MoE is numerically correct at any ``ep_degree`` (each rank
   masks contributions to its own contiguous expert range and the group
   all-reduces the sum -- partitioned experts summed via all-reduce
@@ -300,6 +299,38 @@ class DeepseekV4Compressor(nn.Module):
         )
 
 
+class DeepseekV4GroupedLinear(nn.Linear):
+    """Block-diagonal grouped linear -- the real architecture's output
+    projection's first stage (``o_a_proj``).
+
+    Splits the ``num_heads*head_dim``-wide attention output into
+    ``n_groups`` independent chunks and projects each to a
+    ``out_features // n_groups``-wide intermediate with its own weight
+    block (all blocks packed into one ``[out_features, in_features_per_group]``
+    parameter), rather than one huge dense projection -- the real
+    architecture's perf optimization for very wide ``num_heads*head_dim``
+    (e.g. V4-Flash: 32768). Ported directly from
+    ``transformers.models.deepseek_v4.modeling_deepseek_v4.DeepseekV4GroupedLinear``
+    (0.0 diff; see
+    ``test_deepseek_v4_matches_real_architecture.py``'s
+    ``test_output_projection_matches_real_module``).
+    """
+
+    def __init__(
+        self, in_features_per_group: int, out_features: int, n_groups: int, bias: bool = False
+    ):
+        super().__init__(in_features_per_group, out_features, bias=bias)
+        self.n_groups = n_groups
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape[:-2]
+        hidden_dim = x.shape[-1]
+        w = self.weight.view(self.n_groups, -1, hidden_dim).transpose(1, 2)
+        x = x.reshape(-1, self.n_groups, hidden_dim).transpose(0, 1)
+        y = torch.bmm(x, w).transpose(0, 1)
+        return y.reshape(*input_shape, self.n_groups, -1)
+
+
 class DeepseekV4Attention(nn.Module):
     """Real multi-head q_lora/kv_proj/partial-RoPE MLA attention.
 
@@ -316,16 +347,25 @@ class DeepseekV4Attention(nn.Module):
     attended output at the query's own position" step afterward (needed
     because K=V means the attended output -- a weighted average of RoPE'd
     V -- inherits a position-dependent rotation that has to be removed
-    before the output projection mixes heads). See the module docstring for
-    the one deliberate simplification (a dense, not grouped-low-rank,
-    output projection).
+    before the output projection mixes heads). The output projection is now
+    the real grouped low-rank ``o_a_proj``/``o_b_proj``
+    (``DeepseekV4GroupedLinear``) too, not a plain dense ``Linear`` -- see
+    that class's docstring.
 
     >>> PARALLELISM: TP <<<
     ``kv_proj``/``kv_norm``/``q_a_proj``/``q_a_norm`` stay fully replicated
     (the shared latent must be identical on every rank -- it feeds the
-    compressed cache). ``q_b_proj``'s output and ``o_proj``'s input are
+    compressed cache). ``q_b_proj``'s output and ``o_a_proj``'s input are
     head-sharded (``num_heads // world_size`` heads per rank, the standard
-    MLA TP split), with an all-reduce after ``o_proj``.
+    MLA TP split); ``o_groups`` is sharded the same way
+    (``o_groups // world_size`` groups per rank, each covering exactly the
+    same ``num_heads*head_dim // o_groups``-wide input the unsharded real
+    architecture would, since both numerator and denominator scale down by
+    ``world_size`` together), with an all-reduce after ``o_b_proj`` (a
+    row-parallel linear over the local group slice, same pattern as the
+    existing dense ``o_proj`` all-reduce). Not exercised at ``world_size >
+    1`` on real hardware -- see
+    ``docs/model-dev/deepseek-v4-serving-roadmap.md``.
     """
 
     def __init__(
@@ -378,8 +418,26 @@ class DeepseekV4Attention(nn.Module):
         # _forward_one_token; no parameters to own here.
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.o_proj = nn.Linear(
-            self.heads_per_rank * self.head_dim, config.hidden_size, bias=False
+
+        o_groups = int(getattr(hf_config, "o_groups", 8))
+        o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
+        if o_groups % self.world_size:
+            raise ValueError(
+                f"o_groups={o_groups} must be divisible by TP "
+                f"world_size={self.world_size}"
+            )
+        self.o_groups = o_groups // self.world_size
+        local_width = self.heads_per_rank * self.head_dim
+        if local_width % self.o_groups:
+            raise ValueError(
+                f"heads_per_rank*head_dim={local_width} must be divisible by "
+                f"o_groups (post-TP-shard)={self.o_groups}"
+            )
+        self.o_a_proj = DeepseekV4GroupedLinear(
+            local_width // self.o_groups, self.o_groups * o_lora_rank, self.o_groups
+        )
+        self.o_b_proj = nn.Linear(
+            self.o_groups * o_lora_rank, config.hidden_size, bias=False
         )
         self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
         # K=V broadcast to every head: mla_attention_reference projects a
@@ -562,7 +620,9 @@ class DeepseekV4Attention(nn.Module):
             )
         attended = torch.cat(attended_rows, dim=0)
 
-        out = self.o_proj(attended)
+        grouped = attended.reshape(attended.shape[0], self.o_groups, -1)
+        grouped = self.o_a_proj(grouped).flatten(1)
+        out = self.o_b_proj(grouped)
         if self.world_size > 1:
             out = self.tp_group.all_reduce(out)
         return out

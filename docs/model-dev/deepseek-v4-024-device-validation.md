@@ -33,7 +33,8 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
-| T3 (full model) | Real `vllm.LLM()` graph capture of the registered model on Trn2 | Blocked on a Dynamo/FakeTensor issue reached after fixing two real graph breaks (see Step 5d) |
+| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | Blocked on a Dynamo/FakeTensor issue reached after fixing two real graph breaks (see Step 5d) |
+| T3 (full model, eager) | Real `vllm.LLM()` on Trn2, `enforce_eager=True` | Not possible on this plugin at all, any model (see Step 5e) -- so 5d's blocker is the only path to real-hardware inference |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
 about vLLM 0.24's API surface was established by reading the 0.24 and 0.26
@@ -328,6 +329,27 @@ this same attempt to find the next blocker — not a toolchain blocker and not
 something this pass's "attempt" scope extends to fixing outright. It belongs
 with `deepseek-v4-serving-roadmap.md`'s Step 0.
 
+### 5e. `enforce_eager=True` is not an escape hatch on real hardware
+
+A natural question after 5d: if compiled (`enforce_eager=False`) graph
+capture doesn't complete, does eager mode work on real silicon instead,
+independent of Dynamo? Tried directly (same tiny config, real Trn2, no
+`VLLM_NEURON_CPU_MODE`, `enforce_eager=True`) and the answer is no --
+categorically, not a DeepSeek-V4-specific gap:
+
+```
+AssertionError: Eager mode on Neuron is not yet supported.
+```
+
+Raised unconditionally by `neuron_worker.py`
+(`assert not (eager_mode and not cpu_mode)`,
+`neuron_model_runner.py:1250`) for *every* model on this plugin, real
+hardware only -- `VLLM_NEURON_CPU_MODE=1` is the only way `enforce_eager`
+is accepted, and that's not real hardware at all. There is no eager
+fallback to fall back to here: closing 5d's Dynamo/FakeTensor blocker is
+not one of two ways to reach real-hardware inference, it is the only one.
+Artifact: `artifacts/deepseek-v4/<run-id>/p7-eager-real-device/attempt1.txt`.
+
 ## What this port changed that needs device eyes
 
 These are behavioral changes introduced by the 0.24 migration itself. They pass
@@ -365,6 +387,7 @@ single highest-consequence numeric change in the port.
 | `torch_xla.runtime.device_type()` reports `CPU` instead of `NEURON` | This SDK build compiles out `torch_xla`'s classic PJRT auto-detection. Not fixable by installing `libneuronxla`; see Step 5c |
 | `RuntimeError: No EFA device found` from `neuron_worker.py::_set_efa_affinity` | Expected on an EFA-less instance (e.g. `trn2.3xlarge`). Set `NEURON_SKIP_EFA_AFFINITY=1`; see Step 5d |
 | `torch._dynamo.exc.Unsupported: Data-dependent branching` compiling the full model | A Python `if` on a tensor value inside a traced module. If it is a pure validation guard, skip it under `torch.compiler.is_compiling()`; see Step 5d's fixes in `mhc.py`/`attention.py`/`model.py` |
+| `AssertionError: Eager mode on Neuron is not yet supported.` | Expected on real hardware with `enforce_eager=True` -- this plugin only accepts eager mode under `VLLM_NEURON_CPU_MODE=1`, for every model, not a DeepSeek-V4 gap; see Step 5e |
 
 ## What is still out of scope
 

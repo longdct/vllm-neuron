@@ -148,7 +148,12 @@ FakeTensor issue in the per-token attention loop's `position_ids`
 construction, not yet root-caused to a one-line fix. Read Step 5d before
 spending more device time here: the remaining blockers are in this plugin's
 model code (the per-token loop building tensors from Python scalars in
-ways Dynamo doesn't yet trace cleanly), not the toolchain.
+ways Dynamo doesn't yet trace cleanly), not the toolchain. **This is not
+one of two paths to real-hardware serving** — Step 5e confirms
+`enforce_eager=True` is unconditionally rejected on real Neuron hardware
+for every model on this plugin (`neuron_worker.py`'s
+`assert not (eager_mode and not cpu_mode)`), so there is no eager
+fallback to reach for while 5d's compile blocker stands.
 
 ## What carries over
 

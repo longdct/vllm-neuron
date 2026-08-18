@@ -20,11 +20,13 @@ attention/MoE and an earlier version of this plugin's layer did not. See
 and `model.py`'s ``DeepseekV4DecoderLayer` docstring.
 
 ``DeepseekV4Attention`` is now the real multi-head q_lora/kv_proj/partial-RoPE
-MLA architecture (q_a_proj/q_a_norm/q_b_proj, kv_proj/kv_norm, real
+MLA architecture end to end (q_a_proj/q_a_norm/q_b_proj, kv_proj/kv_norm, real
 ``DeepseekV4RotaryEmbedding``, attention sinks, K=V broadcast via an identity
-"up-projection", and the real architecture's undo-RoPE-on-the-output step),
-cross-validated pre-output-projection both in isolation and through the real
-paged-cache-I/O path (multi-token prefill, real ``bind_kv_cache``). See
+"up-projection", the real architecture's undo-RoPE-on-the-output step, and now
+the real grouped low-rank output projection too -- ``o_a_proj``/``o_b_proj``,
+``DeepseekV4GroupedLinear`` -- rather than a plain dense ``Linear``),
+cross-validated on the full final output both in isolation and through the
+real paged-cache-I/O path (multi-token prefill, real ``bind_kv_cache``). See
 ``test_attention_matches_real_module_through_paged_cache_io`` below and
 ``model.py``'s ``DeepseekV4Attention`` docstring.
 
@@ -35,14 +37,8 @@ gate/up clamped to ``swiglu_limit`` before the SiLU*up product -- not the
 earlier unclamped, ``[in, out]``-layout approximation. See
 ``test_expert_wrapper_matches_real_module`` below.
 
-**What this does NOT cover** (documented divergence, not a bug to fix here):
-
-- The output projection: the real architecture uses a grouped low-rank
-  ``o_a_proj``/``o_b_proj`` (``DeepseekV4GroupedLinear``); this plugin uses a
-  plain dense ``Linear(num_heads*head_dim, hidden_size)`` instead. A
-  parameter-count optimization, not a defining MLA characteristic, and not
-  yet built here -- comparisons below hook the input to ``o_proj``/
-  ``o_a_proj`` to compare everything upstream of that one difference.
+No remaining documented divergence: every wrapper this pass touches now
+matches the real architecture exactly, not just approximates it.
 """
 
 import pytest
@@ -269,11 +265,13 @@ def test_compressor_wrapper_matches_real_module(
 
 
 def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
-    """Cross-checks the *integrated* attention path: real cache I/O, the
-    per-token loop, RoPE applied/undone at the right absolute positions --
-    not just the bare math in isolation. Uses a sliding-only layer (no
-    compressor) to isolate attention; the compressor's own RoPE is already
-    covered by test_compressor_wrapper_matches_real_module.
+    """Cross-checks the *integrated, end-to-end* attention path: real cache
+    I/O, the per-token loop, RoPE applied/undone at the right absolute
+    positions, and now the real grouped low-rank output projection too --
+    not just the bare math in isolation, and not stopping short of the
+    final output. Uses a sliding-only layer (no compressor) to isolate
+    attention; the compressor's own RoPE is already covered by
+    test_compressor_wrapper_matches_real_module.
 
     Tolerance is not bit-exact (unlike the other tests here): the real
     module computes one batched causal softmax over the whole prefill
@@ -321,6 +319,8 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
         my_attn.kv_proj.weight.copy_(real_attn.kv_proj.weight)
         my_attn.kv_norm.weight.copy_(real_attn.kv_norm.weight)
         my_attn.sinks.copy_(real_attn.sinks)
+        my_attn.o_a_proj.weight.copy_(real_attn.o_a_proj.weight)
+        my_attn.o_b_proj.weight.copy_(real_attn.o_b_proj.weight)
 
     tokens = 5
     hidden = torch.randn(1, tokens, sliding_config.hidden_size)
@@ -331,16 +331,8 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
     position_embeddings = {real_attn.rope_layer_type: (cos, sin)}
     causal_mask = torch.triu(torch.full((1, 1, tokens, tokens), float("-inf")), diagonal=1)
 
-    captured_real = {}
-    handle_real = real_attn.o_a_proj.register_forward_hook(
-        lambda module, args, output: captured_real.__setitem__("x", args[0])
-    )
     with torch.no_grad():
-        real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
-    handle_real.remove()
-    real_pre_oproj = captured_real["x"].reshape(
-        1, tokens, sliding_config.num_attention_heads, sliding_config.head_dim
-    )
+        real_out, _ = real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
 
     specs = device_model.get_kv_spec().layers
     caches = {
@@ -365,19 +357,11 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
         for s in specs
     }
 
-    captured_mine = {}
-    handle_mine = my_attn.o_proj.register_forward_hook(
-        lambda module, args, output: captured_mine.__setitem__("x", args[0])
-    )
     with torch.no_grad():
-        my_attn(
+        my_out = my_attn(
             hidden.squeeze(0),
             self_attn_name="model.layers.0.self_attn",
             attn_metadata=attn_metadata,
         )
-    handle_mine.remove()
-    my_pre_oproj = captured_mine["x"].view(
-        1, tokens, sliding_config.num_attention_heads, sliding_config.head_dim
-    )
 
-    torch.testing.assert_close(real_pre_oproj, my_pre_oproj, rtol=1e-3, atol=5e-4)
+    torch.testing.assert_close(real_out.squeeze(0), my_out, rtol=1e-3, atol=5e-4)

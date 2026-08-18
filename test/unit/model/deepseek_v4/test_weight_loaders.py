@@ -20,7 +20,14 @@ from vllm_neuron.model.deepseek_v4.weight_loaders import (
         ("head.weight", "lm_head.weight"),
         ("norm.weight", "model.norm.weight"),
         ("hc_head_fn", "model.hc_head_fn"),
-        ("layers.3.attn.wq_a.weight", "model.layers.3.attn.wq_a.weight"),
+        ("layers.3.attn.wq_a.weight", "model.layers.3.attn.q_a_proj.weight"),
+        ("layers.3.attn.wkv.weight", "model.layers.3.attn.kv_proj.weight"),
+        ("layers.3.attn.wq_b.weight", "model.layers.3.attn.q_b_proj.weight"),
+        ("layers.3.attn.q_norm.weight", "model.layers.3.attn.q_a_norm.weight"),
+        ("layers.3.attn.kv_norm.weight", "model.layers.3.attn.kv_norm.weight"),
+        ("layers.3.attn.wo_a.weight", "model.layers.3.attn.o_a_proj.weight"),
+        ("layers.3.attn.wo_b.weight", "model.layers.3.attn.o_b_proj.weight"),
+        ("layers.3.attn.attn_sink", "model.layers.3.attn.sinks"),
         (
             "layers.3.ffn.gate.bias",
             "model.layers.3.ffn.gate.e_score_correction_bias",
@@ -52,16 +59,6 @@ def test_quantized_scale_names_distinguish_fp4_experts():
         ("layers.1.ffn.w1.weight", "model.layers.1.ffn.gate_up_proj.weight", 0),
         ("layers.1.ffn.w3.weight", "model.layers.1.ffn.gate_up_proj.weight", 1),
         (
-            "layers.1.attn.wq_a.weight",
-            "model.layers.1.attn.fused_wqa_wkv.weight",
-            0,
-        ),
-        (
-            "layers.1.attn.wkv.weight",
-            "model.layers.1.attn.fused_wqa_wkv.weight",
-            1,
-        ),
-        (
             "layers.1.attn.compressor.wgate.weight",
             "model.layers.1.attn.compressor.fused_wkv_wgate.weight",
             1,
@@ -72,6 +69,26 @@ def test_stacked_parameter_contract(source, target, shard_id):
     assert resolve_stacked_shard(map_checkpoint_name(source)) == StackedShard(
         target, shard_id
     )
+
+
+def test_attention_weights_are_plain_renames_not_stacked_shards():
+    """``wq_a``/``wkv`` used to be two shards merged into one fused
+    ``fused_wqa_wkv`` parameter (matching vLLM's own real GPU DeepSeek-V4
+    backend). This plugin's ``DeepseekV4Attention`` keeps them separate
+    instead (matching the ``transformers`` reference module it is
+    cross-validated against), so each checkpoint tensor is now a plain
+    rename onto its own standalone parameter, not a fused shard.
+    """
+    for source in (
+        "layers.1.attn.wq_a.weight",
+        "layers.1.attn.wkv.weight",
+        "layers.1.attn.wq_b.weight",
+        "layers.1.attn.q_norm.weight",
+        "layers.1.attn.wo_a.weight",
+        "layers.1.attn.wo_b.weight",
+        "layers.1.attn.attn_sink",
+    ):
+        assert resolve_stacked_shard(map_checkpoint_name(source)) is None
 
 
 def test_expert_weights_are_not_consumed_by_generic_stacking():
@@ -85,16 +102,28 @@ def test_shape_drift_fails_before_copy():
         require_weight_shape("head.weight", (31, 16), (32, 16))
 
 
-class FakeAttention(torch.nn.Module):
+class FakeCompressor(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.fused_wqa_wkv = torch.nn.Linear(3, 4, bias=False)
-        parameter = self.fused_wqa_wkv.weight
+        self.fused_wkv_wgate = torch.nn.Linear(3, 4, bias=False)
+        parameter = self.fused_wkv_wgate.weight
 
         def load_shard(target, source, shard_id):
             target[shard_id * 2 : shard_id * 2 + 2].copy_(source)
 
         parameter.weight_loader = load_shard
+
+
+class FakeAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        # q_a_proj/kv_proj are plain renames now (see
+        # weight_loaders.py::_ATTENTION_RENAMES) -- no weight_loader, exactly
+        # like every other non-fused parameter.
+        self.q_a_proj = torch.nn.Linear(3, 4, bias=False)
+        self.kv_proj = torch.nn.Linear(3, 2, bias=False)
+        # compressor.fused_wkv_wgate is still a real fused shard.
+        self.compressor = FakeCompressor()
 
 
 class FakeLayer(torch.nn.Module):
@@ -120,23 +149,30 @@ class FakeModel(torch.nn.Module):
 def test_loader_copies_plain_and_dispatches_fused_shards():
     model = FakeModel()
     embed = torch.arange(15, dtype=torch.float32).view(5, 3)
-    q = torch.full((2, 3), 2.0)
-    kv = torch.full((2, 3), 3.0)
+    q_a = torch.full((4, 3), 2.0)
+    kv = torch.full((4, 3), 3.0)
     loaded = load_checkpoint_weights(
         model,
         [
             ("embed.weight", embed),
-            ("layers.0.attn.wq_a.weight", q),
-            ("layers.0.attn.wkv.weight", kv),
+            ("layers.0.attn.wq_a.weight", q_a),
+            ("layers.0.attn.compressor.wkv.weight", kv[:2]),
+            ("layers.0.attn.compressor.wgate.weight", kv[2:]),
         ],
     )
     assert loaded == {
         "model.embed_tokens.weight",
-        "model.layers.0.attn.fused_wqa_wkv.weight",
+        "model.layers.0.attn.q_a_proj.weight",
+        "model.layers.0.attn.compressor.fused_wkv_wgate.weight",
     }
     torch.testing.assert_close(model.model.embed_tokens.weight, embed)
-    torch.testing.assert_close(model.model.layers[0].attn.fused_wqa_wkv.weight[:2], q)
-    torch.testing.assert_close(model.model.layers[0].attn.fused_wqa_wkv.weight[2:], kv)
+    torch.testing.assert_close(model.model.layers[0].attn.q_a_proj.weight, q_a)
+    torch.testing.assert_close(
+        model.model.layers[0].attn.compressor.fused_wkv_wgate.weight[:2], kv[:2]
+    )
+    torch.testing.assert_close(
+        model.model.layers[0].attn.compressor.fused_wkv_wgate.weight[2:], kv[2:]
+    )
 
 
 def test_loader_rejects_missing_target_shape_drift_and_duplicate_sources():

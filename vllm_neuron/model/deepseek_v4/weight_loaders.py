@@ -22,10 +22,31 @@ class StackedShard:
 _STACKED_COMPONENTS = (
     (".w1", ".gate_up_proj", 0),
     (".w3", ".gate_up_proj", 1),
-    (".attn.wq_a", ".attn.fused_wqa_wkv", 0),
-    (".attn.wkv", ".attn.fused_wqa_wkv", 1),
     (".compressor.wkv", ".compressor.fused_wkv_wgate", 0),
     (".compressor.wgate", ".compressor.fused_wkv_wgate", 1),
+)
+
+# Plain (not stacked/fused) attention weight renames: the official checkpoint's
+# raw tensor names -> this plugin's DeepseekV4Attention parameter names.
+# ``wq_a``/``wkv`` were previously mapped as two shards merged into one fused
+# ``fused_wqa_wkv`` parameter, matching vLLM's own real GPU DeepSeek-V4
+# backend (``vllm.models.deepseek_v4.attention.DeepseekV4Attention``, which
+# fuses them into a single ``MergedColumnParallelLinear`` for kernel
+# efficiency). This plugin's ``DeepseekV4Attention`` keeps them separate
+# instead (matching ``transformers.models.deepseek_v4``'s reference module,
+# what the device-shaped rewrite was cross-validated against -- see
+# ``model.py``'s ``DeepseekV4Attention`` docstring), so each checkpoint
+# tensor now renames onto its own standalone parameter rather than a shard
+# of a fused one. ``kv_norm`` needs no rule -- the checkpoint's name for it
+# already matches this plugin's parameter name and passes through unchanged.
+_ATTENTION_RENAMES = (
+    (".attn.wq_a", ".attn.q_a_proj"),
+    (".attn.wkv", ".attn.kv_proj"),
+    (".attn.wq_b", ".attn.q_b_proj"),
+    (".attn.q_norm", ".attn.q_a_norm"),
+    (".attn.wo_a", ".attn.o_a_proj"),
+    (".attn.wo_b", ".attn.o_b_proj"),
+    (".attn.attn_sink", ".attn.sinks"),
 )
 
 
@@ -62,6 +83,8 @@ def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
         mapped = mapped[: -len(".ffn.gate.bias")] + ".ffn.gate.e_score_correction_bias"
 
     mapped = mapped.replace(".shared_experts.w2", ".shared_experts.down_proj")
+    for source, target in _ATTENTION_RENAMES:
+        mapped = mapped.replace(source, target)
     if mapped.endswith(".scale"):
         if expert_dtype == "fp4" and re.search(r"\.experts\.\d+\.w[123]\.scale$", mapped):
             mapped = mapped[: -len(".scale")] + ".weight_scale"
