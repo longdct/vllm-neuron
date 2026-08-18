@@ -24,6 +24,23 @@ import numpy as np
 from nkilib.core.attention.attention_cte import attention_cte
 
 
+def compile_stack_version() -> str:
+    """Report the installed Neuron compile-stack version.
+
+    Upstream ships this under ``torch-neuronx``. On the 0.24 plugin base it
+    lives in ``libtorch-neuronx-lite`` instead (unpinned, resolved against
+    vLLM's torch -- see requirements/core.txt), so ``torch-neuronx`` is not
+    installed at all in that environment. Try both rather than hard failing
+    the whole run after the device work is already done.
+    """
+    for name in ("torch-neuronx", "libtorch-neuronx-lite"):
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "not-installed"
+
+
 def command_output(command: list[str]) -> str:
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=False)
@@ -133,7 +150,7 @@ def main() -> None:
         "numpy": np.__version__,
         "nki": importlib.metadata.version("nki"),
         "neuronx_cc": importlib.metadata.version("neuronx-cc"),
-        "torch_neuronx": importlib.metadata.version("torch-neuronx"),
+        "torch_neuronx": compile_stack_version(),
         "neuron_ls": command_output(["neuron-ls"]),
         "records": records,
         "passed": all(record["passed"] and record["finite"] for record in records),

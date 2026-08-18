@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P1 lifecycle matrix against vLLM 0.26's real cache managers."""
+"""P1 lifecycle matrix against vLLM 0.24's real cache managers."""
 
 import pytest
 
@@ -64,7 +64,7 @@ def cache_manager(num_blocks=256):
         max_model_len=2048,
         scheduler_block_size=128,
         hash_block_size=32,
-        max_in_flight_tokens=128,
+        max_num_batched_tokens=128,
         enable_caching=False,
     )
 
@@ -141,7 +141,7 @@ def test_sliding_window_remapping_uses_null_blocks_but_latents_remain_stable():
     req = request("remap", 200)
     manager.allocate_slots(req, 200)
     before = ids(manager, "remap")
-    manager.remove_skipped_blocks("remap", 200, 200)
+    manager.remove_skipped_blocks("remap", 200)
     after = ids(manager, "remap")
 
     assert after[0][:2] == (0, 0)

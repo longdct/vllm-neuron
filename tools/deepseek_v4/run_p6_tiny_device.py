@@ -23,9 +23,27 @@ from types import ModuleType
 import numpy as np
 import torch
 import torch_xla
+import torch_xla.runtime as xr
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def compile_stack_version() -> str:
+    """Report the installed Neuron compile-stack version.
+
+    Upstream ships this under ``torch-neuronx``. On the 0.24 plugin base it
+    lives in ``libtorch-neuronx-lite`` instead (unpinned, resolved against
+    vLLM's torch -- see requirements/core.txt), so ``torch-neuronx`` is not
+    installed at all in that environment. Try both rather than hard failing
+    the whole run after the device work is already done.
+    """
+    for name in ("torch-neuronx", "libtorch-neuronx-lite"):
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return "not-installed"
 
 
 def command_output(command: list[str]) -> str:
@@ -66,6 +84,21 @@ def main() -> None:
     with torch.no_grad():
         expected, _ = cpu_model(input_ids)
     device = torch_xla.device()
+    if xr.device_type() != "NEURON":
+        # This SDK's torch_xla build hardcodes `_found_libneuronxla = False`
+        # ("Neuron library initialization is handled by neuronx-cc package
+        # directly") -- the classic PJRT auto-detection this script relies on
+        # to reach Trainium is compiled out. `torch_xla.device()` silently
+        # resolves to the CPU pseudo-device instead of raising, so without this
+        # check the run below would "pass" having executed nothing on
+        # hardware. Fail loudly rather than mislabel a CPU run as this gate.
+        raise SystemExit(
+            "torch_xla resolved PJRT_DEVICE="
+            f"{xr.device_type()!r}, not NEURON -- this environment cannot "
+            "reach Trainium through torch_xla's eager device path. This is "
+            "an SDK/environment gap, not a script bug: see "
+            "docs/model-dev/deepseek-v4-024-device-validation.md Step 1."
+        )
     device_model = copy.deepcopy(cpu_model).to(device)
     started = time.monotonic()
     with torch.no_grad():
@@ -92,7 +125,7 @@ def main() -> None:
         "git_revision": command_output(["git", "rev-parse", "HEAD"]),
         "torch": torch.__version__,
         "torch_xla": importlib.metadata.version("torch-xla"),
-        "torch_neuronx": importlib.metadata.version("torch-neuronx"),
+        "torch_neuronx": compile_stack_version(),
         "neuron_ls": command_output(["neuron-ls"]),
         "device": str(device),
         "tokens": args.tokens,

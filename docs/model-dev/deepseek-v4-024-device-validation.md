@@ -29,14 +29,24 @@ is".
 
 | Tier | Scope | Status |
 | --- | --- | --- |
-| T0 | Bare interpreter, no torch/vLLM/Neuron | Green — 173 passed, 12 skipped |
-| T1 | vLLM 0.24 installed, still CPU | **Never run.** Needs Linux |
-| T1-sim | NKI CPU simulator | **Never run** on this branch |
-| T3 | Trn2 device | **Never run** on this branch |
+| T0 | Bare interpreter, no torch/vLLM/Neuron | Green — 226 passed, 4 skipped (Linux/Trn2 host; `test_factory.py` included) |
+| T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
+| T1-sim | NKI CPU simulator | Green — 2 passed |
+| T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
 about vLLM 0.24's API surface was established by reading the 0.24 and 0.26
 wheels, not by importing them. T1 is the first step that tests that reading.
+
+**T1 fixes applied when this ladder was first run on Trn2** (all porting
+mistakes in the tests themselves, per the "fix the assertion, don't delete the
+test" rule below): `KVCacheManager.__init__` takes `max_num_batched_tokens`,
+not `max_in_flight_tokens`; `KVCacheManager.remove_skipped_blocks` takes two
+args, not three; the communicator class is `NeuronDeviceCommunicator`, not
+`NeuronCommunicator`; and `tripwire:parallel_config_all2all_literal` is
+correctly *absent* from `applied_patches()` on 0.24 (the docstring on
+`TestAll2AllBackendSelection` already said this — the tripwire assertion just
+hadn't been flipped to match).
 
 ## Step 1 — environment gate
 
@@ -212,6 +222,23 @@ Torch-XLA. Deliberately not a benchmark — Python-side expert dispatch fragment
 it into many small XLA graphs. Its job is to expose unsupported component
 operations before a captured graph exists.
 
+**Currently blocked on this SDK release, and it is an SDK gap, not a script
+bug.** `torch_xla/__init__.py` in this build hardcodes
+`_found_libneuronxla = False` ("Neuron library initialization is handled by
+neuronx-cc package directly"), so `torch_xla.device()` silently resolves to the
+CPU PJRT pseudo-device instead of `NEURON` — installing `libneuronxla` does not
+change this, since the auto-detection path itself is compiled out, not merely
+unmet. The script now checks `torch_xla.runtime.device_type() == "NEURON"`
+before running and raises `SystemExit` if it isn't, rather than silently
+mislabeling a CPU run as a device gate. The real Neuron dispatch path on this
+release goes through `libtorch_neuronx_lite`'s `torch.compile` backends
+(`neuron_libtorch`, `neuron_libtorch_graph_capture`) and `nkilib`'s own kernel
+entry points — both exercised successfully by 5a/5b above. Eager per-op
+dispatch via `torch_xla.device()` has no working path to hardware here;
+redesigning P6 onto the compile-backend path is new integration work, not a
+retest, and belongs with Step 1 of
+[`deepseek-v4-serving-roadmap.md`](deepseek-v4-serving-roadmap.md).
+
 ## What this port changed that needs device eyes
 
 These are behavioral changes introduced by the 0.24 migration itself. They pass
@@ -245,6 +272,8 @@ single highest-consequence numeric change in the port.
 | `NotImplementedError` naming `RSWASpec` | Expected. Only the synthetic model reaches this path |
 | Block tables sized wrong / cache corruption | The `max_num_blocks_per_req` derivation. Compare against `MultiGroupBlockTable`'s own default |
 | First decode step returns garbage | The allocate→view change above |
+| `PackageNotFoundError: torch-neuronx` from the T3 tool scripts | Expected on 0.24 — the compile stack lives in `libtorch-neuronx-lite` instead. Fixed by trying both names |
+| `torch_xla.runtime.device_type()` reports `CPU` instead of `NEURON` | This SDK build compiles out `torch_xla`'s classic PJRT auto-detection. Not fixable by installing `libneuronxla`; see Step 5c |
 
 ## What is still out of scope
 

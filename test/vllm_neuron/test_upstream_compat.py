@@ -126,9 +126,11 @@ class TestAll2AllBackendSelection:
         )
 
     def test_the_communicator_reads_it_back(self):
-        from vllm_neuron.parallel.neuron_communicator import NeuronCommunicator
+        from vllm_neuron.parallel.neuron_communicator import (
+            NeuronDeviceCommunicator,
+        )
 
-        assert hasattr(NeuronCommunicator, "_read_neuron_all2all_backend")
+        assert hasattr(NeuronDeviceCommunicator, "_read_neuron_all2all_backend")
 
     def test_vllm_parallel_config_is_left_unpatched(self):
         """Scope guard: nothing may reintroduce the pydantic schema surgery.
@@ -255,8 +257,10 @@ class TestTripwiresRunClean:
         apply_phase(Phase.PLATFORM_CONFIG)
         applied = applied_patches()
         assert "tripwire:scheduler_default_detection" in applied
-        assert "tripwire:parallel_config_all2all_literal" in applied
         assert "tripwire:termination_timeout_targets" in applied
+        # 0.24 designs the all2all pydantic-schema patch away entirely (see
+        # TestAll2AllBackendSelection) -- its tripwire no longer exists to apply.
+        assert "tripwire:parallel_config_all2all_literal" not in applied
 
     def test_distributed_init_phase_applies(self):
         from vllm_neuron.vllm.patches import Phase, applied_patches, apply_phase
