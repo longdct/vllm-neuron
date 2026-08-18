@@ -11,12 +11,19 @@ or the NIXL connector, this document is current and that one is not.
 
 ## Read this before booking instance time
 
-**DeepSeek-V4 is not registered.** `vllm_neuron/model/registry.py` is unchanged
-from upstream and never registers `DeepseekV4ForCausalLM`. You cannot
-`vllm serve` a DeepSeek-V4 checkpoint on this branch, and no step below does.
-Registry exposure is deliberately withheld until scheduler-metadata-driven cache
-I/O and graph capture exist. Everything here validates components, cache
-plumbing, and the kernel — not end-to-end serving.
+**DeepSeek-V4 cannot be served, and this is not a testing gap.** The
+scheduler-integrated inference path does not exist yet: the model's `forward`
+takes no `attn_metadata`, `bind_kv_cache` validates without binding, the forward
+pass is a Python loop over single tokens, and there is no parallelism anywhere in
+the package. Registering it in `vllm_neuron/model/registry.py` would advertise
+support that isn't there. See
+[`deepseek-v4-serving-roadmap.md`](deepseek-v4-serving-roadmap.md) for the full
+gap analysis and what has to be built.
+
+Everything below validates components, cache declarations, and the kernel —
+which is exactly what the current implementation is *for*. Read the status table
+as "how far the reference implementation is verified", not "how close serving
+is".
 
 **What is actually verified today:**
 
@@ -247,6 +254,11 @@ full-checkpoint BF16/FP8/FP4, prefix caching, MTP/speculative decoding, and
 and speculative decoding on `deepseek_v4`, and the dense-CSA admission gate
 rejects uncapped generations. Those rejections are features; do not weaken them
 to make a topology start.
+
+The work required to close the serving gap is laid out in
+[`deepseek-v4-serving-roadmap.md`](deepseek-v4-serving-roadmap.md). Its Step 0 —
+confirm graph capture actually works on this base — is answered by the ladder
+above, and should be answered before any device model code is written.
 
 Once this ladder is green, pick up
 [`deepseek-v4-trainium-completion.md`](deepseek-v4-trainium-completion.md) at
