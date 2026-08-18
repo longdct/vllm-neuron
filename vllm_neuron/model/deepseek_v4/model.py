@@ -697,8 +697,17 @@ class DeepseekV4MoE(nn.Module):
             safe_idx = local_idx.clamp(0, self.num_local_experts - 1)
             for local_expert in range(self.num_local_experts):
                 mask = is_local & (safe_idx == local_expert)
-                if not bool(mask.any()):
-                    continue
+                # Always compute, even for an expert no token in this batch
+                # routes to (mask all-False contributes exactly zero either
+                # way) -- the previous `if not bool(mask.any()): continue`
+                # skip was a real optimization but `bool(tensor)` is a
+                # device->host sync and an unconditional Dynamo graph break
+                # ("Data-dependent branching"), found compiling the full
+                # device-shaped model on real Trn2 silicon (see
+                # docs/model-dev/deepseek-v4-024-device-validation.md).
+                # Dense per-token dispatch is already this pass's documented
+                # throughput tradeoff (see this class's docstring); this
+                # just makes the per-*expert* skip the same tradeoff.
                 contribution = self.experts[local_expert](hidden)
                 routed = routed + contribution * (
                     weights[:, slot : slot + 1] * mask.unsqueeze(-1)

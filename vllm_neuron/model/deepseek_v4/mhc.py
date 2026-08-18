@@ -22,7 +22,17 @@ def sinkhorn_positive(
     if iterations < 1 or eps <= 0:
         raise ValueError("iterations and eps must be positive")
     x = matrix.float()
-    if (x < 0).any():
+    # A pure input-validation guard: the branch never changes the numerical
+    # result on the valid (non-raising) path, only whether an invalid one is
+    # caught early. Skipped while torch.compile is tracing -- a
+    # data-dependent `if tensor.any():` is an unconditional graph break
+    # (Dynamo: "Data-dependent branching... fundamental, unlikely Dynamo
+    # will ever trace through it"), found compiling the full device-shaped
+    # model on real Trn2 silicon (see
+    # docs/model-dev/deepseek-v4-024-device-validation.md's device-graph-
+    # capture section). Eager callers (every existing caller) keep the full
+    # check.
+    if not torch.compiler.is_compiling() and (x < 0).any():
         raise ValueError("Sinkhorn input matrix must be non-negative")
     x = x / (x.sum(dim=-2, keepdim=True) + eps)
     for _ in range(iterations - 1):

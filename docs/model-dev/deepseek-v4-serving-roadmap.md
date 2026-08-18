@@ -138,13 +138,17 @@ support that does not exist.
 
 P2.c (FX→HLO→NEFF capture) was blocked solely on the Torch 2.9 / 2.11 mismatch.
 The move to `release-0.24.0.1.1.0` is what plausibly unblocks it, and that is
-**unverified**. If the toolchain still cannot capture a Neuron graph, every step
-below is wasted effort.
-
-Run the environment gate and T1 in
-[`deepseek-v4-024-device-validation.md`](deepseek-v4-024-device-validation.md),
-then confirm capture on a Trn2 instance with a trivial model. Both are cheap
-relative to what follows.
+**partially verified now**: the toolchain question itself is answered —
+[`deepseek-v4-024-device-validation.md`](deepseek-v4-024-device-validation.md)'s
+Step 5d ran real `torch.compile`/Dynamo tracing of the actual registered
+model, through the real Neuron compile backend, on real Trn2 silicon, past
+model construction/weight loading/device move and two real graph-break
+fixes. Not yet a green compile — it stopped on a third, deeper Dynamo/
+FakeTensor issue in the per-token attention loop's `position_ids`
+construction, not yet root-caused to a one-line fix. Read Step 5d before
+spending more device time here: the remaining blockers are in this plugin's
+model code (the per-token loop building tensors from Python scalars in
+ways Dynamo doesn't yet trace cleanly), not the toolchain.
 
 ## What carries over
 

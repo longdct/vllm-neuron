@@ -51,7 +51,11 @@ def gather_paged_latent(
     if required > block_table.numel():
         raise ValueError("block table is too short for sequence_length")
     blocks = block_table[:required].long()
-    if (blocks < 0).any() or (blocks >= cache.shape[0]).any():
+    # Pure input-validation guard, skipped while torch.compile is tracing --
+    # see the matching comment on mhc.py::sinkhorn_positive.
+    if not torch.compiler.is_compiling() and (
+        (blocks < 0).any() or (blocks >= cache.shape[0]).any()
+    ):
         raise ValueError("block table contains an invalid physical block")
     gathered = cache[blocks].permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
     return gathered[:sequence_length]

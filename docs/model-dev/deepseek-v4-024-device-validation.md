@@ -33,6 +33,7 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
+| T3 (full model) | Real `vllm.LLM()` graph capture of the registered model on Trn2 | Blocked on a Dynamo/FakeTensor issue reached after fixing two real graph breaks (see Step 5d) |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
 about vLLM 0.24's API surface was established by reading the 0.24 and 0.26
@@ -239,6 +240,94 @@ redesigning P6 onto the compile-backend path is new integration work, not a
 retest, and belongs with Step 1 of
 [`deepseek-v4-serving-roadmap.md`](deepseek-v4-serving-roadmap.md).
 
+### 5d. Full model graph capture (registry-gated, `vllm.LLM()`)
+
+The compile-backend path 5c names as the real Neuron dispatch route
+(`neuron_libtorch`/`neuron_libtorch_graph_capture`) is exactly what
+`neuron_model_runner.py` uses for a real (non-`enforce_eager`) run. This step
+attempts it for the first time against the **full registered model** — not
+the isolated 512-d kernel (5a/5b) or a hand-driven eager loop (5c blocked) —
+using the same tiny synthetic config as
+`test/vllm_neuron/test_deepseek_v4_device_e2e.py`, but with
+`VLLM_NEURON_CPU_MODE` unset and `enforce_eager=False`, on real Trn2 silicon:
+
+```bash
+export VLLM_NEURON_ENABLE_DEEPSEEK_V4=1
+export NEURON_PLATFORM_TARGET_OVERRIDE=trn2
+export NEURON_LOGICAL_NC_CONFIG=2
+export NEURON_SKIP_EFA_AFFINITY=1   # this instance has no EFA device
+python - <<'PY'
+from vllm import LLM, SamplingParams
+# ... build LLM(model=<tiny checkpoint dir>, load_format="dummy",
+#     enforce_eager=False, ...) and call llm.generate(...)
+PY
+```
+
+**Result: real, incremental progress, not yet a green compile.** Three
+attempts, each one exercising real `torch.compile`/Dynamo tracing through
+`libtorch_neuronx_lite`'s parallel-trace fork on the actual device:
+
+1. **`RuntimeError: No EFA device found`** — an environment fact, not a
+   model bug: this `trn2.3xlarge` has no EFA interface, and
+   `neuron_worker.py::_set_efa_affinity` doesn't skip its lookup without
+   `NEURON_SKIP_EFA_AFFINITY=1`. The error message names its own fix.
+2. **`torch._dynamo.exc.Unsupported: Data-dependent branching`** in
+   `mhc.py::sinkhorn_positive`'s `if (x < 0).any(): raise ValueError(...)`.
+   Dynamo cannot trace a Python `if` on a tensor value ("this graph break is
+   fundamental... use `torch.cond`"). This is a pure input-validation guard
+   with no effect on the numerical result along the non-raising path, so it
+   was fixed by skipping it under `torch.compiler.is_compiling()` rather
+   than removing the check for eager callers. The same pattern was fixed at
+   `attention.py::gather_paged_latent`'s block-table bounds check (same
+   `.any()`-on-`if` shape, not yet reached by tracing but certain to break
+   the same way), and `model.py::DeepseekV4MoE.forward`'s
+   `if not bool(mask.any()): continue` per-expert dead-computation skip was
+   made unconditional (`bool(tensor)` is a device→host sync and an
+   unconditional graph break; the skip was already a throughput
+   optimization only — masked contributions are exactly zero either way, so
+   always computing is numerically identical, just denser). All three fixes
+   are in `mhc.py`, `attention.py`, and `model.py`; CPU-mode
+   (`test/unit test/vllm_neuron`) stays green after them.
+3. **`torch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake
+   tensor call`** in `DeepseekV4Attention._forward_one_token`
+   (`model.py:485-486`):
+   `position_ids = hidden.new_tensor([[cached_seq_len]], dtype=torch.long)`
+   followed by `self.rotary_emb(hidden, position_ids=position_ids, ...)`.
+   `cached_seq_len` is a per-token-loop-local Python `int` (derived once per
+   chunk from `attn_metadata` via `int(...)`, then advanced by plain integer
+   addition per loop iteration — see `_forward_one_token`'s caller). Under
+   Dynamo's FakeTensorMode, constructing a fresh tensor from a nested Python
+   list around a traced scalar (`[[cached_seq_len]]`) and then indexing/
+   unsqueezing it inside `rotary_emb` trips
+   `AssertionError("Please convert all Tensors to FakeTensors first...")`
+   on `aten.unsqueeze.default`. Unlike the two guard-clause breaks above,
+   this is not a removable validation check — it is how every per-token
+   iteration computes its own absolute RoPE position, load-bearing for
+   correctness — and not yet root-caused to a specific one-line fix. Not
+   attempted further in this pass; see "What this means" below.
+
+Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile/` holds the
+three full logs (`attempt1-efa-failure.txt`,
+`attempt2-sinkhorn-graph-break.txt`,
+`attempt3-position-ids-faketensor-error.txt`).
+
+**What this means for Step 0's open question.** The toolchain-level question
+that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
+any previous gate reached it: this is real `torch.compile`/Dynamo tracing of
+the actual registered model through the real Neuron compile backend on real
+silicon, past model construction, weight loading, and the device move —
+substantially past 5a/5b's isolated-kernel-only evidence. The remaining
+blockers are in this plugin's own model code, not the toolchain: the
+per-token attention loop (`docs/model-dev/deepseek-v4-carry-cache-design.md`'s
+"Mid-chunk compression boundaries force a per-token attention loop") builds
+several tensors per iteration from Python-level scalars in ways Dynamo's
+fake-tensor tracing does not yet accept cleanly. Closing this is real,
+scoped follow-up work — restructure `position_ids`/`cached_seq_len`
+construction to stay symbolic-int-friendly throughout the loop, then repeat
+this same attempt to find the next blocker — not a toolchain blocker and not
+something this pass's "attempt" scope extends to fixing outright. It belongs
+with `deepseek-v4-serving-roadmap.md`'s Step 0.
+
 ## What this port changed that needs device eyes
 
 These are behavioral changes introduced by the 0.24 migration itself. They pass
@@ -274,6 +363,8 @@ single highest-consequence numeric change in the port.
 | First decode step returns garbage | The allocate→view change above |
 | `PackageNotFoundError: torch-neuronx` from the T3 tool scripts | Expected on 0.24 — the compile stack lives in `libtorch-neuronx-lite` instead. Fixed by trying both names |
 | `torch_xla.runtime.device_type()` reports `CPU` instead of `NEURON` | This SDK build compiles out `torch_xla`'s classic PJRT auto-detection. Not fixable by installing `libneuronxla`; see Step 5c |
+| `RuntimeError: No EFA device found` from `neuron_worker.py::_set_efa_affinity` | Expected on an EFA-less instance (e.g. `trn2.3xlarge`). Set `NEURON_SKIP_EFA_AFFINITY=1`; see Step 5d |
+| `torch._dynamo.exc.Unsupported: Data-dependent branching` compiling the full model | A Python `if` on a tensor value inside a traced module. If it is a pure validation guard, skip it under `torch.compiler.is_compiling()`; see Step 5d's fixes in `mhc.py`/`attention.py`/`model.py` |
 
 ## What is still out of scope
 
