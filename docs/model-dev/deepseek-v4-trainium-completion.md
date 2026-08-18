@@ -1,5 +1,18 @@
 # DeepSeek-V4 Trainium completion runbook
 
+> **Partly superseded on the 0.24 branch.** This document was written against
+> vLLM 0.26. Start with
+> [`deepseek-v4-024-device-validation.md`](deepseek-v4-024-device-validation.md),
+> which is current for `deepseek-V4-on-0.24`, then return here for Campaign 2
+> onward. Three things below are now false on that branch: the Torch 2.9/2.11
+> mismatch is what the move to `release-0.24.0.1.1.0` resolves (the compile
+> stack now lives in `libtorch-neuronx-lite`, unpinned so it resolves against
+> vLLM's torch); Campaign 1's baseline should be upstream's own
+> `release-0.24.0.1.1.0` rather than commit `be0def6` on vLLM 0.21; and
+> `NeuronNixlConnector` is no longer rejected, because 0.24 still exports
+> `NixlConnectorWorker`. The campaign structure, artifact requirements, and
+> sign-off discipline all still apply.
+
 This runbook covers the gates that cannot be closed in the repository's current
 local environment. T0, the NKI simulator, backend-config lowering, exact cache
 declaration/binding, and the local regression suite are already green. Full
