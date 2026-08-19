@@ -80,6 +80,27 @@ def carry_replay_already_emitted(cached_seq_len: int, ratio: int, *, needs_overl
     return 1 if (needs_overlap and cached_seq_len >= ratio) else 0
 
 
+def carry_gather_length_tensor(
+    cached_seq_len: torch.Tensor, ratio: int, *, needs_overlap: bool
+) -> torch.Tensor:
+    """Tensor-valued counterpart to :func:`carry_gather_length`.
+
+    Same formula, but branches only on ``needs_overlap`` (a compile-time
+    Python bool -- a fixed model-config attribute, never traced);
+    ``cached_seq_len``'s *value* only ever flows through
+    ``torch.where``/``torch.minimum``, never a Python ``if``, so this is
+    safe to call with a traced (Dynamo/FakeTensor) tensor. Used by
+    ``DeepseekV4Compressor._carry_rows`` to build a *validity mask* over a
+    fixed-size gather, not to size a slice -- unlike ``carry_gather_length``,
+    this never determines a shape.
+    """
+    unconsumed = cached_seq_len % ratio
+    if not needs_overlap:
+        return unconsumed
+    overlapped = torch.minimum(cached_seq_len, unconsumed + ratio)
+    return torch.where(cached_seq_len >= ratio, overlapped, unconsumed)
+
+
 def finalize_compressed_entries(
     compressed: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -131,9 +152,29 @@ def compress_hca_chunk(
     gate: torch.Tensor,
     position_bias: torch.Tensor,
     state: GatedCompressorState | None = None,
+    *,
+    carry_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, GatedCompressorState]:
-    """Transformers-equivalent c128 gated reduction before RMSNorm and RoPE."""
+    """Transformers-equivalent c128 gated reduction before RMSNorm and RoPE.
+
+    ``carry_valid`` (``[joined_kv.shape[1]]``, optional) marks rows of the
+    joined carry+new sequence that are real content vs. structural padding
+    -- for a caller (``DeepseekV4Compressor._carry_rows``) that must supply
+    a *fixed-size* carry window under ``torch.compile``/Dynamo, where some
+    leading rows may not exist yet or may already have been consumed by an
+    earlier call. Invalid rows are neutralized via the gate softmax
+    (``-inf`` so they get ~0 weight) rather than sliced away, which keeps
+    every shape below governed by ordinary (backed) tensor shapes only.
+    ``None`` (default) applies no masking, exactly like before this
+    parameter existed.
+    """
     joined_kv, joined_gate = _join_gated_carry(kv, gate, state)
+    if carry_valid is not None:
+        if carry_valid.shape != (joined_kv.shape[1],):
+            raise ValueError("carry_valid must have shape [joined sequence length]")
+        joined_gate = torch.where(
+            carry_valid.view(1, -1, 1), joined_gate, joined_gate.new_full((), float("-inf"))
+        )
     ratio = position_bias.shape[0]
     if ratio < 1 or position_bias.shape != (ratio, kv.shape[-1]):
         raise ValueError("HCA position_bias must have shape [ratio, head_dim]")
@@ -159,9 +200,26 @@ def compress_csa_chunk(
     gate: torch.Tensor,
     position_bias: torch.Tensor,
     state: GatedCompressorState | None = None,
+    *,
+    carry_valid: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, GatedCompressorState]:
-    """Transformers-equivalent c4 overlapping reduction before RMSNorm and RoPE."""
+    """Transformers-equivalent c4 overlapping reduction before RMSNorm and RoPE.
+
+    ``carry_valid`` -- see :func:`compress_hca_chunk`'s docstring; the same
+    contract applies here. Masking ``joined_gate`` before the ``.view(...)``
+    into ``windows``/``logits`` (rather than after) matters for CSA
+    specifically: the overlap assembly below (``combined_gate[:, 1:, :ratio]
+    = logits[:, :-1, ...]``) copies from this same masked ``logits`` tensor,
+    so an invalid row correctly propagates into the next window's overlap
+    half automatically, with no CSA-specific handling needed.
+    """
     joined_kv, joined_gate = _join_gated_carry(kv, gate, state)
+    if carry_valid is not None:
+        if carry_valid.shape != (joined_kv.shape[1],):
+            raise ValueError("carry_valid must have shape [joined sequence length]")
+        joined_gate = torch.where(
+            carry_valid.view(1, -1, 1), joined_gate, joined_gate.new_full((), float("-inf"))
+        )
     ratio, double_width = position_bias.shape
     if ratio < 1 or double_width % 2 or kv.shape[-1] != double_width:
         raise ValueError("CSA projections and position_bias must have shape [*, *, 2*head_dim]")

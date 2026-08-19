@@ -62,8 +62,7 @@ from .attention import (
     scatter_paged_latent,
 )
 from .compressor import (
-    carry_gather_length,
-    carry_replay_already_emitted,
+    carry_gather_length_tensor,
     compress_csa_chunk,
     compress_hca_chunk,
     finalize_compressed_entries,
@@ -206,101 +205,118 @@ class DeepseekV4Compressor(nn.Module):
         self.state_cache: torch.Tensor | None = None
 
     def _carry_rows(
-        self, block_table_row: torch.Tensor, cached_seq_len: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, block_table_row: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fixed-size carry window ending one token before ``position_ids``.
+
+        Dynamo-shape-static, mirroring ``DeepseekV4Attention._swa_history``'s
+        ``gather_recent_window``-based redesign: always gathers exactly
+        ``coff*ratio - 1`` rows (a compile-time-constant Python int, never a
+        traced value) via ``gather_recent_window`` -- one less than the full
+        carry window, since the new token itself (not yet scattered into
+        ``self.state_cache`` at the point this runs) is appended separately
+        as the replay's final row by the caller. Returns
+        ``(carry_kv, carry_gate, carry_valid)`` where ``carry_valid`` is
+        ``[coff*ratio]`` long: the gathered rows' own existence mask
+        (``gather_recent_window``'s ``exists``, for rows before generation
+        produced them) ANDed with an "unconsumed" mask built from
+        ``carry_gather_length_tensor`` (rows already consumed/emitted by an
+        earlier call must not be replayed a second time -- same accounting
+        as the old Python-int ``gather_n``, now tensor-valued), plus a
+        trailing ``True`` for the new token's own always-valid slot.
+        Invalid rows are neutralized downstream via
+        ``compress_hca_chunk``/``compress_csa_chunk``'s gate-softmax masking
+        rather than sliced away -- no more data-dependent-length slice (see
+        docs/model-dev/deepseek-v4-swa-null-block-bug.md item 3).
+
+        The state cache is itself a sliding-window group (window =
+        coff*ratio, matching get_kv_spec); like ``_swa_history``,
+        ``gather_recent_window`` reads columns covering exactly
+        ``[position_ids - coff*ratio, position_ids - 1]`` (the live window),
+        never a null-remapped column, regardless of how much eviction has
+        happened.
+        """
         assert self.state_cache is not None
-        gather_n = carry_gather_length(
+        carry_window = self.coff * self.ratio - 1
+        gathered, exists = gather_recent_window(
+            self.state_cache, block_table_row, carry_window, position_ids - 1
+        )
+        gathered = gathered.squeeze(1).unsqueeze(0)  # [1, carry_window, 2*width]
+        cached_seq_len = position_ids.view(()).long()
+        gather_n = carry_gather_length_tensor(
             cached_seq_len, self.ratio, needs_overlap=self.overlap
         )
-        if gather_n == 0:
-            empty = self.state_cache.new_zeros((1, 0, 2 * self.width))
-            return empty[..., : self.width], empty[..., self.width :]
-        # The state cache is itself a sliding-window group (window =
-        # coff*ratio, matching get_kv_spec); the scheduler remaps blocks
-        # older than that to a null block once evicted, same as
-        # DeepseekV4Attention._swa_history. gather_n never exceeds coff*ratio
-        # by construction (carry_gather_length), so capping the *length*
-        # alone would still be enough to stay within the live window's real
-        # data size -- but the block table's real data has moved to
-        # ever-higher columns as eviction progresses, so the read must also
-        # start at the live window's actual start column
-        # (start_token=max(0, cached_seq_len-window)), not column 0 (see
-        # docs/model-dev/deepseek-v4-swa-null-block-bug.md).
-        window = self.coff * self.ratio
-        rows = gather_paged_latent(
-            self.state_cache,
-            block_table_row,
-            min(cached_seq_len, window),
-            start_token=max(0, cached_seq_len - window),
-        )
-        rows = rows.squeeze(1)[-gather_n:].unsqueeze(0)
-        return rows[..., : self.width], rows[..., self.width :]
+        idx = torch.arange(carry_window, device=gathered.device)
+        carry_valid = exists & (idx >= (carry_window - gather_n))
+        full_valid = torch.cat((carry_valid, carry_valid.new_ones(1)))
+        return gathered[..., : self.width], gathered[..., self.width :], full_valid
 
     def forward(
         self,
         hidden: torch.Tensor,
         *,
-        cached_seq_len: int,
+        position_ids: torch.Tensor,
         block_table_row: torch.Tensor,
         state_slot_mapping: torch.Tensor,
         mla_cache: torch.Tensor,
         mla_slot_mapping: torch.Tensor,
     ) -> None:
-        """Compress ``hidden``'s new tokens and write results into caches.
+        """Compress ``hidden``'s one new token and write results into caches.
 
-        ``hidden`` is ``[tokens, hidden_size]`` for this one request's chunk.
-        Writes new compressed entries into ``mla_cache`` (via
-        ``mla_slot_mapping``, already restricted to this compressor's
-        ``compress_ratio``) and the raw per-token kv/gate projection into
+        ``hidden`` is ``[1, hidden_size]`` -- this module's only call site
+        (``DeepseekV4Attention._forward_one_token``) is itself inside a
+        per-token loop, so exactly one new raw token is compressed per call;
+        see the class docstring. Writes a new compressed entry into
+        ``mla_cache`` (via ``mla_slot_mapping``, already restricted to this
+        compressor's ``compress_ratio``, ``-1`` if this token does not
+        complete a window) and the raw per-token kv/gate projection into
         ``self.state_cache`` (via ``state_slot_mapping``, a plain per-token
         sliding-window write). No return value -- this module only writes.
         """
         kv_gate = self.fused_wkv_wgate(hidden).unsqueeze(0)
         kv_new, gate_new = kv_gate[..., : self.width], kv_gate[..., self.width :]
 
-        carry_kv, carry_gate = self._carry_rows(block_table_row, cached_seq_len)
+        carry_kv, carry_gate, carry_valid = self._carry_rows(
+            block_table_row, position_ids
+        )
         replay_kv = torch.cat((carry_kv, kv_new), dim=1)
         replay_gate = torch.cat((carry_gate, gate_new), dim=1)
 
+        # replay_{kv,gate} are always exactly [1, coff*ratio, width]: a fixed
+        # carry_window=coff*ratio-1 rows plus this one new token. So
+        # compress_fn always produces exactly `coff` candidate rows (a plain
+        # Python int, not a traced value -- see compress_hca_chunk's
+        # docstring) and the currently-completing window (if this token
+        # completes one) is unconditionally the LAST of them. Earlier rows
+        # can be all-(-inf)-gated -> NaN when no real prior window exists yet
+        # (e.g. CSA's block 0 on a request's first-ever completed window) and
+        # must never be read -- only `entry` (the last row) is.
         compress_fn = compress_csa_chunk if self.overlap else compress_hca_chunk
-        compressed, _ = compress_fn(replay_kv, replay_gate, self.ape, None)
-        drop = carry_replay_already_emitted(
-            cached_seq_len, self.ratio, needs_overlap=self.overlap
+        compressed, _ = compress_fn(
+            replay_kv, replay_gate, self.ape, None, carry_valid=carry_valid
         )
-        compressed = compressed[:, drop:]
+        entry = compressed[:, -1:]
 
-        # mla_slot_mapping carries one entry per *raw* token in this chunk
-        # (-1 for both padding and non-window-completing positions -- see
-        # compressed_entry_slot_mapping); `compressed`'s row count instead
-        # reflects positional window-boundary arithmetic with no notion of
-        # padding. Under this plugin's right-padding convention any window
-        # touching padding is the trailing one(s), so filtering to the valid
-        # (>= 0) slots and truncating both sides to the shorter length keeps
-        # only genuinely-complete, non-padding windows -- dropping a
-        # padding-corrupted trailing window rather than writing it.
-        valid_slots = mla_slot_mapping[mla_slot_mapping >= 0]
-        write_count = min(int(valid_slots.shape[0]), compressed.shape[1])
-        compressed = compressed[:, :write_count]
-        if compressed.shape[1]:
-            # Real RoPE, matching the real architecture's compressor exactly
-            # (rope_layer_type="compress"): window k's entry position is
-            # first_window_position + k*ratio, where first_window_position is
-            # the absolute raw-token position of the first NEW window this
-            # call writes -- (cached_seq_len // ratio) windows were already
-            # complete (and their positions already emitted) before this call.
-            first_window_position = (cached_seq_len // self.ratio) * self.ratio
-            entry_positions = (
-                first_window_position
-                + torch.arange(compressed.shape[1], device=compressed.device) * self.ratio
-            ).unsqueeze(0)
-            cos, sin = self.rotary_emb(
-                compressed, position_ids=entry_positions, layer_type="compress"
-            )
-            finalized = finalize_compressed_entries(
-                compressed, self.norm_weight, self.rms_norm_eps, cos, sin
-            )
-            entry_slots = valid_slots[:write_count]
-            scatter_paged_latent(mla_cache, entry_slots, finalized.squeeze(0))
+        # Real RoPE, matching the real architecture's compressor exactly
+        # (rope_layer_type="compress"): this entry's absolute position is the
+        # start of the window it completes -- (position_ids // ratio) windows
+        # were already complete (and their positions already emitted) before
+        # this call.
+        first_window_position = (
+            torch.div(position_ids, self.ratio, rounding_mode="floor") * self.ratio
+        )
+        cos, sin = self.rotary_emb(
+            entry, position_ids=first_window_position, layer_type="compress"
+        )
+        finalized = finalize_compressed_entries(
+            entry, self.norm_weight, self.rms_norm_eps, cos, sin
+        )
+        # mla_slot_mapping is already [1]-shaped and 1:1 with `finalized`'s
+        # single row by construction of the per-token call site;
+        # scatter_paged_latent's existing slot_mapping==-1 filtering (already
+        # Dynamo-safe) handles "don't write, this token didn't complete a
+        # window" with no extra code here.
+        scatter_paged_latent(mla_cache, mla_slot_mapping, finalized.squeeze(0))
 
         # Raw per-token projection feeds the *next* chunk's carry replay.
         scatter_paged_latent(
@@ -612,7 +628,7 @@ class DeepseekV4Attention(nn.Module):
             )
             self.compressor(
                 hidden,
-                cached_seq_len=cached_seq_len,
+                position_ids=position_ids,
                 block_table_row=state_entry["block_table_tensor"][request],
                 state_slot_mapping=state_entry["slot_mapping"][
                     local_index : local_index + 1

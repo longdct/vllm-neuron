@@ -33,7 +33,7 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
-| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids`, `scatter_paged_latent`, and `_swa_history`'s data-dependent shape all fixed and device-confirmed; now blocked on `_carry_rows`'s data-dependent shape, entangled with the compressor's internal chunking (see Step 5d) |
+| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids`, `scatter_paged_latent`, `_swa_history`'s, and now `_carry_rows`'s data-dependent shape all fixed and device-confirmed; now blocked on `_compressed_history`'s own (separate, simpler) `cached_seq_len // ratio` data-dependent shape (see Step 5d) |
 | T3 (full model, eager) | Real `vllm.LLM()` on Trn2, `enforce_eager=True` | Not possible on this plugin at all, any model (see Step 5e) -- so 5d's blocker is the only path to real-hardware inference |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
@@ -436,7 +436,50 @@ real, forward progress, not a different flavor of the same error.
    all needing to become consistent with a fixed-candidate-count,
    filter-on-write design -- real, substantial, separate work with
    correctness risk if rushed. See the bug doc's "Suggested fix direction"
-   item 3 for the full account. Not attempted.
+   item 3 for the full account. Not attempted (at the time of this attempt).
+8. **`_carry_rows` made Dynamo-shape-static (closes item 3 above) --
+   confirmed on real Trn2 silicon, advancing to a new (8th, separate)
+   blocker.** Investigation found the cascade item 3 worried about is
+   smaller than feared: `DeepseekV4Compressor.forward` has exactly one call
+   site (`_forward_one_token`'s per-token loop), so it always compresses
+   exactly one new raw token -- never a multi-token chunk. That collapses
+   the write-side risk: with a fixed `coff*ratio`-row carry window (reusing
+   `gather_recent_window`, the same helper item 2 introduced, plus a new
+   `carry_gather_length_tensor` tensor-valued "unconsumed" formula and a
+   `carry_valid` gate-softmax mask threaded through
+   `compress_hca_chunk`/`compress_csa_chunk`), `compressed` always has
+   exactly `coff` static rows and the currently-completing window (if any)
+   is unconditionally the *last* one -- no data-dependent count, no slicing,
+   no separate slot-matching machinery. Full design, staged CPU-eager
+   oracle tests (including a new eviction-past-carry-window regression test
+   mirroring `_swa_history`'s, and a full real-`transformers`-module
+   comparison through real paged cache I/O past eviction), and this
+   real-hardware confirmation are in
+   `docs/model-dev/deepseek-v4-swa-null-block-bug.md`'s updated status
+   block and "Suggested fix direction" item 3.
+
+   First a CPU-only proxy (`torch.compile(fullgraph=True, dynamic=True)`,
+   same technique as item 6) confirmed `_carry_rows`'s line no longer
+   appears in the trace at all -- tracing now fails one call later, at
+   `_compressed_history`'s own (separate, simpler) `if num_entries == 0:`
+   (`model.py:552`, `cached_seq_len // self.ratio`) instead. Then the exact
+   same real-hardware `vllm.LLM()`/`enforce_eager=False` recipe as attempts
+   1-7, re-run against this fix on the same `trn2.3xlarge`, reproduces the
+   identical result on the real compile backend: `RuntimeError: Parallel
+   trace fork failed`, with `Could not guard on data-dependent expression
+   Eq((u0//128), 0)` at `_compressed_history:552` as the underlying cause --
+   no mention of `_carry_rows`/`gather_n`/`compress_hca_chunk`/
+   `compress_csa_chunk` anywhere in the trace, confirming the fix closes
+   item 3 on real hardware, not just in the CPU proxy.
+
+   `_compressed_history` is a genuinely separate, simpler item, not part of
+   this fix: it reads the non-evicting `mla_cache` (no null-block
+   correctness bug, per the bug doc's "Affected call sites" section) and
+   its only Dynamo problem is the same "Python-int `cached_seq_len` driving
+   a slice length" pattern `_swa_history`/`_carry_rows` already had --
+   likely a small, `_swa_history`-item-2-shaped fix (fixed-length gather +
+   mask), not entangled with any windowing/write-side complexity. Not
+   attempted here; the next open item in this family.
 
 Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile-retry/`
 holds the two new full logs (`attempt-position-ids-fix-retry.log`,
@@ -448,7 +491,12 @@ after the null-block fix is
 Attempt 7's two real-hardware re-runs (post-`_swa_history`-fix landing on
 `_carry_rows`; post-`carry_gather_length`-guard-fix landing on the same
 `_carry_rows` line) are in
-`artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/`.
+`artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/`. Attempt 8's
+CPU proxy and real-hardware confirmation (both landing cleanly on
+`_compressed_history`, past `_carry_rows`) are in
+`artifacts/deepseek-v4/20260819T035235Z-2f88686-wip/p6-carry-rows-dynamo-static-fix/`
+(directory name notes this was run against an uncommitted working tree --
+see that directory's `git-revision.txt`).
 
 **What this means for Step 0's open question.** The toolchain-level question
 that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
@@ -460,18 +508,20 @@ blockers are in this plugin's own model code, not the toolchain: the
 per-token attention loop (`docs/model-dev/deepseek-v4-carry-cache-design.md`'s
 "Mid-chunk compression boundaries force a per-token attention loop") builds
 several tensors per iteration from Python-level scalars in ways Dynamo's
-fake-tensor tracing does not yet accept cleanly. The `position_ids` instance
-of that pattern is fixed and device-confirmed above, as is one guard-clause
-instance in `scatter_paged_latent`; attempt 5 confirms the real remaining
-instance is `_swa_history`/`_compressed_history`/the compressor's
-carry-window math, which slice cache tensors to a Python-int length
-computed from `cached_seq_len` (`min(cached_seq_len, self.sliding_window)`,
-`cached_seq_len // self.ratio`) — genuinely shape-determining, not a
-removable guard. The fix is the shape one flagged in the roadmap: gather a
-fixed, compile-time-static length (the window/entry cap) unconditionally
-and mask instead of slicing to a runtime-computed length, rather than
-threading a symbolic int into a slice bound. It belongs with
-`deepseek-v4-serving-roadmap.md`'s Step 0.
+fake-tensor tracing does not yet accept cleanly. The `position_ids`,
+`_swa_history`, and `_carry_rows`/compressor-carry-window instances of that
+pattern are now fixed and device-confirmed above, as is one guard-clause
+instance in `scatter_paged_latent`; the real remaining instance is
+`_compressed_history` alone, which still slices `mla_cache` to a Python-int
+length computed from `cached_seq_len` (`cached_seq_len // self.ratio`) —
+genuinely shape-determining, not a removable guard, but (per its own
+docstring and the null-block bug doc's "Affected call sites" section) a
+simpler case than `_carry_rows` was: it reads a non-evicting cache group
+with no windowing/write-side entanglement. The fix is the same shape
+pattern used for the other three: gather a fixed, compile-time-static
+length (the entry cap) unconditionally and mask instead of slicing to a
+runtime-computed length, rather than threading a symbolic int into a slice
+bound. It belongs with `deepseek-v4-serving-roadmap.md`'s Step 0.
 
 ### 5e. `enforce_eager=True` is not an escape hatch on real hardware
 

@@ -18,6 +18,7 @@ from vllm_neuron.model.deepseek_v4.attention import (
 )
 from vllm_neuron.model.deepseek_v4.compressor import (
     carry_gather_length,
+    carry_gather_length_tensor,
     carry_replay_already_emitted,
     compress_csa_chunk,
     compress_hca_chunk,
@@ -170,6 +171,230 @@ def test_carry_replay_reproduces_incremental_hca_chunking():
             pos += size
         dev = torch.cat(dev_outputs, dim=1)
         torch.testing.assert_close(dev, ref, rtol=0, atol=1e-5)
+
+
+@pytest.mark.parametrize("ratio,needs_overlap", [(128, False), (4, True)])
+def test_carry_gather_length_tensor_matches_python_int_version(ratio, needs_overlap):
+    """Stage A equivalence check: carry_gather_length_tensor's torch.where/
+    torch.minimum formula must reproduce carry_gather_length's Python-int
+    result exactly, for every cached_seq_len -- it's the tensor-valued
+    building block DeepseekV4Compressor._carry_rows uses to build a validity
+    mask instead of a data-dependent-length slice."""
+    for cached_seq_len in range(0, 5 * ratio):
+        expected = carry_gather_length(cached_seq_len, ratio, needs_overlap=needs_overlap)
+        actual = carry_gather_length_tensor(
+            torch.tensor(cached_seq_len), ratio, needs_overlap=needs_overlap
+        )
+        assert int(actual) == expected
+
+
+def _fixed_window_carry(history_kv, history_gate, cached_seq_len, ratio, coff, needs_overlap):
+    """Test-only stand-in for DeepseekV4Compressor._carry_rows's masking
+    logic, operating on a plain in-memory history buffer instead of a paged
+    cache + gather_recent_window (that combination is covered separately by
+    test_carry_rows_reads_live_window_correctly_past_carry_cache_eviction).
+    Isolates the carry_valid masking/replay math from the paged-cache
+    plumbing."""
+    carry_window = coff * ratio - 1
+    available = history_kv.shape[1]
+    take = min(carry_window, available)
+    pad = carry_window - take
+    carry_kv = torch.cat((history_kv.new_zeros((1, pad, history_kv.shape[-1])), history_kv[:, -take:] if take else history_kv[:, :0]), dim=1)
+    carry_gate = torch.cat((history_gate.new_zeros((1, pad, history_gate.shape[-1])), history_gate[:, -take:] if take else history_gate[:, :0]), dim=1)
+    exists = torch.cat((torch.zeros(pad, dtype=torch.bool), torch.ones(take, dtype=torch.bool)))
+    gather_n = carry_gather_length_tensor(
+        torch.tensor(cached_seq_len), ratio, needs_overlap=needs_overlap
+    )
+    idx = torch.arange(carry_window)
+    carry_valid = exists & (idx >= (carry_window - gather_n))
+    full_valid = torch.cat((carry_valid, carry_valid.new_ones(1)))
+    return carry_kv, carry_gate, full_valid
+
+
+def test_compress_hca_chunk_carry_valid_masking_matches_incremental_slicing():
+    """The key regression test for the _carry_rows Dynamo fix: walking a
+    token-by-token sequence (matching the real per-token call pattern --
+    DeepseekV4Compressor.forward has exactly one call site, always fed one
+    new raw token), the new fixed-window + carry_valid masking path must
+    reproduce the old, already-oracle-validated carry_gather_length + slice
+    path's output bit-exactly at every window-completing step."""
+    torch.manual_seed(4)
+    ratio, head_dim, coff = 4, 6, 1
+    total_len = 5 * ratio
+    kv_all = torch.randn(1, total_len, head_dim)
+    gate_all = torch.randn(1, total_len, head_dim)
+    bias = torch.randn(ratio, head_dim)
+
+    history_kv = history_gate = torch.zeros(1, 0, head_dim)
+    cached_seq_len = 0
+    for pos in range(total_len):
+        kv_c, gate_c = kv_all[:, pos : pos + 1], gate_all[:, pos : pos + 1]
+
+        n = carry_gather_length(cached_seq_len, ratio, needs_overlap=False)
+        drop = carry_replay_already_emitted(cached_seq_len, ratio, needs_overlap=False)
+        old_kv = torch.cat((history_kv[:, -n:] if n else history_kv[:, :0], kv_c), dim=1)
+        old_gate = torch.cat((history_gate[:, -n:] if n else history_gate[:, :0], gate_c), dim=1)
+        out_old, _ = compress_hca_chunk(old_kv, old_gate, bias, None)
+        out_old = out_old[:, drop:]
+
+        carry_kv, carry_gate, valid = _fixed_window_carry(
+            history_kv, history_gate, cached_seq_len, ratio, coff, needs_overlap=False
+        )
+        new_kv = torch.cat((carry_kv, kv_c), dim=1)
+        new_gate = torch.cat((carry_gate, gate_c), dim=1)
+        out_new, _ = compress_hca_chunk(new_kv, new_gate, bias, None, carry_valid=valid)
+        entry_new = out_new[:, -1:]
+
+        assert torch.isfinite(entry_new).all()
+        if out_old.shape[1] == 1:
+            torch.testing.assert_close(entry_new, out_old, rtol=0, atol=1e-5)
+
+        history_kv = torch.cat((history_kv, kv_c), dim=1)
+        history_gate = torch.cat((history_gate, gate_c), dim=1)
+        cached_seq_len += 1
+
+
+def test_compress_csa_chunk_carry_valid_masking_matches_incremental_slicing():
+    """Same as the HCA version, for CSA's overlap reconstruction --
+    specifically covers the first-ever completed window (an all-masked
+    "previous window" block 0, verifying softmax-of-all--inf there never
+    contaminates the block actually read) and the second (the first real
+    overlap block)."""
+    torch.manual_seed(5)
+    ratio, head_dim, coff = 4, 5, 2
+    double_width = 2 * head_dim
+    total_len = 6 * ratio
+    kv_all = torch.randn(1, total_len, double_width)
+    gate_all = torch.randn(1, total_len, double_width)
+    bias = torch.randn(ratio, double_width)
+
+    history_kv = history_gate = torch.zeros(1, 0, double_width)
+    cached_seq_len = 0
+    completions_checked = 0
+    for pos in range(total_len):
+        kv_c, gate_c = kv_all[:, pos : pos + 1], gate_all[:, pos : pos + 1]
+
+        n = carry_gather_length(cached_seq_len, ratio, needs_overlap=True)
+        drop = carry_replay_already_emitted(cached_seq_len, ratio, needs_overlap=True)
+        old_kv = torch.cat((history_kv[:, -n:] if n else history_kv[:, :0], kv_c), dim=1)
+        old_gate = torch.cat((history_gate[:, -n:] if n else history_gate[:, :0], gate_c), dim=1)
+        out_old, _ = compress_csa_chunk(old_kv, old_gate, bias, None)
+        out_old = out_old[:, drop:]
+
+        carry_kv, carry_gate, valid = _fixed_window_carry(
+            history_kv, history_gate, cached_seq_len, ratio, coff, needs_overlap=True
+        )
+        new_kv = torch.cat((carry_kv, kv_c), dim=1)
+        new_gate = torch.cat((carry_gate, gate_c), dim=1)
+        out_new, _ = compress_csa_chunk(new_kv, new_gate, bias, None, carry_valid=valid)
+        entry_new = out_new[:, -1:]
+
+        assert torch.isfinite(entry_new).all()
+        if out_old.shape[1] == 1:
+            torch.testing.assert_close(entry_new, out_old, rtol=0, atol=1e-5)
+            completions_checked += 1
+
+        history_kv = torch.cat((history_kv, kv_c), dim=1)
+        history_gate = torch.cat((history_gate, gate_c), dim=1)
+        cached_seq_len += 1
+
+    # Sanity: this walk actually exercised >1 completion (both the
+    # all-masked-block-0 first completion and later, real-overlap ones), not
+    # just the trivially-easy first case.
+    assert completions_checked >= 2
+
+
+def test_compress_hca_chunk_and_csa_chunk_carry_valid_default_none_unchanged():
+    """carry_valid=None (the default) must reproduce pre-change output
+    exactly -- the new parameter is opt-in, existing callers (the oracle
+    tests in test_deepseek_v4_component_oracles.py, this file's own
+    incremental-chunking cross-checks) are untouched."""
+    torch.manual_seed(6)
+    ratio, head_dim = 4, 6
+    kv = torch.randn(1, 11, head_dim)
+    gate = torch.randn(1, 11, head_dim)
+    bias = torch.randn(ratio, head_dim)
+    out_implicit, state_implicit = compress_hca_chunk(kv, gate, bias, None)
+    out_explicit, state_explicit = compress_hca_chunk(kv, gate, bias, None, carry_valid=None)
+    torch.testing.assert_close(out_implicit, out_explicit, rtol=0, atol=0)
+    torch.testing.assert_close(state_implicit.kv_carry, state_explicit.kv_carry, rtol=0, atol=0)
+
+    double_width = 2 * head_dim
+    kv2 = torch.randn(1, 13, double_width)
+    gate2 = torch.randn(1, 13, double_width)
+    bias2 = torch.randn(ratio, double_width)
+    out_implicit2, _ = compress_csa_chunk(kv2, gate2, bias2, None)
+    out_explicit2, _ = compress_csa_chunk(kv2, gate2, bias2, None, carry_valid=None)
+    torch.testing.assert_close(out_implicit2, out_explicit2, rtol=0, atol=0)
+
+
+def test_carry_rows_reads_live_window_correctly_past_carry_cache_eviction():
+    """Regression test closing the coverage gap
+    docs/model-dev/deepseek-v4-swa-null-block-bug.md flags for _carry_rows:
+    unlike _swa_history (covered by
+    test_attention_matches_real_module_after_swa_eviction_past_one_window in
+    test_deepseek_v4_matches_real_architecture.py), no existing test drove
+    _carry_rows itself through a real paged state_cache past one carry
+    window's worth of eviction. Mirrors
+    test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced's
+    null-block simulation, applied to DeepseekV4Compressor._carry_rows.
+    """
+    from vllm_neuron.model.deepseek_v4.model import DeepseekV4Compressor
+
+    torch.manual_seed(7)
+    ratio, head_dim, needs_overlap = 4, 3, True
+    coff = 2
+    width = coff * head_dim
+    cache_window = coff * ratio  # state_cache's own physical sliding window
+    block_size = 2
+    cached_seq_len = 21  # well past cache_window (8) and past one evicted block
+
+    comp = DeepseekV4Compressor(
+        hidden_size=8,
+        head_dim=head_dim,
+        ratio=ratio,
+        rms_norm_eps=1e-6,
+        rotary_emb=None,
+        qk_rope_head_dim=head_dim,
+    )
+    assert comp.coff == coff and comp.width == width and comp.overlap == needs_overlap
+
+    history_kv = torch.randn(1, cached_seq_len, width)
+    history_gate = torch.randn(1, cached_seq_len, width)
+    history = torch.cat((history_kv, history_gate), dim=-1).squeeze(0)
+
+    live_start = max(0, cached_seq_len - cache_window)  # = 13
+    n_cols = -(-cached_seq_len // block_size)
+    cache = torch.zeros(n_cols + 1, 1, block_size, 2 * width)
+    cache[0] = -999.0  # null-block sentinel -- a valid read must never see this
+    block_table_row = []
+    for col in range(n_cols):
+        col_start = col * block_size
+        if col_start + block_size <= live_start:
+            block_table_row.append(0)
+            continue
+        physical = col + 1
+        block_table_row.append(physical)
+        for slot in range(block_size):
+            token = col_start + slot
+            if token < cached_seq_len:
+                cache[physical, 0, slot] = history[token]
+    block_table = torch.tensor(block_table_row, dtype=torch.long)
+
+    comp.state_cache = cache
+    position_ids = torch.tensor([[cached_seq_len]], dtype=torch.long)
+    carry_kv, carry_gate, carry_valid = comp._carry_rows(block_table, position_ids)
+
+    gather_n = carry_gather_length(cached_seq_len, ratio, needs_overlap=needs_overlap)
+    assert gather_n == 5
+    expected_kv = history_kv[:, -gather_n:]
+    expected_gate = history_gate[:, -gather_n:]
+    valid_carry = carry_valid[:-1]  # drop the trailing (always-True) new-token slot
+    assert int(valid_carry.sum()) == gather_n
+    torch.testing.assert_close(carry_kv[:, valid_carry], expected_kv, rtol=0, atol=0)
+    torch.testing.assert_close(carry_gate[:, valid_carry], expected_gate, rtol=0, atol=0)
+    assert not bool((carry_kv[:, valid_carry] == -999.0).any())
+    assert not bool((carry_gate[:, valid_carry] == -999.0).any())
 
 
 def test_carry_replay_reproduces_incremental_csa_chunking_with_overlap():

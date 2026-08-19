@@ -51,6 +51,10 @@ from transformers import DeepseekV4Config
 from transformers.models.deepseek_v4 import modeling_deepseek_v4 as tm
 
 from vllm_neuron.model.deepseek_v4 import model as dev
+from vllm_neuron.model.deepseek_v4.attention import (
+    apply_partial_rotary,
+    compressed_entry_slot_mapping,
+)
 from vllm_neuron.model.deepseek_v4.compressor import (
     compress_csa_chunk,
     compress_hca_chunk,
@@ -262,6 +266,122 @@ def test_compressor_wrapper_matches_real_module(
     )
     torch.testing.assert_close(real_reduced, my_reduced, rtol=0, atol=1e-6)
     torch.testing.assert_close(real_normed, my_normed, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("layer_index,ratio,total_len", [(0, 128, 270), (2, 4, 20)])
+def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carry_eviction(
+    real_and_dev, layer_index, ratio, total_len
+):
+    """Extends test_compressor_wrapper_matches_real_module past the
+    compressor's own carry-cache eviction, and through the *real*
+    ``DeepseekV4Compressor.forward`` (real paged ``state_cache``/``mla_cache``
+    I/O, real null-block eviction, one call per raw token -- the actual
+    runtime call pattern) rather than the bare ``compress_fn`` -- closing the
+    coverage gap docs/model-dev/deepseek-v4-swa-null-block-bug.md flags for
+    ``_carry_rows`` (no existing test drove it past eviction through the real
+    module, unlike ``_swa_history``'s
+    ``test_attention_matches_real_module_after_swa_eviction_past_one_window``).
+
+    Relies on the already-established chunk-invariance of
+    ``compress_hca_chunk``/``compress_csa_chunk`` (this module's own
+    docstring, and ``test_carry_replay_reproduces_incremental_*_chunking``):
+    the real module's one-shot reduction over the full sequence and this
+    plugin's per-token incremental writes must land on the identical
+    compressed sequence. RoPE is undone at read-back (via
+    ``apply_partial_rotary(..., inverse=True)`` at each entry's own known
+    position) before comparing, matching
+    ``test_compressor_wrapper_matches_real_module``'s choice to compare the
+    RoPE-degenerate (norm-only) stage -- this test additionally proves real
+    RoPE round-trips cleanly, it just isn't the equality being asserted.
+    """
+    config, real, device_model = real_and_dev
+    real_comp = real.model.layers[layer_index].self_attn.compressor
+    my_comp = device_model.model.layers[layer_index].attention.compressor
+    assert my_comp.ratio == ratio
+    with torch.no_grad():
+        fused_weight = torch.cat([real_comp.kv_proj.weight, real_comp.gate_proj.weight], dim=0)
+        my_comp.fused_wkv_wgate.weight.copy_(fused_weight)
+        my_comp.ape.copy_(real_comp.position_bias)
+        my_comp.norm_weight.copy_(real_comp.kv_norm.weight)
+
+    hidden = torch.randn(1, total_len, config.hidden_size)
+    captured, handle = _capture_pre_norm(real_comp.kv_norm)
+    with torch.no_grad():
+        try:
+            real_comp(hidden, torch.empty(0), torch.arange(total_len).unsqueeze(0), None, layer_index)
+        except RuntimeError:
+            pass
+    handle.remove()
+    real_reduced = captured["pre_norm"]  # [1, num_entries, width] -- chunk-invariant ground truth
+    real_normed = real_comp.kv_norm(real_reduced)
+
+    self_attn_name = f"model.layers.{layer_index}.self_attn"
+    specs = {s.name: s for s in device_model.get_kv_spec().layers}
+    state_spec = specs[f"{self_attn_name}.compressor.state_cache"]
+    mla_spec = specs[self_attn_name]
+    # block-table columns -- must cover total_len raw tokens at state_cache's
+    # own (small) block_size, e.g. 8 for HCA/128 blocks over 140 tokens.
+    width = -(-total_len // state_spec.block_size) + 1
+    my_comp.state_cache = torch.zeros(
+        (width + 1, 1, state_spec.block_size, state_spec.head_size), dtype=state_spec.dtype
+    )
+    mla_cache = torch.zeros(
+        (2, 1, mla_spec.block_size, mla_spec.head_size), dtype=mla_spec.dtype
+    )
+
+    def null_remapped_block_table(cached_seq_len, window, block_size):
+        # Same null-remap convention as
+        # test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced
+        # / test_carry_rows_reads_live_window_correctly_past_carry_cache_eviction:
+        # column c is live iff its last token hasn't fallen out of the window.
+        # +1: real vLLM allocates a token's own column before the engine
+        # calls forward for it, so the column housing *this* (about-to-be-
+        # written) token must already count as allocated -- using plain
+        # cached_seq_len (tokens strictly before this one) would leave a
+        # freshly-started column null at the exact step that writes its
+        # first slot.
+        live_start = max(0, cached_seq_len - window)
+        n_cols = -(-(cached_seq_len + 1) // block_size)
+        return [
+            0 if (c >= n_cols or c * block_size + block_size <= live_start) else c + 1
+            for c in range(width)
+        ]
+
+    # mla_cache addressing: one always-live raw physical block (id 1) is
+    # enough for the *raw-token-addressed* side of compressed_entry_slot_mapping
+    # (see its docstring on why raw and entry addressing share low bits);
+    # entry_base is the compressed-entry index that raw block 1 maps to.
+    entry_base = mla_spec.block_size // ratio
+    hidden_flat = hidden.squeeze(0)
+    with torch.no_grad():
+        for t in range(total_len):
+            state_row = null_remapped_block_table(t, state_spec.sliding_window_size, state_spec.block_size)
+            state_col, state_off = t // state_spec.block_size, t % state_spec.block_size
+            state_slot = state_row[state_col] * state_spec.block_size + state_off
+            raw_slot = 1 * mla_spec.block_size + t
+            mla_slot = compressed_entry_slot_mapping(torch.tensor([raw_slot]), ratio)
+            my_comp(
+                hidden_flat[t : t + 1],
+                position_ids=torch.tensor([[t]], dtype=torch.long),
+                block_table_row=torch.tensor(state_row, dtype=torch.long),
+                state_slot_mapping=torch.tensor([state_slot], dtype=torch.long),
+                mla_cache=mla_cache,
+                mla_slot_mapping=mla_slot,
+            )
+
+    num_entries = total_len // ratio
+    assert num_entries >= 2, "test must actually exercise multiple completions"
+    # mla_cache stores bf16 (CacheKind.MLA's dtype, per get_kv_spec) -- cast
+    # up before comparing against the real module's fp32 output; the wider
+    # tolerance below accounts for that quantization, not just floating-point
+    # summation-order noise.
+    written = mla_cache[0, 0, entry_base : entry_base + num_entries, :].float().unsqueeze(0)
+    entry_positions = (torch.arange(num_entries) * ratio).unsqueeze(0)
+    with torch.no_grad():
+        cos, sin = my_comp.rotary_emb(real_normed, position_ids=entry_positions, layer_type="compress")
+    real_finalized = apply_partial_rotary(real_normed, cos, sin, rope_dim=2 * cos.shape[-1])
+
+    torch.testing.assert_close(real_finalized, written, rtol=1e-2, atol=1e-2)
 
 
 def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):

@@ -1,9 +1,11 @@
 # DeepSeek-V4: SWA/carry-state history reads stale (null) blocks past one window
 
-> **Status: correctness fixed. `_swa_history` is now also Dynamo-shape-static
-> and confirmed past its blocker on real Trn2 hardware. `_carry_rows` (the
-> compressor's carry state) is not — a new, harder blocker was found there
-> and is documented below as separate follow-up work, not attempted.**
+> **Status: correctness fixed. `_swa_history` AND `_carry_rows` (the
+> compressor's carry state) are now both Dynamo-shape-static and confirmed
+> past their blockers on real Trn2 hardware. Tracing now advances one call
+> further, to a new, separate, simpler blocker in `_compressed_history` —
+> not part of this bug's scope (that cache group has no correctness issue),
+> documented at the bottom of item 3 below as the next open item.**
 >
 > **Correctness (`gather_paged_latent`'s `start_token`).**
 > `gather_paged_latent` (`vllm_neuron/model/deepseek_v4/attention.py`) now
@@ -42,45 +44,73 @@
 > confirms this directly (no graph break at all, across multiple steps
 > spanning past one window).
 >
-> **New blocker found: `_carry_rows`'s `if gather_n == 0:` (`model.py`),
-> entangled with the compressor's internal chunking math — not attempted.**
-> One pure guard clause on the way there was fixed the same mechanical way
-> as `mhc.py`/`gather_paged_latent`'s existing guards
-> (`carry_gather_length`'s `if cached_seq_len < 0:`, `compressor.py`, now
-> skipped under `torch.compiler.is_compiling()`), but `_carry_rows`'s
-> `if gather_n == 0:` itself is genuinely shape-determining, the same
-> species of problem `_swa_history` had — except **not** self-contained the
-> way `_swa_history`'s was. Tracing why: `carry_gather_length` returns a
-> Python-int length that is *never* the full carry window (`coff*ratio`),
-> always strictly less, because unlike `_swa_history` (which reads a window
-> ending at, and including, the query's own already-written token) the
-> compressor gathers carry *before* writing this step's new token, and only
-> the *unconsumed* trailing suffix. A fixed-size-window replacement (viable
-> in principle -- same `gather_recent_window` shape) would need to feed
-> `compress_hca_chunk`/`compress_csa_chunk` a *padded* replay tensor and
-> neutralize the invalid leading rows via their existing gate-softmax
-> (set gate to `-inf` so they get ~0 weight) rather than slicing them away
-> -- and that reveals the real complication: those functions' `complete =
-> joined_kv.shape[1] // ratio` windowing, the write-side
-> `valid_slots[:write_count]` slot filtering, and the compressed-entry RoPE
-> position math (`(cached_seq_len // self.ratio) * self.ratio`, another
-> Python-int `cached_seq_len` use) all need to become consistent with
-> "always compute a fixed number of candidate entries, let the (already
-> tensor-based, Dynamo-safe) slot-validity filtering decide which ones
-> actually get written" -- the same pattern `DeepseekV4MoE.forward` already
-> uses for its own always-compute/mask-on-write design, but unverified here
-> and with real risk of silently swapping *which* computed entry is genuine
-> if the entry ordering assumption is wrong -- precisely the class of silent
-> correctness bug this whole document is about. This needs its own pass
-> with dedicated oracle comparisons before being attempted, per "Suggested
-> fix direction" item 2's original caution -- not rushed here. Artifacts:
+> **`_carry_rows` made Dynamo-shape-static too, closing this document's
+> remaining item — confirmed on real Trn2 hardware.** The blocker
+> (`_carry_rows`'s `if gather_n == 0:`, `model.py`) looked entangled with
+> the compressor's internal chunking math, and it was — but the cascade
+> turned out smaller than feared once a key fact was found:
+> `DeepseekV4Compressor.forward` has exactly **one call site** in the whole
+> tree, inside `_forward_one_token`'s per-token loop, so it always
+> compresses exactly **one new raw token**, never a multi-token chunk. That
+> collapses the write-side risk this item originally flagged (see below).
+>
+> The fix: `_carry_rows` now gathers a fixed `coff*ratio - 1` row window via
+> `gather_recent_window` (the same helper item 2 built), ending one token
+> before the new one, plus a `carry_valid` mask combining
+> `gather_recent_window`'s own "doesn't exist yet" mask with a new tensor-
+> valued `carry_gather_length_tensor` (`compressor.py`) marking rows already
+> consumed by an earlier call. `compress_hca_chunk`/`compress_csa_chunk`
+> gained an optional `carry_valid` parameter (default `None`, unchanged
+> behavior for every existing caller) that neutralizes invalid rows via
+> their existing gate-softmax (`-inf`) *before* the windowing reshape —
+> masking pre-reshape, not post, is what makes CSA's overlap-half copy
+> (`combined_gate[:, 1:, :ratio] = logits[:, :-1, ...]`) propagate
+> invalidity correctly with no CSA-specific handling needed. Because the
+> carry window is now always exactly `coff*ratio` rows total (fixed), the
+> two compress functions always produce exactly `coff` candidate rows for
+> this caller (a plain Python int, not a traced value) and the
+> currently-completing window (if any) is unconditionally the *last* one —
+> so the original "write-side `valid_slots[:write_count]` slot filtering" and
+> "which computed entry is genuine" risk this item warned about doesn't
+> arise: `DeepseekV4Compressor.forward` now just takes `compressed[:, -1:]`
+> unconditionally and lets `scatter_paged_latent`'s existing `slot_mapping
+> == -1` filtering (already Dynamo-safe) decide whether to write it. The
+> compressed-entry RoPE position math also switched from the Python-int
+> `cached_seq_len // self.ratio` to the tensor `position_ids`, the same
+> swap item 2 made for `_swa_history`.
+>
+> Verified in stages, per this item's own original caution against rushing:
+> new CPU-eager oracle tests first (bit-exact cross-checks of the masked
+> fixed-window replay against the already-validated slice-based path across
+> full token-by-token walks, including CSA's all-masked-first-window case; a
+> new eviction-past-carry-window regression test driving `_carry_rows`
+> itself against a real paged cache with real null-block eviction, mirroring
+> `_swa_history`'s coverage; and a full real-`transformers`-module
+> comparison through real paged cache I/O, past eviction, for both HCA and
+> CSA) — all green — then a CPU `torch.compile(fullgraph=True, dynamic=True)`
+> proxy confirming `_carry_rows`/`gather_n`/`compress_hca_chunk`/
+> `compress_csa_chunk` no longer appear anywhere in the trace, then the same
+> real-hardware `vllm.LLM()`/`enforce_eager=False` recipe as every attempt
+> above, re-run on the same `trn2.3xlarge`: tracing reaches the real compile
+> backend and advances cleanly past `_carry_rows`, landing on a new,
+> separate, simpler blocker in `_compressed_history` (`model.py:552`,
+> `cached_seq_len // self.ratio` — that cache group never evicts, so it has
+> no correctness bug like this document's; it just needs the same
+> fixed-length-gather-and-mask shape fix, not entangled with any windowing
+> or write-side complexity) — not part of this document's scope, the next
+> open item. Artifacts:
 > `artifacts/deepseek-v4/20260819T022008Z-8df62fb/
 > p6-null-block-fix-step5d-retry/` (correctness-only fix, confirms
-> `_swa_history`'s *old* blocker unchanged) and
-> `artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/` (this
-> redesign: one log confirming `_swa_history`'s blocker is gone and landing
-> on `_carry_rows`; a second confirming the `carry_gather_length` guard fix
-> and landing on the same `_carry_rows` line).
+> `_swa_history`'s *old* blocker unchanged),
+> `artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/` (`_swa_history`
+> redesign: one log confirming its blocker is gone and landing on
+> `_carry_rows`; a second confirming the `carry_gather_length` guard fix and
+> landing on the same `_carry_rows` line), and
+> `artifacts/deepseek-v4/20260819T035235Z-2f88686-wip/p6-carry-rows-dynamo-static-fix/`
+> (this fix's CPU proxy and real-hardware confirmation, both landing
+> cleanly on `_compressed_history`, past `_carry_rows` — directory name
+> notes this ran against an uncommitted working tree, see its
+> `git-revision.txt`).
 
 ## One-paragraph summary
 
@@ -285,37 +315,46 @@ than a variable-length one).
    hardware, re-running Step 5d's actual `vllm.LLM()` recipe against this
    fix advances cleanly past the exact guard failure that blocked every
    previous attempt, onto a new, later blocker (item 4).
-3. **Making `_carry_rows` Dynamo-shape-static, per Step 5d — still open,
-   not attempted; harder than item 2.** Unlike `_swa_history`, this is not
-   self-contained: `carry_gather_length`'s Python-int result is *never*
-   the full carry window (`coff*ratio`) -- always strictly less, because
-   the compressor gathers carry *before* writing the new token, and only
-   the unconsumed trailing suffix. A `gather_recent_window`-shaped fix is
-   viable in principle, but consuming it correctly requires
-   `compress_hca_chunk`/`compress_csa_chunk` to tolerate *padded* input
-   (neutralizing invalid leading rows via their existing gate-softmax --
-   set gate to `-inf` -- rather than slicing them away), which in turn
-   means their `complete = joined_kv.shape[1] // ratio` windowing, the
-   write-side `valid_slots[:write_count]` slot filtering, and the
-   compressed-entry RoPE position math
-   (`(cached_seq_len // self.ratio) * self.ratio`, another Python-int
-   `cached_seq_len` use) all need to move to "always compute a fixed
-   number of candidate entries, let the slot-validity filtering (already
-   tensor-based, Dynamo-safe) decide which get written" -- the same
-   pattern `DeepseekV4MoE.forward` already uses, but unverified here, and
-   with real risk of silently writing the *wrong* computed entry if the
-   ordering assumption is off -- precisely the class of silent
-   correctness bug this document is about. Needs its own pass with
-   dedicated oracle comparisons, per this item's original caution -- not
-   rushed alongside item 2.
+3. **Making `_carry_rows` Dynamo-shape-static, per Step 5d — done, confirmed
+   on real Trn2 hardware.** The cascade this item originally warned about
+   turned out smaller than feared: `DeepseekV4Compressor.forward` has
+   exactly one call site (`_forward_one_token`'s per-token loop), so it
+   always compresses exactly one new raw token, never a multi-token chunk.
+   `_carry_rows` now gathers a fixed `coff*ratio - 1` row window via
+   `gather_recent_window` (the same helper item 2 built) plus a new tensor-
+   valued `carry_gather_length_tensor` (`compressor.py`) to build a
+   `carry_valid` mask; `compress_hca_chunk`/`compress_csa_chunk` gained an
+   optional `carry_valid` parameter (default `None`, unchanged behavior for
+   every existing caller) that neutralizes invalid rows via their existing
+   gate-softmax (`-inf`) *before* the windowing reshape -- this ordering is
+   what makes CSA's overlap-half copy propagate invalidity correctly with
+   no CSA-specific handling needed. Because the carry window is now always
+   exactly `coff*ratio` rows, both compress functions always produce
+   exactly `coff` candidate rows for this caller (a plain Python int, not a
+   traced value), and the currently-completing window (if any) is
+   unconditionally the *last* one -- so the "write-side
+   `valid_slots[:write_count]` slot filtering" / "which entry is genuine"
+   risk this item warned about doesn't arise: `DeepseekV4Compressor.forward`
+   just takes `compressed[:, -1:]` unconditionally and lets
+   `scatter_paged_latent`'s existing `slot_mapping == -1` filtering decide
+   whether to write it. Verified with dedicated oracle comparisons first
+   (per this item's own original caution), then a CPU `torch.compile`
+   proxy, then real hardware -- see the status block at the top of this
+   document for the full account and artifact paths.
 4. `tools/deepseek_v4/check_swa_null_block_bug.py` and the (now non-xfail)
-   regression test are the correctness gate — green as of item 1. Step
-   5d's device attempt (see that doc for the exact `vllm.LLM()` invocation
-   and required env vars) is the Dynamo gate: item 2 (`_swa_history`) is
-   confirmed to pass its slice of that gate; the attempt now fails at a
-   new line, `_carry_rows`'s `if gather_n == 0:` (`model.py`) -- item 3,
-   still open. All of items 1-3 need to land before compiled-serving
-   sign-off; item 1 alone (or 1+2) is not sufficient for that.
+   regression test are the correctness gate — green as of item 1.
+   `tools/deepseek_v4/check_carry_rows_dynamo_trace.py` (new) is item 3's
+   CPU-only Dynamo tracing gate. Step 5d's device attempt (see that doc for
+   the exact `vllm.LLM()` invocation and required env vars) is the Dynamo
+   gate: items 2 (`_swa_history`) and 3 (`_carry_rows`) are both now
+   confirmed to pass their slice of that gate; the attempt now fails one
+   call later, at `_compressed_history`'s own `cached_seq_len //
+   self.ratio` (`model.py`) -- a separate, simpler item (that cache group
+   never evicts, so it has no correctness bug like this document's), not
+   tracked here. All of items 1-3 have landed; item 1 alone (or 1+2) was
+   not sufficient for compiled-serving sign-off, but items 1-3 together are
+   not sufficient either -- `_compressed_history` is the next, and (as far
+   as this document's investigation found) last, blocker in this family.
 
 ## Severity
 
@@ -323,7 +362,8 @@ Any real serving session whose generation exceeds one `sliding_window`'s
 length of tokens — the common case, not an edge case — would have gotten
 silently wrong attention for every SWA layer (and wrong carry-state replay
 for the compressor). Fixed as of item 1 above (correctness). The
-compiled-serving Dynamo work is partially done (item 2, `_swa_history`) and
-partially still blocked on this same code (item 3, `_carry_rows` and the
-compressor's internal chunking) — see "Relationship to the Dynamo work"
-above.
+compiled-serving Dynamo work is now fully done for the code this document
+covers (item 2, `_swa_history`; item 3, `_carry_rows` and the compressor's
+internal chunking) — see "Relationship to the Dynamo work" above. Tracing
+now advances past all of it, to a separate, simpler, not-yet-attempted item
+in `_compressed_history` (`model.py`) outside this document's scope.
