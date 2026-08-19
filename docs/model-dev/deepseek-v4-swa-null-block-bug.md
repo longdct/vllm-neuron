@@ -2,10 +2,17 @@
 
 > **Status: correctness fixed. `_swa_history` AND `_carry_rows` (the
 > compressor's carry state) are now both Dynamo-shape-static and confirmed
-> past their blockers on real Trn2 hardware. Tracing now advances one call
-> further, to a new, separate, simpler blocker in `_compressed_history` —
-> not part of this bug's scope (that cache group has no correctness issue),
-> documented at the bottom of item 3 below as the next open item.**
+> past their blockers on real Trn2 hardware. `_compressed_history` (out of
+> this bug's scope -- that cache group has no correctness issue -- but the
+> next Dynamo-shape item in this same family) is now fixed too, in
+> `docs/model-dev/deepseek-v4-024-device-validation.md`'s Step 5d item 9:
+> full-model FX graph capture now succeeds completely on the real compile
+> backend. What comes next is a different kind of problem entirely -- a
+> deterministic segfault inside torch_xla's PjRt execution runtime, a
+> toolchain/SDK-level issue, not a Dynamo-shape or model-code one. See that
+> doc for the full account; this document's own scope (SWA/carry null-block
+> correctness plus the three model-code Dynamo-shape items it led to) is
+> now fully closed.**
 >
 > **Correctness (`gather_paged_latent`'s `start_token`).**
 > `gather_paged_latent` (`vllm_neuron/model/deepseek_v4/attention.py`) now
@@ -344,17 +351,21 @@ than a variable-length one).
 4. `tools/deepseek_v4/check_swa_null_block_bug.py` and the (now non-xfail)
    regression test are the correctness gate — green as of item 1.
    `tools/deepseek_v4/check_carry_rows_dynamo_trace.py` (new) is item 3's
-   CPU-only Dynamo tracing gate. Step 5d's device attempt (see that doc for
-   the exact `vllm.LLM()` invocation and required env vars) is the Dynamo
-   gate: items 2 (`_swa_history`) and 3 (`_carry_rows`) are both now
-   confirmed to pass their slice of that gate; the attempt now fails one
-   call later, at `_compressed_history`'s own `cached_seq_len //
-   self.ratio` (`model.py`) -- a separate, simpler item (that cache group
-   never evicts, so it has no correctness bug like this document's), not
-   tracked here. All of items 1-3 have landed; item 1 alone (or 1+2) was
-   not sufficient for compiled-serving sign-off, but items 1-3 together are
-   not sufficient either -- `_compressed_history` is the next, and (as far
-   as this document's investigation found) last, blocker in this family.
+   CPU-only Dynamo tracing gate; it now traces the full 25-step run with
+   zero graph breaks at all, since `_compressed_history` (fixed alongside,
+   outside this bug's scope but the same tracing gate) no longer trips
+   either. Step 5d's device attempt (see that doc for the exact
+   `vllm.LLM()` invocation and required env vars) is the Dynamo gate: items
+   2 (`_swa_history`) and 3 (`_carry_rows`), plus `_compressed_history`, are
+   all now confirmed to pass their slice of that gate -- full-model FX
+   graph capture succeeds completely on the real compile backend for the
+   first time. The attempt now fails one stage later, during graph
+   *execution* (a deterministic torch_xla/PjRt segfault, not a
+   guard/tracing failure) -- see that doc's Step 5d item 9. All of items
+   1-3 have landed; item 1 alone (or 1+2) was not sufficient for
+   compiled-serving sign-off, and items 1-3 together are not sufficient for
+   it either, but not because of anything left in this document's scope --
+   the remaining gap is the toolchain-level execution issue above.
 
 ## Severity
 
@@ -365,5 +376,9 @@ for the compressor). Fixed as of item 1 above (correctness). The
 compiled-serving Dynamo work is now fully done for the code this document
 covers (item 2, `_swa_history`; item 3, `_carry_rows` and the compressor's
 internal chunking) — see "Relationship to the Dynamo work" above. Tracing
-now advances past all of it, to a separate, simpler, not-yet-attempted item
-in `_compressed_history` (`model.py`) outside this document's scope.
+now advances past all of it and past `_compressed_history` too (fixed
+alongside, outside this document's scope), reaching full-model graph
+capture on the real compile backend for the first time -- the remaining
+gap to compiled-serving sign-off is a toolchain-level execution segfault,
+not a shape or correctness problem in this plugin's model code. See
+`docs/model-dev/deepseek-v4-024-device-validation.md`'s Step 5d item 9.

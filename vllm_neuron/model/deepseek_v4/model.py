@@ -536,9 +536,9 @@ class DeepseekV4Attention(nn.Module):
         return gathered.squeeze(1), valid
 
     def _compressed_history(
-        self, block_table_row: torch.Tensor, cached_seq_len: int
-    ) -> torch.Tensor:
-        """Prior compressed entries.
+        self, block_table_row: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All prior compressed entries, Dynamo-shape-static.
 
         This group's cache stores one physical row per *compressed entry*,
         not per raw token (``storage_block_size = block_size //
@@ -547,13 +547,33 @@ class DeepseekV4Attention(nn.Module):
         ``compressed_entry_slot_mapping``). The two address spaces differ by
         exactly ``compress_ratio``, matching the write side's
         ``raw_slot // compress_ratio``.
+
+        Unlike ``_swa_history``/``_carry_rows``'s *sliding* windows, this
+        group never evicts -- entries are addressed from 0 and simply
+        accumulate, so "the first ``num_entries`` columns" is a fixed,
+        growing *prefix*, not a moving window. That makes the Dynamo-static
+        fix simpler than either of those: no tensor-derived offset is
+        needed, just gather the *entire* block-table-addressable capacity
+        (``max_entries`` -- a plain Python int from real tensor shapes,
+        ``block_table_row``'s own column count times this cache's
+        ``storage_block_size``, sized for the whole ``max_model_len`` by the
+        same per-group convention documented in
+        docs/model-dev/deepseek-v4-swa-null-block-bug.md) and mask off
+        entries beyond the real current count -- rather than branching on
+        ``cached_seq_len``'s value at all. Trades throughput for
+        compilability (gathers the full capacity every call, not just the
+        real entries so far), the same tradeoff ``DeepseekV4MoE.forward``'s
+        always-compute redesign documents; not a concern for this pass's
+        synthetic validation config, a real cost at production scale.
         """
-        num_entries = cached_seq_len // self.ratio
-        if num_entries == 0:
-            return self.mla_cache.new_zeros((0, self.mla_cache.shape[-1]))
-        return gather_paged_latent(
-            self.mla_cache, block_table_row, num_entries
+        max_entries = block_table_row.shape[0] * self.mla_cache.shape[2]
+        gathered = gather_paged_latent(
+            self.mla_cache, block_table_row, max_entries
         ).squeeze(1)
+        cached_seq_len = position_ids.view(()).long()
+        num_entries = torch.div(cached_seq_len, self.ratio, rounding_mode="floor")
+        valid = torch.arange(max_entries, device=gathered.device) < num_entries
+        return gathered, valid
 
     def _forward_one_token(
         self,
@@ -563,7 +583,6 @@ class DeepseekV4Attention(nn.Module):
         attn_metadata: dict,
         request: int,
         local_index: int,
-        cached_seq_len: int,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Attend and update caches for exactly one token.
@@ -636,18 +655,20 @@ class DeepseekV4Attention(nn.Module):
                 mla_cache=self.mla_cache,
                 mla_slot_mapping=mla_slot,
             )
-            compressed_history = self._compressed_history(
-                mla_entry["block_table_tensor"][request], cached_seq_len
+            compressed_history, compressed_valid = self._compressed_history(
+                mla_entry["block_table_tensor"][request], position_ids
             )
             history = torch.cat((compressed_history, history), dim=0)
-            # compressed_history is never padding (its cache group never
-            # evicts and only ever holds completed entries -- see
-            # _compressed_history's docstring), so every one of its rows is
-            # real content; only the fixed-size swa window above can contain
-            # not-yet-produced padding rows.
-            key_valid = torch.cat(
-                (key_valid.new_ones(compressed_history.shape[0]), key_valid), dim=0
-            )
+            # compressed_history is now a fixed-size (max_entries) buffer,
+            # not just the real entries so far -- compressed_valid marks
+            # which of those rows are real (see _compressed_history's
+            # docstring). Padding rows sit between the real compressed
+            # entries and the swa window below, but that's safe: causal
+            # order among *real* content is still preserved (every real
+            # compressed entry precedes every swa-window row regardless of
+            # any padding gap), and mla_attention_reference's key_valid mask
+            # excludes the padding itself from attention entirely.
+            key_valid = torch.cat((compressed_valid, key_valid), dim=0)
 
         attended = mla_attention_reference(
             q_roped,
@@ -675,18 +696,14 @@ class DeepseekV4Attention(nn.Module):
         cached_seq_len_row = attn_metadata[f"{self_attn_name}.swa_cache"][
             "cached_seq_len"
         ][request]
-        # Two views of the same source value, kept deliberately separate:
-        #   - ``base_cached_seq_len`` (a plain Python int, via the same
-        #     ``int(...)`` device->host read as before) still drives the
-        #     shape/control-flow math below (`_swa_history`'s window cap,
-        #     the compressor's carry-window arithmetic, ...) -- those are
-        #     genuinely shape-determining and out of scope for this fix (see
-        #     Step 5d's "next blocker" note in the device-validation doc).
-        #   - ``base_position_id`` stays a real tensor end to end and feeds
-        #     `_forward_one_token`'s RoPE `position_ids` -- see that
-        #     method's docstring for why the int/list round trip broke
-        #     Dynamo tracing.
-        base_cached_seq_len = int(cached_seq_len_row[0])
+        # base_position_id stays a real tensor end to end and feeds
+        # `_forward_one_token`'s RoPE `position_ids` -- see that method's
+        # docstring for why an int/list round trip broke Dynamo tracing.
+        # No plain-Python-int `cached_seq_len` is derived here at all
+        # anymore (no `int(...)` device->host read): `_swa_history`,
+        # `_carry_rows`, and now `_compressed_history` all consume
+        # `position_ids` directly instead -- see
+        # docs/model-dev/deepseek-v4-swa-null-block-bug.md.
         base_position_id = cached_seq_len_row[0:1].to(dtype=torch.long).view(1, 1)
         attended_rows = []
         for local_index in range(hidden.shape[0]):
@@ -697,7 +714,6 @@ class DeepseekV4Attention(nn.Module):
                     attn_metadata=attn_metadata,
                     request=request,
                     local_index=local_index,
-                    cached_seq_len=base_cached_seq_len + local_index,
                     position_ids=base_position_id + local_index,
                 )
             )

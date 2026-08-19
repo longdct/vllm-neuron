@@ -384,6 +384,56 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     torch.testing.assert_close(real_finalized, written, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("layer_index,ratio", [(0, 128), (2, 4)])
+def test_compressed_history_gathers_full_prefix_with_correct_validity_mask(
+    real_and_dev, layer_index, ratio
+):
+    """Regression test for DeepseekV4Attention._compressed_history's
+    Dynamo-static redesign (docs/model-dev/deepseek-v4-swa-null-block-bug.md's
+    next open item, now closed): unlike _swa_history/_carry_rows's *sliding*
+    windows, this cache group never evicts, so the fix gathers the entire
+    block-table-addressable capacity (max_entries) unconditionally and masks
+    entries past the real count, rather than branching on cached_seq_len.
+    Verifies directly against a hand-built paged mla_cache with known
+    entries: the valid rows exactly match the true entries in order, the
+    validity boundary is exactly at num_entries, and the num_entries == 0
+    case (no branch, just an all-False mask) works too.
+    """
+    config, real, device_model = real_and_dev
+    my_attn = device_model.model.layers[layer_index].attention
+    assert my_attn.ratio == ratio
+
+    mla_spec = {s.name: s for s in device_model.get_kv_spec().layers}[
+        f"model.layers.{layer_index}.self_attn"
+    ]
+    storage_block_size = mla_spec.block_size
+    num_cols = 3
+    my_attn.mla_cache = torch.zeros((num_cols + 1, 1, storage_block_size, mla_spec.head_size))
+    block_table_row = torch.arange(1, num_cols + 1, dtype=torch.long)
+    max_entries = num_cols * storage_block_size
+
+    torch.manual_seed(9)
+    known_entries = torch.randn(max_entries, mla_spec.head_size)
+    for col in range(num_cols):
+        my_attn.mla_cache[col + 1, 0] = known_entries[
+            col * storage_block_size : (col + 1) * storage_block_size
+        ]
+
+    for num_entries in (0, 1, storage_block_size, max_entries - 1, max_entries):
+        cached_seq_len = num_entries * ratio  # the boundary _compressed_history reads
+        position_ids = torch.tensor([[cached_seq_len]], dtype=torch.long)
+        gathered, valid = my_attn._compressed_history(block_table_row, position_ids)
+
+        assert gathered.shape[0] == max_entries
+        assert valid.shape == (max_entries,)
+        expected_valid = torch.arange(max_entries) < num_entries
+        assert torch.equal(valid, expected_valid)
+        if num_entries:
+            torch.testing.assert_close(
+                gathered[:num_entries], known_entries[:num_entries], rtol=0, atol=0
+            )
+
+
 def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
     """Cross-checks the *integrated, end-to-end* attention path: real cache
     I/O, the per-token loop, RoPE applied/undone at the right absolute

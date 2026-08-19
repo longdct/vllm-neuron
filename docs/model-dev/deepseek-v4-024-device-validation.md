@@ -33,7 +33,7 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
-| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids`, `scatter_paged_latent`, `_swa_history`'s, and now `_carry_rows`'s data-dependent shape all fixed and device-confirmed; now blocked on `_compressed_history`'s own (separate, simpler) `cached_seq_len // ratio` data-dependent shape (see Step 5d) |
+| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | Every data-dependent-shape blocker in this plugin's model code is now fixed and device-confirmed (`position_ids`, `scatter_paged_latent`, `_swa_history`, `_carry_rows`, `_compressed_history`) -- full-model FX graph capture now succeeds on the real compile backend for the first time. Blocked past that on a new, different-in-kind issue: a deterministic segfault inside torch_xla's PjRt execution runtime during actual on-device graph execution, not a Dynamo/tracing/model-code problem (see Step 5d) |
 | T3 (full model, eager) | Real `vllm.LLM()` on Trn2, `enforce_eager=True` | Not possible on this plugin at all, any model (see Step 5e) -- so 5d's blocker is the only path to real-hardware inference |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
@@ -480,6 +480,59 @@ real, forward progress, not a different flavor of the same error.
    likely a small, `_swa_history`-item-2-shaped fix (fixed-length gather +
    mask), not entangled with any windowing/write-side complexity. Not
    attempted here; the next open item in this family.
+9. **`_compressed_history` made Dynamo-shape-static -- closes every
+   data-dependent-shape blocker in this plugin's model code. Full-model FX
+   graph capture now succeeds on the real compile backend for the first
+   time. Blocked one stage later by a new, different-in-kind issue: a
+   deterministic segfault during actual on-device graph *execution*, inside
+   torch_xla's PjRt runtime -- not a Dynamo/tracing/model-code problem.**
+   Unlike `_swa_history`/`_carry_rows`, this group never evicts -- entries
+   are addressed from 0 and simply accumulate, so "the first `num_entries`
+   columns" is a fixed, growing *prefix*, not a sliding window. That makes
+   the fix simpler than either: no tensor-derived offset needed. It always
+   gathers the *entire* block-table-addressable capacity (`max_entries` --
+   `block_table_row.shape[0] * self.mla_cache.shape[2]`, a plain Python int
+   from real tensor shapes, no config threading needed) and masks off
+   entries beyond the real current count, rather than branching on
+   `cached_seq_len`'s value at all. `gather_paged_latent` itself needed no
+   changes -- called with a fixed, shape-derived length, its own internal
+   `if sequence_length == 0:` guard becomes an ordinary compile-time-constant
+   branch, not a data-dependent one. `_forward_one_token`'s Python-int
+   `cached_seq_len` parameter (and `forward()`'s `int(cached_seq_len_row[0])`
+   device-to-host read that built it) are now gone entirely -- every
+   consumer uses the tensor `position_ids` instead.
+
+   Verified the same way as item 8: new CPU-eager unit tests (a direct
+   gather/mask-boundary check against a hand-built paged `mla_cache` with
+   known entries, for both HCA and CSA) plus the existing chunk-invariance
+   and real-engine `generate()` tests, all green; then the CPU
+   `torch.compile(fullgraph=True, dynamic=True)` proxy -- which now traces
+   **25 steps with zero graph breaks at all**, not just past the one line
+   that used to fail; then the real hardware `vllm.LLM()`/
+   `enforce_eager=False` recipe. That real-hardware run is where the
+   picture changes: tracing succeeds completely (FX graphs written for
+   every one of the 3 parallel-trace lanes, `capture_backend.py`'s "FX Pass
+   metadata" logged for each), but graph *execution* then crashes:
+   ```
+   !!!!!!! Segfault encountered !!!!!!!
+     File "<unknown>", line 0, in torch_xla::runtime::PjRtComputationClient::ExecuteComputation(...)
+     File "<unknown>", line 0, in torch_xla::XLAGraphExecutor::ScheduleSyncTensorsGraph(...)
+     ...
+   RuntimeError: Parallel trace fork failed (rank=0): lane=1 pid=... exit_code=-1 status=ERROR err=no status file written
+   ```
+   Reproduced twice, including once against a fully cleared
+   `~/.cache/neuron_libtorch` compile cache (ruling out stale-cache
+   corruption) -- deterministic, not flaky. HBM is not the cause (23.99 GiB
+   free logged just before the crash). This is a crash inside
+   `libtorch_neuronx_lite`/torch_xla's native execution path, not raised
+   Python-side and not traceable to a specific line in this plugin's code --
+   a toolchain/SDK-level issue, the same category as the EFA-device and
+   eager-mode gaps in Steps 5d(attempt 1)/5e, not a DeepSeek-V4 model bug.
+   Not investigated further here: root-causing a native segfault in the
+   compile/execution runtime is a different kind of work (SDK bug report,
+   toolchain version bisection, ...) than the Dynamo-shape fixes this
+   document's whole thread has been about, and is out of scope for this
+   pass.
 
 Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile-retry/`
 holds the two new full logs (`attempt-position-ids-fix-retry.log`,
@@ -494,34 +547,33 @@ Attempt 7's two real-hardware re-runs (post-`_swa_history`-fix landing on
 `artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/`. Attempt 8's
 CPU proxy and real-hardware confirmation (both landing cleanly on
 `_compressed_history`, past `_carry_rows`) are in
-`artifacts/deepseek-v4/20260819T035235Z-2f88686-wip/p6-carry-rows-dynamo-static-fix/`
-(directory name notes this was run against an uncommitted working tree --
-see that directory's `git-revision.txt`).
+`artifacts/deepseek-v4/20260819T035235Z-2f88686-wip/p6-carry-rows-dynamo-static-fix/`.
+Attempt 9's CPU proxy (full 25-step clean trace) and both real-hardware
+segfault reproductions (fresh cache and cleared cache) are in
+`artifacts/deepseek-v4/20260819T040508Z-055e15f-wip/p6-compressed-history-dynamo-static-fix/`
+(directory names note these ran against an uncommitted working tree at
+capture time -- see each directory's `git-revision.txt`).
 
 **What this means for Step 0's open question.** The toolchain-level question
-that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
-any previous gate reached it: this is real `torch.compile`/Dynamo tracing of
-the actual registered model through the real Neuron compile backend on real
-silicon, past model construction, weight loading, and the device move —
-substantially past 5a/5b's isolated-kernel-only evidence. The remaining
-blockers are in this plugin's own model code, not the toolchain: the
-per-token attention loop (`docs/model-dev/deepseek-v4-carry-cache-design.md`'s
-"Mid-chunk compression boundaries force a per-token attention loop") builds
-several tensors per iteration from Python-level scalars in ways Dynamo's
-fake-tensor tracing does not yet accept cleanly. The `position_ids`,
-`_swa_history`, and `_carry_rows`/compressor-carry-window instances of that
-pattern are now fixed and device-confirmed above, as is one guard-clause
-instance in `scatter_paged_latent`; the real remaining instance is
-`_compressed_history` alone, which still slices `mla_cache` to a Python-int
-length computed from `cached_seq_len` (`cached_seq_len // self.ratio`) —
-genuinely shape-determining, not a removable guard, but (per its own
-docstring and the null-block bug doc's "Affected call sites" section) a
-simpler case than `_carry_rows` was: it reads a non-evicting cache group
-with no windowing/write-side entanglement. The fix is the same shape
-pattern used for the other three: gather a fixed, compile-time-static
-length (the entry cap) unconditionally and mask instead of slicing to a
-runtime-computed length, rather than threading a symbolic int into a slice
-bound. It belongs with `deepseek-v4-serving-roadmap.md`'s Step 0.
+that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is now answered as far as
+Dynamo tracing goes: this is real `torch.compile`/Dynamo tracing of the
+*actual, complete* registered model through the real Neuron compile backend
+on real silicon, past model construction, weight loading, the device move,
+and now full FX graph capture for every layer -- substantially past 5a/5b's
+isolated-kernel-only evidence, and past every model-code blocker this
+document's whole thread was chasing. The per-token attention loop
+(`docs/model-dev/deepseek-v4-carry-cache-design.md`'s "Mid-chunk compression
+boundaries force a per-token attention loop") built several tensors per
+iteration from Python-level scalars in ways Dynamo's fake-tensor tracing did
+not accept cleanly; every instance of that pattern (`position_ids`,
+`_swa_history`, `_carry_rows`/compressor-carry-window, `_compressed_history`,
+plus the two guard-clause instances in `scatter_paged_latent`/`mhc.py`) is
+now fixed and device-confirmed. What replaces it as the open question is a
+genuinely different one: a deterministic segfault inside torch_xla's PjRt
+execution runtime once graph *execution* actually starts (item 9 above) --
+a toolchain/SDK-level question, not a "which line needs a shape fix"
+question. That belongs with `deepseek-v4-serving-roadmap.md`'s Step 0 as a
+new, distinct open item, not a continuation of the shape-fix series above.
 
 ### 5e. `enforce_eager=True` is not an escape hatch on real hardware
 
