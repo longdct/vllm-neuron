@@ -568,12 +568,112 @@ iteration from Python-level scalars in ways Dynamo's fake-tensor tracing did
 not accept cleanly; every instance of that pattern (`position_ids`,
 `_swa_history`, `_carry_rows`/compressor-carry-window, `_compressed_history`,
 plus the two guard-clause instances in `scatter_paged_latent`/`mhc.py`) is
-now fixed and device-confirmed. What replaces it as the open question is a
-genuinely different one: a deterministic segfault inside torch_xla's PjRt
-execution runtime once graph *execution* actually starts (item 9 above) --
-a toolchain/SDK-level question, not a "which line needs a shape fix"
-question. That belongs with `deepseek-v4-serving-roadmap.md`'s Step 0 as a
-new, distinct open item, not a continuation of the shape-fix series above.
+now fixed and device-confirmed. What appeared to replace it as the open
+question was a genuinely different one: a deterministic segfault inside
+torch_xla's PjRt execution runtime once graph *execution* actually starts
+(item 9 above), read at the time as a toolchain/SDK-level question rather
+than a "which line needs a shape fix" question.
+
+**That reading was wrong — see item 12 below.** The segfault was a 57th
+instance of exactly this same shape-fix series, hiding in
+`scatter_paged_latent`'s padding filter, and it is fixed in this repo. The
+lesson worth carrying: a graph that captures with *zero Dynamo graph breaks*
+can still be shape-dynamic, because `fullgraph=True` converts what would
+have been a break into a silently-captured unbacked SymInt. "No graph break"
+was the wrong success signal to read the earlier attempts against.
+
+#### Item 12: the segfault was model code after all — a 57th data-dependent shape
+
+**The "toolchain/SDK-level, not fixable in this repo" conclusion above is
+wrong, and this item supersedes it.** The `ExecuteComputation` segfault has a
+single root cause in this repo's own model code, it is the *same* family as
+every other Step 5d fix, and it is fixed in `scatter_paged_latent`
+(`vllm_neuron/model/deepseek_v4/attention.py`).
+
+**Mechanism, confirmed end to end.** `xla_builder.create_placeholder_tensor`
+— which the compile backend's FX→HLO stage
+(`libtorch_neuronx_lite/compile/hlo.py::convert_fx_to_hlo`) builds its replay
+inputs from — returns XLA tensors with *no backing device buffer*. They are
+valid only for lowering. Reduced to first principles, hardware-free:
+
+| What is done to a placeholder tensor | Result |
+| --- | --- |
+| `LoweringContext().build(...)` / `.hlo()` (capture) | fine — HLO comes out |
+| `torch_xla.sync(wait=True)` (execute) | **SIGSEGV** in `PjRtComputationClient::ExecuteComputation` |
+| `.item()` (materialize) | **SIGSEGV**, same frame |
+
+`convert_fx_to_hlo` does not merely lower the FX graph — it *replays* it
+(`gm(*xla_placeholders)`). Replay is safe only while every op in the graph
+has a data-independent output shape. Probing the op families the DeepSeek-V4
+graph actually contains against placeholder inputs, exactly two segfault:
+`torch.nonzero` and **boolean-mask indexing**. `index_put_`, `setitem`,
+`gather`, `scatter_`, `index_select`, `embedding`, `einsum`, `where`,
+`clamp`, `masked_fill`, `softmax`, `rms_norm` and the rest all replay
+cleanly.
+
+**The offending line.** `scatter_paged_latent` filtered padding rows out with
+`slot_mapping = slot_mapping[valid]` / `values = values[valid]`. Its own
+comment recorded the assumption that made this look safe — *"Filtering to the
+valid rows costs a data-dependent shape (fine here — this pass is
+eager/CPU-mode)"*. That assumption expired the moment the model reached the
+device compile path. Under the `fullgraph=True` tracing
+`neuron_model_runner.py` uses, Dynamo cannot break on the mask, so it
+captures it as an unbacked SymInt instead — which is why the capture looked
+*clean*: **no graph break is not the same as static shapes.**
+
+The crashed run's own captured FX graph proves this is the whole story: it
+holds 112 `aten._assert_scalar` guard nodes, and every one of them traces
+back through 56 `aten.sym_size.int` calls to a `slot_mapping` produced by
+those two mask filters. There is no other unbacked-SymInt source anywhere in
+the full-model graph, and no other `nonzero`/`masked_select`/`.item()`/
+boolean-mask site remains in `vllm_neuron/model/deepseek_v4/`.
+
+**The fix.** Redirect padding rows to the reserved null block instead of
+filtering them out — `slot_mapping.clamp(min=0)` sends `-1` to flat slot 0,
+i.e. block 0 offset 0, which is vLLM's `NULL_BLOCK_ID`: never handed to a
+real request, masked out on every read path here, and already this plugin's
+write-side padding convention everywhere else (see `llama3/model.py`'s
+`_write_kv_cache`, and the runner's own `slot_mapping[pad:] = NULL_BLOCK_ID`).
+The write stays a single unconditional fixed-shape `index_put_`. This is the
+same clamp-and-mask idiom `gather_recent_window` already uses on the read
+side.
+
+The collision hazard the old comment worried about — a padding row
+redirected onto slot 0 racing a real row that also targets slot 0, with
+`index_put_` leaving the winner unspecified — cannot occur, for two
+independent reasons: the null block is reserved so no real row ever targets
+it, and both production call sites pass **exactly one row** (`model.py`'s
+per-token `[local_index : local_index + 1]` slice, and
+`compressed_entry_slot_mapping`'s `[1]`-shaped result), so a padding row can
+never share a call with a real row at all.
+
+**Evidence.** A ~35-line reproduction that needs neither vLLM nor Neuron
+hardware — the capture backend runs entirely on the CPU PjRt client, which is
+what `PJRT_DEVICE=CPU` in `vllm_neuron/__init__.py` selects — drives the real
+`scatter_paged_latent` through `torch.compile(backend=
+"neuron_libtorch_graph_capture", fullgraph=True)` on meta inputs. Before the
+fix it segfaults immediately after the `FX Pass metadata` log line with no
+HLO written, matching the reported crash exactly; after the fix it reaches
+`CaptureComplete` and the captured graph contains zero `_assert_scalar`
+nodes. Regression coverage:
+`test_scatter_paged_latent_is_dynamo_shape_static` (asserts the traced graph
+stays data-independent) plus the two padding-contract tests in
+`test/unit/model/deepseek_v4/test_paged_cache_helpers.py`; all three fail on
+the pre-fix code. Full DeepSeek-V4 unit and integration suites are green
+(153 + 24 passed).
+
+**Still owed: the end-to-end hardware re-run.** The `vllm.LLM()` recipe has
+not been re-run on real silicon since the fix — the instance's Neuron device
+was occupied for the whole of this session by an unrelated root-owned
+`vllm serve openai/gpt-oss-20b` (TP=2, both logical cores). Re-run
+`artifacts/deepseek-v4/20260819T150816Z-0d84188-wip/p6-disable-parallel-trace-workaround/step5d_run_script_disable_parallel_trace.py`
+once the device is free to confirm capture now completes for all buckets.
+
+**What this leaves for the SDK.** A much narrower report than the original
+draft: the capture backend should *reject* a graph whose replay needs a
+data-dependent shape, rather than segfaulting in a worker thread with no
+Python frame. See
+`artifacts/deepseek-v4/<run-id>/p6-capture-segfault-root-cause/sdk-bug-report.md`.
 
 ### 5e. `enforce_eager=True` is not an escape hatch on real hardware
 

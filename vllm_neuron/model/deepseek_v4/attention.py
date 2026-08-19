@@ -151,8 +151,12 @@ def scatter_paged_latent(
     (``blk_idx = slot // storage_block_size``, ``pos_idx = slot %
     storage_block_size``, matching the convention every other cache write in
     this plugin uses -- see ``llama3/model.py``'s ``_write_kv_cache``).
-    Entries with ``slot_mapping == -1`` are padding and are not written,
-    exactly like every other paged cache write in this plugin.
+    Entries with ``slot_mapping == -1`` are padding: they are redirected to
+    the reserved null block (flat slot 0) rather than written to real cache
+    content, exactly like every other paged cache write in this plugin. The
+    write itself stays unconditional and fixed-shape -- see the comment on
+    the redirect below for why filtering them out instead is not an option
+    on the device path.
     """
     if cache.ndim != 4:
         raise ValueError("cache must be 4-D: [blocks, heads, slots, latent]")
@@ -161,31 +165,31 @@ def scatter_paged_latent(
     if slot_mapping.shape[0] != values.shape[0]:
         raise ValueError("slot_mapping and values must have the same row count")
     storage_block_size = cache.shape[2]
-    valid = slot_mapping >= 0
-    # Padding rows are dropped rather than redirected to a dummy slot: an
-    # earlier version wrote padding rows back to slot 0 with their
-    # pre-existing value to keep this a plain unconditional index_put_, but
-    # index_put_ makes no ordering guarantee between rows that collide on the
-    # same physical index -- whenever a real row's slot happened to be 0 too,
-    # the padding row's "restore" write could nondeterministically clobber
-    # it. Filtering to the valid rows costs a data-dependent shape (fine here
-    # -- this pass is eager/CPU-mode; see the module docstring's scope note)
-    # but is unconditionally correct.
-    slot_mapping = slot_mapping[valid]
-    values = values[valid]
-    # No early "nothing to write" return on slot_mapping.numel() == 0: under
-    # torch.compile/Dynamo, that numel() came from the data-dependent
-    # boolean-mask filter just above, so branching on it trips "Could not
-    # guard on data-dependent expression" (unbacked SymInt from `valid`
-    # filtering -- same family of issue as the sinkhorn_positive/
-    # gather_paged_latent guard-clause fixes elsewhere in this pass, see
-    # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d). Like
-    # those, this was a throughput short-circuit only, not a correctness
-    # requirement: index_put_ with an empty (possibly data-dependent-sized)
-    # index is already a well-defined no-op, so running it unconditionally
-    # is numerically identical, just skips the early-out.
-    blk_idx = torch.div(slot_mapping, storage_block_size, rounding_mode="floor")
-    pos_idx = slot_mapping % storage_block_size
+    # Padding rows are redirected to the reserved null block, not filtered
+    # out. Filtering (`slot_mapping[slot_mapping >= 0]`) costs a
+    # data-dependent output shape, which is fatal on the device path: the
+    # model is traced with `fullgraph=True`, so Dynamo cannot break on the
+    # boolean mask and captures it as an unbacked SymInt instead. The compile
+    # backend's FX->HLO stage then *replays* that graph against
+    # `create_placeholder_tensor` XLA tensors, which carry no backing device
+    # buffer -- and a boolean mask must materialize to learn its output size,
+    # so the replay schedules a real execution over unbacked memory and
+    # segfaults inside PjRt's `ExecuteComputation`. See
+    # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d item 12.
+    #
+    # This is the same clamp-and-mask idiom `gather_recent_window` above uses
+    # for the read side. `clamp(min=0)` sends -1 to flat slot 0 -- block 0,
+    # offset 0 -- which is vLLM's reserved null block (`NULL_BLOCK_ID`, never
+    # handed out to a real request and masked out on every read path here).
+    # That reservation is what makes an unconditional `index_put_` safe now
+    # where an earlier "write padding rows back to slot 0" attempt was not:
+    # `index_put_` leaves the ordering between rows colliding on one physical
+    # index unspecified, but a redirected padding row can only ever collide
+    # with another padding row in the null block, never with a real row, so
+    # no real content can be clobbered.
+    safe_slots = slot_mapping.clamp(min=0)
+    blk_idx = torch.div(safe_slots, storage_block_size, rounding_mode="floor")
+    pos_idx = safe_slots % storage_block_size
     cache.index_put_(
         (blk_idx.long(), torch.zeros_like(blk_idx.long()), pos_idx.long()),
         values.to(cache.dtype),

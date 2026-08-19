@@ -313,9 +313,12 @@ class DeepseekV4Compressor(nn.Module):
         )
         # mla_slot_mapping is already [1]-shaped and 1:1 with `finalized`'s
         # single row by construction of the per-token call site;
-        # scatter_paged_latent's existing slot_mapping==-1 filtering (already
-        # Dynamo-safe) handles "don't write, this token didn't complete a
-        # window" with no extra code here.
+        # scatter_paged_latent's slot_mapping==-1 handling covers "don't
+        # write, this token didn't complete a window" with no extra code
+        # here. That handling redirects the row to the reserved null block
+        # rather than filtering it out -- filtering captured a data-dependent
+        # shape that segfaulted the compile backend's FX->HLO replay (see
+        # scatter_paged_latent's own comment).
         scatter_paged_latent(mla_cache, mla_slot_mapping, finalized.squeeze(0))
 
         # Raw per-token projection feeds the *next* chunk's carry replay.

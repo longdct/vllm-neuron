@@ -25,15 +25,61 @@ from vllm_neuron.model.deepseek_v4.compressor import (
 )
 
 
-def test_scatter_paged_latent_writes_and_ignores_padding():
+def test_scatter_paged_latent_writes_and_redirects_padding_to_null_block():
     cache = torch.zeros(2, 1, 4, 3)  # [blocks, heads, slots, latent]
     values = torch.tensor([[1.0, 1, 1], [2.0, 2, 2], [9.0, 9, 9]])
-    slots = torch.tensor([0, 5, -1])  # block0/slot0, block1/slot1, padding
+    slots = torch.tensor([1, 5, -1])  # block0/slot1, block1/slot1, padding
     scatter_paged_latent(cache, slots, values)
-    assert torch.equal(cache[0, 0, 0], values[0])
+    assert torch.equal(cache[0, 0, 1], values[0])
     assert torch.equal(cache[1, 0, 1], values[1])
-    assert torch.equal(cache[0, 0, 1], torch.zeros(3))  # untouched
-    assert cache.sum().item() == pytest.approx(float(values[:2].sum()))
+    # Padding is redirected to flat slot 0 -- block 0, slot 0 -- which is
+    # vLLM's reserved null block, never a real destination. Real content
+    # elsewhere is untouched.
+    assert torch.equal(cache[0, 0, 0], values[2])
+    assert torch.equal(cache[0, 0, 2], torch.zeros(3))
+    assert torch.equal(cache[1, 0, 0], torch.zeros(3))
+
+
+def test_scatter_paged_latent_padding_only_row_touches_nothing_but_null_block():
+    """The shape every production caller uses: exactly one row (see
+    ``model.py``'s per-token ``[local_index : local_index + 1]`` slice and
+    ``compressed_entry_slot_mapping``'s ``[1]``-shaped result). A padding row
+    can therefore never share a call with a real row, so redirecting it into
+    the null block cannot collide with real content even in principle."""
+    cache = torch.arange(2 * 1 * 4 * 3, dtype=torch.float32).reshape(2, 1, 4, 3)
+    before = cache.clone()
+    scatter_paged_latent(cache, torch.tensor([-1]), torch.full((1, 3), 9.0))
+    elsewhere = torch.ones_like(cache, dtype=torch.bool)
+    elsewhere[0, 0, 0] = False
+    assert torch.equal(cache[elsewhere], before[elsewhere])
+
+
+def test_scatter_paged_latent_is_dynamo_shape_static():
+    """Regression for the graph-capture segfault: this helper used to filter
+    padding out with a boolean mask (``slot_mapping[slot_mapping >= 0]``).
+    Under the ``fullgraph=True`` tracing the device path uses, Dynamo cannot
+    break on that mask, so it captured an unbacked SymInt (surfacing as
+    ``aten._assert_scalar`` guard nodes). The compile backend then replays the
+    captured graph against placeholder XLA tensors that hold no backing
+    buffer, and materializing the mask to learn its output size segfaults
+    inside PjRt's ``ExecuteComputation``. The traced graph must stay entirely
+    data-independent."""
+    graphs = []
+
+    def _record(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    compiled = torch.compile(
+        scatter_paged_latent, backend=_record, fullgraph=True, dynamic=True
+    )
+    compiled(torch.zeros(2, 1, 4, 3), torch.tensor([1, -1]), torch.ones(2, 3))
+
+    assert graphs, "expected torch.compile to capture a graph"
+    targets = [str(node.target) for gm in graphs for node in gm.graph.nodes]
+    assert not [t for t in targets if "_assert_scalar" in t], (
+        f"data-dependent shape captured in scatter_paged_latent: {targets}"
+    )
 
 
 def test_scatter_paged_latent_round_trips_with_gather():
