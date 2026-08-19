@@ -145,11 +145,30 @@ model, through the real Neuron compile backend, on real Trn2 silicon, past
 model construction/weight loading/device move and two real graph-break
 fixes. Not yet a green compile — it stopped on a third, deeper Dynamo/
 FakeTensor issue in the per-token attention loop's `position_ids`
-construction, not yet root-caused to a one-line fix. Read Step 5d before
-spending more device time here: the remaining blockers are in this plugin's
-model code (the per-token loop building tensors from Python scalars in
-ways Dynamo doesn't yet trace cleanly), not the toolchain. **This is not
-one of two paths to real-hardware serving** — Step 5e confirms
+construction. That one is now fixed in `model.py` and **confirmed on real
+Trn2 silicon** (root cause: a per-token-loop-local Python int, symbolic
+under Dynamo, was getting re-embedded in a fresh `new_tensor([[...]])`
+Python-list construction that FakeTensorMode doesn't track —
+`position_ids` is now built purely through tensor ops instead). Re-running
+against the fix showed real forward progress — tracing got well past
+`position_ids`/`rotary_emb` — then hit two more, different blockers in the
+same class, one at a time, each confirmed by an actual device re-run: a
+guard-clause branch in `attention.py::scatter_paged_latent` (fixed, same
+pattern as the two graph-break fixes above — a throughput-only early
+return, safe to make unconditional) and then a genuine, not-yet-fixed one
+in `_swa_history`'s `if cached_seq_len == 0:` — this one is real
+shape-determining logic (the SWA gather length), not a removable guard, so
+it needs the redesign described below rather than a mechanical fix.
+Designing that redesign surfaced a real, separate, pre-existing correctness
+bug in the same code — confirmed by direct reproduction, not caught by any
+existing test — that any redesign here needs to fix alongside the shape
+problem, not paper over: see
+[`deepseek-v4-swa-null-block-bug.md`](deepseek-v4-swa-null-block-bug.md).
+Read Step 5d before spending more device time here: the remaining blocker is in
+this plugin's model code (the per-token loop's cache-gather lengths, built
+from a data-dependent `cached_seq_len` in ways Dynamo can't turn into a
+static shape), not the toolchain. **This is not one of two paths to
+real-hardware serving** — Step 5e confirms
 `enforce_eager=True` is unconditionally rejected on real Neuron hardware
 for every model on this plugin (`neuron_worker.py`'s
 `assert not (eager_mode and not cpu_mode)`), so there is no eager

@@ -519,6 +519,7 @@ class DeepseekV4Attention(nn.Module):
         request: int,
         local_index: int,
         cached_seq_len: int,
+        position_ids: torch.Tensor,
     ) -> torch.Tensor:
         """Attend and update caches for exactly one token.
 
@@ -539,8 +540,21 @@ class DeepseekV4Attention(nn.Module):
         # forward rotation, kv's forward rotation (baked into what gets
         # cached), and the attended output's inverse rotation at the end
         # (real architecture's "K=V, so undo RoPE on the output" step; see
-        # the class docstring).
-        position_ids = hidden.new_tensor([[cached_seq_len]], dtype=torch.long)
+        # the class docstring). ``position_ids`` arrives as a real ``[1, 1]``
+        # tensor built by the caller directly from ``attn_metadata`` --
+        # never round-tripped through a Python/SymInt scalar embedded in a
+        # fresh ``new_tensor([[...]])`` list here. That round trip is what
+        # broke Dynamo/FakeTensor tracing (see
+        # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d):
+        # ``int(fake_tensor)`` produces a symbolic (not a plain Python) int
+        # under Dynamo, and building a brand-new tensor from a nested
+        # Python list around that symbolic value goes through a plain
+        # ``torch.tensor``-style eager-construction path that FakeTensorMode
+        # doesn't understand, so the very next real op on it
+        # (``rotary_emb``'s internal ``unsqueeze``) sees a tensor that was
+        # never properly faked. Deriving ``position_ids`` purely through
+        # tensor ops (slice + add + view, all real proxied ops) keeps it
+        # symbolic-int-friendly end to end.
         cos, sin = self.rotary_emb(hidden, position_ids=position_ids, layer_type=self.rope_layer_type)
 
         q = self.q_b_proj(self.q_a_norm(self.q_a_proj(hidden)))
@@ -603,9 +617,22 @@ class DeepseekV4Attention(nn.Module):
     ) -> torch.Tensor:
         """``hidden`` is ``[tokens, hidden_size]`` for one request's chunk."""
         request = 0  # see module docstring: one request per forward call.
-        base_cached_seq_len = int(
-            attn_metadata[f"{self_attn_name}.swa_cache"]["cached_seq_len"][request][0]
-        )
+        cached_seq_len_row = attn_metadata[f"{self_attn_name}.swa_cache"][
+            "cached_seq_len"
+        ][request]
+        # Two views of the same source value, kept deliberately separate:
+        #   - ``base_cached_seq_len`` (a plain Python int, via the same
+        #     ``int(...)`` device->host read as before) still drives the
+        #     shape/control-flow math below (`_swa_history`'s window cap,
+        #     the compressor's carry-window arithmetic, ...) -- those are
+        #     genuinely shape-determining and out of scope for this fix (see
+        #     Step 5d's "next blocker" note in the device-validation doc).
+        #   - ``base_position_id`` stays a real tensor end to end and feeds
+        #     `_forward_one_token`'s RoPE `position_ids` -- see that
+        #     method's docstring for why the int/list round trip broke
+        #     Dynamo tracing.
+        base_cached_seq_len = int(cached_seq_len_row[0])
+        base_position_id = cached_seq_len_row[0:1].to(dtype=torch.long).view(1, 1)
         attended_rows = []
         for local_index in range(hidden.shape[0]):
             attended_rows.append(
@@ -616,6 +643,7 @@ class DeepseekV4Attention(nn.Module):
                     request=request,
                     local_index=local_index,
                     cached_seq_len=base_cached_seq_len + local_index,
+                    position_ids=base_position_id + local_index,
                 )
             )
         attended = torch.cat(attended_rows, dim=0)

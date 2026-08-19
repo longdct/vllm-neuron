@@ -33,7 +33,7 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
-| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | Blocked on a Dynamo/FakeTensor issue reached after fixing two real graph breaks (see Step 5d) |
+| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids` and one `scatter_paged_latent` blocker fixed and device-confirmed; now blocked on `_swa_history`'s data-dependent `cached_seq_len` shape (see Step 5d) |
 | T3 (full model, eager) | Real `vllm.LLM()` on Trn2, `enforce_eager=True` | Not possible on this plugin at all, any model (see Step 5e) -- so 5d's blocker is the only path to real-hardware inference |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
@@ -291,7 +291,8 @@ attempts, each one exercising real `torch.compile`/Dynamo tracing through
    (`test/unit test/vllm_neuron`) stays green after them.
 3. **`torch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake
    tensor call`** in `DeepseekV4Attention._forward_one_token`
-   (`model.py:485-486`):
+   (`model.py:485-486` at the time of this attempt; fixed below, so the
+   line numbers have since moved):
    `position_ids = hidden.new_tensor([[cached_seq_len]], dtype=torch.long)`
    followed by `self.rotary_emb(hidden, position_ids=position_ids, ...)`.
    `cached_seq_len` is a per-token-loop-local Python `int` (derived once per
@@ -304,13 +305,100 @@ attempts, each one exercising real `torch.compile`/Dynamo tracing through
    on `aten.unsqueeze.default`. Unlike the two guard-clause breaks above,
    this is not a removable validation check — it is how every per-token
    iteration computes its own absolute RoPE position, load-bearing for
-   correctness — and not yet root-caused to a specific one-line fix. Not
-   attempted further in this pass; see "What this means" below.
+   correctness.
 
 Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile/` holds the
 three full logs (`attempt1-efa-failure.txt`,
 `attempt2-sinkhorn-graph-break.txt`,
 `attempt3-position-ids-faketensor-error.txt`).
+
+**Root cause, fix, and confirmation on real Trn2 silicon (attempts 4-5).**
+`cached_seq_len` reaches `_forward_one_token` as a Python `int`, but under
+Dynamo it is not a plain int — `int(fake_tensor)` on the `attn_metadata`
+scalar produces a symbolic value, and embedding that inside a fresh
+`[[cached_seq_len]]` Python list handed to `Tensor.new_tensor(...)` goes
+through the same eager list-construction path `torch.tensor(...)` uses,
+which FakeTensorMode does not track as a proper proxied tensor — so the
+very next real op on it (`rotary_emb`'s internal `unsqueeze`) sees a tensor
+FakeTensorMode never faked, tripping the "Please convert all Tensors to
+FakeTensors first" assertion. `_forward_one_token` and its caller now build
+`position_ids` without that round trip: the caller slices `attn_metadata`'s
+`cached_seq_len` tensor directly (never calling `int()` on that copy) and
+threads it into the loop as a real tensor, advanced by tensor-scalar
+addition (`base_position_id + local_index`) and reshaped with `.view(1,
+1)` — slice, add, view are all real proxied ops Dynamo traces natively, so
+the symbolic value never gets re-embedded in a Python list.
+
+Re-running attempt 3 against this fix, on real Trn2 silicon
+(`trn2.3xlarge`, same tiny-config `vllm.LLM()`/`enforce_eager=False` setup),
+**confirms the fix**: tracing gets cleanly past `position_ids`/`rotary_emb`
+and well beyond, into the decoder-layer/attention/cache-write call chain —
+real, forward progress, not a different flavor of the same error.
+
+4. It landed on a new error one call deeper:
+   `torch._dynamo.exc.UserError: Could not guard on data-dependent
+   expression Eq(u0, 0)`, caused by `scatter_paged_latent`'s
+   `if slot_mapping.numel() == 0: return` (`attention.py`). `slot_mapping`
+   at that point has already been filtered by a boolean mask
+   (`slot_mapping[valid]`) a few lines up — a data-dependent (unbacked
+   SymInt) size by construction, and the file's own docstring already
+   called this out: "costs a data-dependent shape ... fine here, this pass
+   is eager/CPU-mode." Branching on it is exactly the "data-dependent
+   branching" pattern the two guard-clause fixes above (`mhc.py`,
+   `attention.py::gather_paged_latent`) already fixed elsewhere in this
+   file. Unlike those two, this branch isn't a validation check, it's a
+   throughput short-circuit — `index_put_` with an empty (or
+   data-dependent-sized) index is already a well-defined no-op — so it was
+   fixed the same way as `model.py`'s `if not bool(mask.any()): continue`
+   fix from attempt 2: removed, always executing the (possibly empty)
+   write. CPU-mode suites stay green (346 passed, 7 skipped) after this
+   change.
+5. Re-running again with that second fix reached a **third** blocker, this
+   time a real, not-yet-fixed one:
+   `Could not guard on data-dependent expression Eq(u0, 0)` again, now from
+   `if cached_seq_len == 0:` in `_swa_history` (`model.py`). Unlike attempt
+   4's, this one is not a removable/unconditional-izable guard clause —
+   `cached_seq_len` genuinely varies per request per step (it is the live
+   KV-cache length), Dynamo does not treat it as a compile-time constant,
+   and this function's job is to gather a **runtime-length-dependent
+   slice** of the SWA cache (`gather_len = min(cached_seq_len,
+   self.sliding_window)`, then `gather_paged_latent(..., gather_len)`) —
+   genuinely shape-determining, not a validation nicety. `_compressed_history`
+   and the compressor's carry-window arithmetic
+   (`carry_gather_length`/`carry_replay_already_emitted` in
+   `compressor.py`, and `DeepseekV4Compressor._carry_rows`) share the same
+   shape problem: a Python-int `cached_seq_len` driving a slice length via
+   `min`/`//`/`%`. This is the real remaining redesign, not a guard clause:
+   gather a fixed, compile-time-static length (`self.sliding_window`, the
+   compressor's max carry width) unconditionally on every call, and use
+   `mla_attention_reference`'s existing position-based masking (`kpos`/
+   `qpos`, already there for causality and the sliding-window cap) —
+   extended to also mask off rows beyond the real `cached_seq_len`, since
+   today it assumes the supplied tensor's length *is* the true history
+   length — rather than varying the gathered tensor's actual size.
+
+   **This is where a real, separate, pre-existing correctness bug was found
+   while designing that redesign — see
+   [`deepseek-v4-swa-null-block-bug.md`](deepseek-v4-swa-null-block-bug.md)
+   for the full account.** `_swa_history`'s `block_table[:required]` read
+   (via `gather_paged_latent`) silently returns null-block content instead
+   of real history once `cached_seq_len` exceeds one `sliding_window` —
+   confirmed by direct reproduction, not caught by any existing test.
+   `_carry_rows` (the compressor's `state_cache`) has the identical bug;
+   `_compressed_history` (the non-evicting `mla_cache`) does not. Fixing the
+   Dynamo shape problem and this correctness bug are naturally one piece of
+   work, since both live in the same column-selection logic — read that doc
+   before starting either. Not attempted in this pass: it is real,
+   non-trivial numerical-correctness surface (attention masking, cache-write
+   filtering), not a mechanical trace-compatibility fix, and deserves its
+   own pass with dedicated oracle comparisons rather than being rushed
+   alongside two guard-clause fixes.
+
+Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile-retry/`
+holds the two new full logs (`attempt-position-ids-fix-retry.log`,
+confirming the position_ids fix and showing the new `scatter_paged_latent`
+error; `attempt-scatter-guard-fix-retry.log`, confirming that fix and
+showing the new `_swa_history` error).
 
 **What this means for Step 0's open question.** The toolchain-level question
 that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
@@ -322,12 +410,18 @@ blockers are in this plugin's own model code, not the toolchain: the
 per-token attention loop (`docs/model-dev/deepseek-v4-carry-cache-design.md`'s
 "Mid-chunk compression boundaries force a per-token attention loop") builds
 several tensors per iteration from Python-level scalars in ways Dynamo's
-fake-tensor tracing does not yet accept cleanly. Closing this is real,
-scoped follow-up work — restructure `position_ids`/`cached_seq_len`
-construction to stay symbolic-int-friendly throughout the loop, then repeat
-this same attempt to find the next blocker — not a toolchain blocker and not
-something this pass's "attempt" scope extends to fixing outright. It belongs
-with `deepseek-v4-serving-roadmap.md`'s Step 0.
+fake-tensor tracing does not yet accept cleanly. The `position_ids` instance
+of that pattern is fixed and device-confirmed above, as is one guard-clause
+instance in `scatter_paged_latent`; attempt 5 confirms the real remaining
+instance is `_swa_history`/`_compressed_history`/the compressor's
+carry-window math, which slice cache tensors to a Python-int length
+computed from `cached_seq_len` (`min(cached_seq_len, self.sliding_window)`,
+`cached_seq_len // self.ratio`) — genuinely shape-determining, not a
+removable guard. The fix is the shape one flagged in the roadmap: gather a
+fixed, compile-time-static length (the window/entry cap) unconditionally
+and mask instead of slicing to a runtime-computed length, rather than
+threading a symbolic int into a slice bound. It belongs with
+`deepseek-v4-serving-roadmap.md`'s Step 0.
 
 ### 5e. `enforce_eager=True` is not an escape hatch on real hardware
 

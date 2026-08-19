@@ -45,6 +45,68 @@ def test_scatter_paged_latent_round_trips_with_gather():
     torch.testing.assert_close(gathered, values)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known bug, not yet fixed -- see "
+        "docs/model-dev/deepseek-v4-swa-null-block-bug.md. "
+        "gather_paged_latent(cache, block_table, sequence_length) always reads "
+        "block_table[:required] (columns 0..required-1), which only holds the "
+        "true recent window while nothing has been evicted yet. Real vLLM's "
+        "SlidingWindowManager never compacts a block table -- it remaps only "
+        "the columns that have fallen entirely outside the window to a shared "
+        "null block, in place, while the live window's real data moves to "
+        "ever-higher column indices as generation continues. Once a sequence "
+        "has run for more than one sliding_window's worth of tokens, reading "
+        "columns 0..required-1 unconditionally returns null-block content "
+        "instead of history. Affects DeepseekV4Attention._swa_history (the raw "
+        "SWA cache) and DeepseekV4Compressor._carry_rows (the compressor's "
+        "state_cache, same SWA eviction lifecycle) in model.py; does NOT "
+        "affect _compressed_history (the compressed-entries mla_cache is a "
+        "non-evicting MLAAttentionSpec group, so reading from column 0 stays "
+        "correct there). When this is fixed, delete this xfail marker -- "
+        "strict=True will fail the suite here as a reminder if it's forgotten."
+    ),
+)
+def test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced():
+    """Reproduces the bug directly: a block table shaped exactly like real
+    vLLM produces once a sliding-window sequence has run past one window --
+    old (low-index) columns remapped to the null block (id 0, matching this
+    plugin's own ``test_sliding_window_remapping_uses_null_blocks_but_
+    latents_remain_stable``), live data at high-index columns. See
+    ``tools/deepseek_v4/check_swa_null_block_bug.py`` for a standalone,
+    narrated version of this same repro.
+    """
+    block_size = 2
+    sliding_window = 4
+    cached_seq_len = 10  # already-computed tokens, well past one window
+    live_start_token = cached_seq_len - sliding_window  # = 6
+
+    # Logical column i covers tokens [i*block_size, (i+1)*block_size). Null
+    # out any column entirely below live_start_token; give every other
+    # column a distinct physical block holding its own token positions.
+    cache = torch.zeros(9, 1, block_size, 1)
+    cache[0] = -999.0  # the null block: a recognizably-wrong sentinel
+    block_table_row = []
+    for logical_idx in range(8):
+        block_start = logical_idx * block_size
+        if block_start + block_size <= live_start_token:
+            block_table_row.append(0)
+            continue
+        physical_id = logical_idx + 1
+        block_table_row.append(physical_id)
+        for slot in range(block_size):
+            token = block_start + slot
+            if token < cached_seq_len:
+                cache[physical_id, 0, slot, 0] = float(token)
+    block_table = torch.tensor(block_table_row, dtype=torch.long)
+
+    gather_len = min(cached_seq_len, sliding_window)
+    gathered = gather_paged_latent(cache, block_table, gather_len).squeeze(1).squeeze(-1)
+    expected = torch.arange(cached_seq_len - gather_len, cached_seq_len, dtype=torch.float32)
+    torch.testing.assert_close(gathered, expected)
+
+
 @pytest.mark.parametrize("ratio", [4, 128])
 def test_compressed_entry_slot_mapping_matches_upstream_formula(ratio):
     """Ported from vLLM 0.24's own DeepSeek-V4 GPU backend

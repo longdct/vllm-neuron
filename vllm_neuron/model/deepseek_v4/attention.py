@@ -94,8 +94,17 @@ def scatter_paged_latent(
     # but is unconditionally correct.
     slot_mapping = slot_mapping[valid]
     values = values[valid]
-    if slot_mapping.numel() == 0:
-        return
+    # No early "nothing to write" return on slot_mapping.numel() == 0: under
+    # torch.compile/Dynamo, that numel() came from the data-dependent
+    # boolean-mask filter just above, so branching on it trips "Could not
+    # guard on data-dependent expression" (unbacked SymInt from `valid`
+    # filtering -- same family of issue as the sinkhorn_positive/
+    # gather_paged_latent guard-clause fixes elsewhere in this pass, see
+    # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d). Like
+    # those, this was a throughput short-circuit only, not a correctness
+    # requirement: index_put_ with an empty (possibly data-dependent-sized)
+    # index is already a well-defined no-op, so running it unconditionally
+    # is numerically identical, just skips the early-out.
     blk_idx = torch.div(slot_mapping, storage_block_size, rounding_mode="floor")
     pos_idx = slot_mapping % storage_block_size
     cache.index_put_(
