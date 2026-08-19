@@ -177,8 +177,11 @@ def scatter_paged_latent(
     # segfaults inside PjRt's `ExecuteComputation`. See
     # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d item 12.
     #
-    # This is the same clamp-and-mask idiom `gather_recent_window` above uses
-    # for the read side. `clamp(min=0)` sends -1 to flat slot 0 -- block 0,
+    # This is the write-side counterpart to the clamp-and-mask idiom
+    # `gather_recent_window` above uses on the read side -- clamp the index
+    # the same way, but with no mask to carry, because the clamped
+    # destination is itself the discard target rather than a row a caller
+    # has to exclude later. `clamp(min=0)` sends -1 to flat slot 0 -- block 0,
     # offset 0 -- which is vLLM's reserved null block (`NULL_BLOCK_ID`, never
     # handed out to a real request and masked out on every read path here).
     # That reservation is what makes an unconditional `index_put_` safe now
