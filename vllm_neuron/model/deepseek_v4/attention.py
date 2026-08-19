@@ -84,6 +84,62 @@ def gather_paged_latent(
     return gathered[front_trim : front_trim + sequence_length]
 
 
+def gather_recent_window(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    window: int,
+    end_position: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dynamo-shape-static counterpart to ``gather_paged_latent``: always
+    returns exactly ``window`` rows -- ``window`` is a compile-time-constant
+    Python int, never derived from a traced value -- covering absolute token
+    positions ``[end_position + 1 - window, end_position]`` (inclusive of
+    ``end_position``), plus a ``[window]`` bool mask marking which of those
+    rows are real content.
+
+    ``end_position`` is a tensor (0-D or broadcastable), so the *offset* into
+    the block table is fully tensor-derived; the fixed ``window`` size then
+    comes from ordinary advanced indexing (real proxied ops), not a
+    Python-int-length slice -- the combination Dynamo can trace without
+    tripping "Could not guard on data-dependent expression" (see
+    ``docs/model-dev/deepseek-v4-swa-null-block-bug.md``'s "Suggested fix
+    direction" item 2). By construction the window's last row is always
+    ``end_position`` itself, so every row satisfies the causal
+    ``kpos <= qpos`` check on its own; the only rows that can be invalid are
+    *leading* ones with a negative absolute position -- generation hasn't
+    produced that much history yet (only possible when ``end_position + 1 <
+    window``). Callers combine the returned mask with
+    ``mla_attention_reference``'s ``key_valid`` to exclude those rows.
+
+    Unlike ``gather_paged_latent``, this never reads a null-remapped column:
+    real vLLM's eviction only nulls columns strictly *before* the live
+    window, and this always reads columns covering
+    ``[end_position + 1 - window, end_position]`` -- exactly the live
+    window, by the same reasoning as ``gather_paged_latent``'s
+    ``start_token`` parameter.
+    """
+    if cache.ndim != 4 or block_table.ndim != 1:
+        raise ValueError("cache must be 4-D and block_table must be 1-D")
+    if window < 1:
+        raise ValueError("window must be positive")
+    slots_per_block = cache.shape[2]
+    start = end_position.view(()).long() + (1 - window)
+    positions = start + torch.arange(window, device=block_table.device, dtype=start.dtype)
+    valid = positions >= 0
+    positions = positions.clamp(min=0)
+    columns = torch.div(positions, slots_per_block, rounding_mode="floor")
+    slot_offsets = positions % slots_per_block
+    blocks = block_table[columns].long()
+    # Pure input-validation guard, skipped while torch.compile is tracing --
+    # see the matching comment on gather_paged_latent above.
+    if not torch.compiler.is_compiling() and (
+        (blocks < 0).any() or (blocks >= cache.shape[0]).any()
+    ):
+        raise ValueError("block table contains an invalid physical block")
+    gathered = cache[blocks, :, slot_offsets, :]
+    return gathered, valid
+
+
 def scatter_paged_latent(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -212,6 +268,7 @@ def mla_attention_reference(
     attention_sinks: torch.Tensor | None = None,
     causal: bool = True,
     sliding_window: int | None = None,
+    key_valid: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialized fp32 MLA oracle supporting prefill and one-token decode.
 
@@ -219,6 +276,14 @@ def mla_attention_reference(
     are ``[H,L,Dq]`` and ``[H,L,Dv]``. Optional RoPE features are concatenated
     to Q/K after the latent projection. The implementation is deliberately
     straightforward and never used as a production kernel.
+
+    ``key_valid`` (``[S]``, ``causal=True`` only) marks rows of ``latent``
+    that are real content vs. structural padding -- needed once a caller
+    supplies a *fixed-size* ``latent`` that can include rows the local
+    ``kpos<=qpos`` ordering check alone can't see are invalid (e.g.
+    ``gather_recent_window``'s leading rows before generation has produced
+    that much history yet). ``None`` (default) applies no extra masking,
+    exactly like before this parameter existed.
     """
     if latent.shape[-1] != key_weight.shape[1] or key_weight.shape[:2] != value_weight.shape[:2]:
         raise ValueError("latent/projection dimensions do not agree")
@@ -240,7 +305,13 @@ def mla_attention_reference(
         allowed = kpos <= qpos
         if sliding_window is not None:
             allowed &= kpos > (qpos - sliding_window)
+        if key_valid is not None:
+            if key_valid.shape != (s,):
+                raise ValueError("key_valid must have shape [S]")
+            allowed = allowed & key_valid[None, :]
         scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+    elif key_valid is not None:
+        raise ValueError("key_valid requires causal=True")
     if attention_sinks is not None:
         if attention_sinks.shape != (query.shape[2],):
             raise ValueError("attention_sinks must have shape [num_heads]")

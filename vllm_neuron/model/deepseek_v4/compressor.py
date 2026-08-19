@@ -50,7 +50,16 @@ def carry_gather_length(cached_seq_len: int, ratio: int, *, needs_overlap: bool)
       discard exactly that many leading rows of ``compress_csa_chunk``'s
       output (see :func:`carry_replay_already_emitted`).
     """
-    if cached_seq_len < 0:
+    # Pure input-validation guard, skipped while torch.compile is tracing --
+    # cached_seq_len genuinely can never be negative at runtime (it's a
+    # monotonically-increasing live KV-cache length), but under Dynamo it
+    # arrives as a symbolic (not plain Python) int derived from a traced
+    # tensor value, and branching on it trips "Could not guard on
+    # data-dependent expression" -- same family of fix as
+    # attention.py::gather_paged_latent's bounds check and
+    # mhc.py::sinkhorn_positive. ``ratio`` never needs this: it's always a
+    # compile-time Python int (a config constant), never traced.
+    if not torch.compiler.is_compiling() and cached_seq_len < 0:
         raise ValueError("cached_seq_len must be non-negative")
     if ratio < 1:
         raise ValueError("ratio must be positive")

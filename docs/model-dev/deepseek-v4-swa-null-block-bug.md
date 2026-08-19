@@ -1,50 +1,86 @@
 # DeepSeek-V4: SWA/carry-state history reads stale (null) blocks past one window
 
-> **Status: correctness fixed; Dynamo-shape-static redesign still open.**
-> `gather_paged_latent` (`vllm_neuron/model/deepseek_v4/attention.py`) now
-> takes a `start_token` parameter, and `_swa_history`/`_carry_rows`
-> (`model.py`) pass `start_token=max(0, cached_seq_len - window)` so the read
-> starts at the live window's true column instead of always column 0. This
-> was a pure correctness fix (still a Python-int `cached_seq_len`, same
-> dynamic-shape behavior as before) — it does **not** attempt the
-> Dynamo-shape-static redesign sketched in "Suggested fix direction" item 2
-> below (fixed-size gather + extended `mla_attention_reference` masking).
-> Step 5d in
-> [`deepseek-v4-024-device-validation.md`](deepseek-v4-024-device-validation.md)
-> (the compiled-serving Dynamo blocker that shares this code) is therefore
-> **still open** — this fix only closes the correctness half of that
-> section's coupled work, not the tracing half.
+> **Status: correctness fixed. `_swa_history` is now also Dynamo-shape-static
+> and confirmed past its blocker on real Trn2 hardware. `_carry_rows` (the
+> compressor's carry state) is not — a new, harder blocker was found there
+> and is documented below as separate follow-up work, not attempted.**
 >
-> Verification: `python tools/deepseek_v4/check_swa_null_block_bug.py` now
-> prints `PASS`; the regression test
+> **Correctness (`gather_paged_latent`'s `start_token`).**
+> `gather_paged_latent` (`vllm_neuron/model/deepseek_v4/attention.py`) now
+> takes a `start_token` parameter; `_swa_history`/`_carry_rows` (`model.py`)
+> passed `start_token=max(0, cached_seq_len - window)` so the read starts at
+> the live window's true column instead of always column 0. Verification:
+> `python tools/deepseek_v4/check_swa_null_block_bug.py` prints `PASS`; the
+> regression test
 > (`test/unit/model/deepseek_v4/test_paged_cache_helpers.py::
 > test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced`)
 > is no longer `xfail`; and a new integration test,
 > `test/vllm_neuron/test_deepseek_v4_matches_real_architecture.py::
 > test_attention_matches_real_module_after_swa_eviction_past_one_window`,
 > drives the device path past one window (using vLLM's real
-> `KVCacheManager` to produce a genuinely null-remapped block table) and
-> checks the post-eviction step against the real HF module — it fails
-> against the pre-fix code (94/96 elements wrong) and passes against the
-> fix.
+> `KVCacheManager` for a genuinely null-remapped block table) against the
+> real HF module — confirmed to fail on the pre-fix code (94/96 elements
+> wrong) and pass on the fix.
 >
-> **Confirmed the Dynamo blocker is genuinely unchanged, on real Trn2
-> hardware.** First a CPU-only proxy (`torch.compile(fullgraph=True,
-> dynamic=True)` on the default `eager` backend) reproduced the identical
-> attempt-5 error at the identical line. Then, on an actual `trn2.3xlarge`
-> instance, Step 5d's own `vllm.LLM()` recipe was re-run against this fix
-> (`enforce_eager=False`, real `libtorch_neuronx_lite` parallel-trace-fork
-> compile, `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`,
-> `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`, `NEURON_LOGICAL_NC_CONFIG=2`,
-> `NEURON_SKIP_EFA_AFFINITY=1`) and hit the exact same
-> `Could not guard on data-dependent expression Eq(u0, 0)` at
-> `_swa_history`'s `if cached_seq_len == 0:` (`model.py:498`), this time from
-> `RuntimeError: Parallel trace fork failed (rank=0): ... status=ERROR`, the
-> real compile backend's own error surface, not just Dynamo's. This is now
-> the authoritative confirmation, not a proxy: the correctness fix does not
-> touch Step 5d's Dynamo-shape blocker at all, on real silicon. Artifact:
+> **`_swa_history` made Dynamo-shape-static (closes its specific Step 5d
+> blocker).** `_swa_history` was redesigned around a new
+> `gather_recent_window` helper (`attention.py`): always gathers exactly
+> `sliding_window` rows ending at (and including) the query's own absolute
+> position — a tensor-derived dynamic offset feeding fixed-size advanced
+> indexing, never a Python-int-length slice — plus a `[sliding_window]`
+> validity mask for the leading rows that don't exist yet in the first
+> `sliding_window` tokens of a request. `mla_attention_reference` gained a
+> matching `key_valid` parameter to apply that mask. `cached_seq_len`'s
+> Python-int form is no longer used here at all; `position_ids` (already a
+> real tensor end to end, from the earlier position_ids Dynamo fix) is
+> reused directly as the window's end position. Confirmed on real Trn2
+> hardware: re-running Step 5d's `vllm.LLM()` recipe
+> (`enforce_eager=False`) against this fix advances cleanly past the
+> `_swa_history` guard failure that blocked every previous attempt, onto a
+> new, later blocker (below) — a CPU `torch.compile(fullgraph=True,
+> dynamic=True)` proxy on an isolated sliding-window-only config also
+> confirms this directly (no graph break at all, across multiple steps
+> spanning past one window).
+>
+> **New blocker found: `_carry_rows`'s `if gather_n == 0:` (`model.py`),
+> entangled with the compressor's internal chunking math — not attempted.**
+> One pure guard clause on the way there was fixed the same mechanical way
+> as `mhc.py`/`gather_paged_latent`'s existing guards
+> (`carry_gather_length`'s `if cached_seq_len < 0:`, `compressor.py`, now
+> skipped under `torch.compiler.is_compiling()`), but `_carry_rows`'s
+> `if gather_n == 0:` itself is genuinely shape-determining, the same
+> species of problem `_swa_history` had — except **not** self-contained the
+> way `_swa_history`'s was. Tracing why: `carry_gather_length` returns a
+> Python-int length that is *never* the full carry window (`coff*ratio`),
+> always strictly less, because unlike `_swa_history` (which reads a window
+> ending at, and including, the query's own already-written token) the
+> compressor gathers carry *before* writing this step's new token, and only
+> the *unconsumed* trailing suffix. A fixed-size-window replacement (viable
+> in principle -- same `gather_recent_window` shape) would need to feed
+> `compress_hca_chunk`/`compress_csa_chunk` a *padded* replay tensor and
+> neutralize the invalid leading rows via their existing gate-softmax
+> (set gate to `-inf` so they get ~0 weight) rather than slicing them away
+> -- and that reveals the real complication: those functions' `complete =
+> joined_kv.shape[1] // ratio` windowing, the write-side
+> `valid_slots[:write_count]` slot filtering, and the compressed-entry RoPE
+> position math (`(cached_seq_len // self.ratio) * self.ratio`, another
+> Python-int `cached_seq_len` use) all need to become consistent with
+> "always compute a fixed number of candidate entries, let the (already
+> tensor-based, Dynamo-safe) slot-validity filtering decide which ones
+> actually get written" -- the same pattern `DeepseekV4MoE.forward` already
+> uses for its own always-compute/mask-on-write design, but unverified here
+> and with real risk of silently swapping *which* computed entry is genuine
+> if the entry ordering assumption is wrong -- precisely the class of silent
+> correctness bug this whole document is about. This needs its own pass
+> with dedicated oracle comparisons before being attempted, per "Suggested
+> fix direction" item 2's original caution -- not rushed here. Artifacts:
 > `artifacts/deepseek-v4/20260819T022008Z-8df62fb/
-> p6-null-block-fix-step5d-retry/attempt-post-null-block-fix.log`.
+> p6-null-block-fix-step5d-retry/` (correctness-only fix, confirms
+> `_swa_history`'s *old* blocker unchanged) and
+> `artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/` (this
+> redesign: one log confirming `_swa_history`'s blocker is gone and landing
+> on `_carry_rows`; a second confirming the `carry_gather_length` guard fix
+> and landing on the same `_carry_rows` line).
 
 ## One-paragraph summary
 
@@ -228,28 +264,58 @@ than a variable-length one).
    confirmed to fail against the pre-fix code and pass against the fix. The
    existing `sliding_window=128, tokens=5` test is left as-is (still valid,
    just not the eviction case).
-2. **Making it Dynamo-shape-static, per Step 5d — still open, not
-   attempted.** This fix deliberately kept `cached_seq_len` a Python int and
-   the gather variable-length (same shape behavior as before), so Step 5d's
-   `Could not guard on data-dependent expression Eq(u0, 0)` blocker on
-   `_swa_history`'s `if cached_seq_len == 0:` remains. That redesign still
-   needs to gather a fixed, compile-time-constant number of columns (`required`, computed
-   from `self.sliding_window`, a config constant — never from
-   `cached_seq_len`) starting at the *dynamic* offset above, computed as a
-   tensor (not a Python int fed through `int()`), and rely on masking
-   (`mla_attention_reference`'s existing `kpos`/`qpos` position-based
-   masking, extended to also exclude rows before the true live start
-   position — today it assumes the supplied tensor's length *is* the valid
-   length, which stops holding once the gather is always a fixed size)
-   rather than a variable-length slice to represent "how much of this
-   window is real." `_carry_rows` needs the same treatment for
-   `self.state_cache`.
-3. `tools/deepseek_v4/check_swa_null_block_bug.py` and the (now non-xfail)
-   regression test are the correctness gate — both green as of item 1.
-   Step 5d's device attempt (see that doc for the exact `vllm.LLM()`
-   invocation and required env vars) remains the separate Dynamo gate for
-   item 2, still open. Both need to pass before compiled-serving sign-off;
-   correctness alone is not sufficient for that.
+2. **Making `_swa_history` Dynamo-shape-static, per Step 5d — done.** New
+   helper `gather_recent_window` (`attention.py`): always gathers exactly
+   `sliding_window` rows ending at (and including) a tensor `end_position`
+   (fixed-size advanced indexing at a tensor-derived offset, never a
+   Python-int-length slice), plus a `[sliding_window]` bool validity mask
+   for rows before generation has produced them yet. `_swa_history` now
+   returns `(window, valid)` built this way, using `position_ids` (already
+   a real tensor, from the earlier position_ids Dynamo fix) as
+   `end_position` instead of the Python-int `cached_seq_len`. Since the
+   query's own token is already scattered into `swa_cache` by the time
+   `_swa_history` runs, the returned window directly *is* the attention
+   history -- no separate `cat` of the fresh token afterward, unlike
+   before. `mla_attention_reference` gained a `key_valid` parameter
+   (applied as an extra AND into its existing causal `allowed` mask) to
+   consume the validity mask. Verified two ways: a CPU
+   `torch.compile(fullgraph=True, dynamic=True)` proxy on an
+   isolated sliding-only config traces cleanly across multiple steps
+   spanning past one window (no graph break at all); and, on real Trn2
+   hardware, re-running Step 5d's actual `vllm.LLM()` recipe against this
+   fix advances cleanly past the exact guard failure that blocked every
+   previous attempt, onto a new, later blocker (item 4).
+3. **Making `_carry_rows` Dynamo-shape-static, per Step 5d — still open,
+   not attempted; harder than item 2.** Unlike `_swa_history`, this is not
+   self-contained: `carry_gather_length`'s Python-int result is *never*
+   the full carry window (`coff*ratio`) -- always strictly less, because
+   the compressor gathers carry *before* writing the new token, and only
+   the unconsumed trailing suffix. A `gather_recent_window`-shaped fix is
+   viable in principle, but consuming it correctly requires
+   `compress_hca_chunk`/`compress_csa_chunk` to tolerate *padded* input
+   (neutralizing invalid leading rows via their existing gate-softmax --
+   set gate to `-inf` -- rather than slicing them away), which in turn
+   means their `complete = joined_kv.shape[1] // ratio` windowing, the
+   write-side `valid_slots[:write_count]` slot filtering, and the
+   compressed-entry RoPE position math
+   (`(cached_seq_len // self.ratio) * self.ratio`, another Python-int
+   `cached_seq_len` use) all need to move to "always compute a fixed
+   number of candidate entries, let the slot-validity filtering (already
+   tensor-based, Dynamo-safe) decide which get written" -- the same
+   pattern `DeepseekV4MoE.forward` already uses, but unverified here, and
+   with real risk of silently writing the *wrong* computed entry if the
+   ordering assumption is off -- precisely the class of silent
+   correctness bug this document is about. Needs its own pass with
+   dedicated oracle comparisons, per this item's original caution -- not
+   rushed alongside item 2.
+4. `tools/deepseek_v4/check_swa_null_block_bug.py` and the (now non-xfail)
+   regression test are the correctness gate — green as of item 1. Step
+   5d's device attempt (see that doc for the exact `vllm.LLM()` invocation
+   and required env vars) is the Dynamo gate: item 2 (`_swa_history`) is
+   confirmed to pass its slice of that gate; the attempt now fails at a
+   new line, `_carry_rows`'s `if gather_n == 0:` (`model.py`) -- item 3,
+   still open. All of items 1-3 need to land before compiled-serving
+   sign-off; item 1 alone (or 1+2) is not sufficient for that.
 
 ## Severity
 
@@ -257,5 +323,7 @@ Any real serving session whose generation exceeds one `sliding_window`'s
 length of tokens — the common case, not an edge case — would have gotten
 silently wrong attention for every SWA layer (and wrong carry-state replay
 for the compressor). Fixed as of item 1 above (correctness). The
-compiled-serving Dynamo work is still separately blocked on this same code
-(see "Relationship to the Dynamo work" above) — item 2 remains open.
+compiled-serving Dynamo work is partially done (item 2, `_swa_history`) and
+partially still blocked on this same code (item 3, `_carry_rows` and the
+compressor's internal chunking) — see "Relationship to the Dynamo work"
+above.

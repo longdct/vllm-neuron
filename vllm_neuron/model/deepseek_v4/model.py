@@ -57,6 +57,7 @@ from .attention import (
     apply_partial_rotary,
     compressed_entry_slot_mapping,
     gather_paged_latent,
+    gather_recent_window,
     mla_attention_reference,
     scatter_paged_latent,
 )
@@ -478,9 +479,28 @@ class DeepseekV4Attention(nn.Module):
         self.mla_cache: torch.Tensor | None = None
 
     def _swa_history(
-        self, block_table_row: torch.Tensor, cached_seq_len: int
-    ) -> torch.Tensor:
-        """Prior uncompressed latents, capped at the sliding window.
+        self, block_table_row: torch.Tensor, current_position: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fixed-size ``sliding_window`` window of uncompressed latents
+        ending at (and including) this token's own absolute position.
+
+        Dynamo-shape-static: always exactly ``self.sliding_window`` rows
+        (``gather_recent_window``'s ``window`` is a compile-time constant),
+        with a ``valid`` mask marking rows before generation has produced
+        that much history yet -- only possible in the first
+        ``sliding_window`` tokens of a request. Unlike the old
+        variable-length gather (``gather_len = min(cached_seq_len,
+        sliding_window)``, driven by a Python-int ``cached_seq_len`` that
+        Dynamo cannot guard on -- see
+        docs/model-dev/deepseek-v4-024-device-validation.md Step 5d),
+        ``current_position`` is a real tensor end to end.
+
+        This token's own kv is already physically written into
+        ``self.swa_cache`` by the time this runs (``_forward_one_token``
+        scatters before calling this), so the returned window directly *is*
+        the full attention history for this token -- no separate
+        concatenation of the freshly-computed kv is needed afterward, unlike
+        before this redesign.
 
         The SWA cache is a true sliding-window group: the scheduler remaps
         blocks older than the window to a null block once the window has
@@ -488,22 +508,16 @@ class DeepseekV4Attention(nn.Module):
         ``test_sliding_window_remapping_uses_null_blocks_but_latents_remain_stable``
         covers this), but it never compacts the block table -- the live
         window's real data keeps living at ever-higher column indices as
-        generation continues, it does not stay at column 0. Capping the
-        gather *length* alone is not enough once a request outgrows the
-        window: the read must also start at the live window's actual start
-        column (``start_token=max(0, cached_seq_len - sliding_window)``), or
-        it silently returns null-block content instead of history -- see
+        generation continues, it does not stay at column 0.
+        ``gather_recent_window`` reads columns covering exactly
+        ``[current_position + 1 - sliding_window, current_position]``, the
+        live window, never a null-remapped column -- see
         docs/model-dev/deepseek-v4-swa-null-block-bug.md.
         """
-        if cached_seq_len == 0:
-            return self.swa_cache.new_zeros((0, self.swa_cache.shape[-1]))
-        gather_len = min(cached_seq_len, self.sliding_window)
-        return gather_paged_latent(
-            self.swa_cache,
-            block_table_row,
-            gather_len,
-            start_token=max(0, cached_seq_len - self.sliding_window),
-        ).squeeze(1)
+        gathered, valid = gather_recent_window(
+            self.swa_cache, block_table_row, self.sliding_window, current_position
+        )
+        return gathered.squeeze(1), valid
 
     def _compressed_history(
         self, block_table_row: torch.Tensor, cached_seq_len: int
@@ -584,10 +598,11 @@ class DeepseekV4Attention(nn.Module):
         ).squeeze(0)
         scatter_paged_latent(self.swa_cache, swa_slot, kv_roped)
 
-        swa_history = self._swa_history(swa_block_table, cached_seq_len)
-        history = torch.cat((swa_history, kv_roped), dim=0)
-        if len(history) > self.sliding_window:
-            history = history[-self.sliding_window :]
+        # position_ids is already this token's absolute position as a real
+        # tensor (see the docstring above) -- reused directly as
+        # _swa_history's current_position rather than reintroducing a
+        # Python-int cached_seq_len dependency here.
+        history, key_valid = self._swa_history(swa_block_table, position_ids)
 
         if self.compressor is not None:
             mla_entry = attn_metadata[self_attn_name]
@@ -609,6 +624,14 @@ class DeepseekV4Attention(nn.Module):
                 mla_entry["block_table_tensor"][request], cached_seq_len
             )
             history = torch.cat((compressed_history, history), dim=0)
+            # compressed_history is never padding (its cache group never
+            # evicts and only ever holds completed entries -- see
+            # _compressed_history's docstring), so every one of its rows is
+            # real content; only the fixed-size swa window above can contain
+            # not-yet-produced padding rows.
+            key_valid = torch.cat(
+                (key_valid.new_ones(compressed_history.shape[0]), key_valid), dim=0
+            )
 
         attended = mla_attention_reference(
             q_roped,
@@ -617,6 +640,7 @@ class DeepseekV4Attention(nn.Module):
             self.identity_kv_weight,
             attention_sinks=self.sinks,
             sliding_window=self.sliding_window if self.ratio == 0 else None,
+            key_valid=key_valid,
         )  # [1, 1, heads_per_rank, head_dim]
         attended = apply_partial_rotary(
             attended, cos_h, sin_h, rope_dim=self.qk_rope_head_dim, inverse=True

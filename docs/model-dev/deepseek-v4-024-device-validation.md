@@ -33,7 +33,7 @@ is".
 | T1 | vLLM 0.24 installed, still CPU | Green — 88 passed, 2 skipped, after 4 test-vs-0.24-API fixes (see below) |
 | T1-sim | NKI CPU simulator | Green — 2 passed |
 | T3 | Trn2 device | 5a/5b green on real Trn2 silicon; 5c blocked on an SDK gap (see Step 5c) |
-| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids` and one `scatter_paged_latent` blocker fixed and device-confirmed; now blocked on `_swa_history`'s data-dependent `cached_seq_len` shape (see Step 5d) |
+| T3 (full model) | Real `vllm.LLM()` on Trn2, compiled (`enforce_eager=False`) | `position_ids`, `scatter_paged_latent`, and `_swa_history`'s data-dependent shape all fixed and device-confirmed; now blocked on `_carry_rows`'s data-dependent shape, entangled with the compressor's internal chunking (see Step 5d) |
 | T3 (full model, eager) | Real `vllm.LLM()` on Trn2, `enforce_eager=True` | Not possible on this plugin at all, any model (see Step 5e) -- so 5d's blocker is the only path to real-hardware inference |
 
 The port was developed on macOS, where vLLM cannot be installed. Every claim
@@ -397,25 +397,46 @@ real, forward progress, not a different flavor of the same error.
    gather + extended `mla_attention_reference` masking redesign described
    above is still real, not-yet-attempted work.
 
-6. **Confirmed directly on real Trn2 silicon, not just predicted.** First a
-   CPU-only proxy (`torch.compile(fullgraph=True, dynamic=True)` on the
-   default `eager` backend, no hardware) reproduced the identical
-   `Could not guard on data-dependent expression Eq(u0, 0)` error at the
-   identical `_swa_history` line. Then this exact attempt was re-run for
-   real — `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`,
-   `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`, `NEURON_LOGICAL_NC_CONFIG=2`,
-   `NEURON_SKIP_EFA_AFFINITY=1`, same tiny-config `vllm.LLM()` /
-   `enforce_eager=False` setup as attempts 1-5 above, on an actual
-   `trn2.3xlarge` — after landing the null-block correctness fix (see
+6. **Confirmed directly on real Trn2 silicon, not just predicted -- then
+   fixed, advancing to a new (7th) blocker.** First a CPU-only proxy
+   (`torch.compile(fullgraph=True, dynamic=True)` on the default `eager`
+   backend, no hardware) reproduced the identical `Could not guard on
+   data-dependent expression Eq(u0, 0)` error at the identical
+   `_swa_history` line. Then this exact attempt was re-run for real --
+   `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`, `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`,
+   `NEURON_LOGICAL_NC_CONFIG=2`, `NEURON_SKIP_EFA_AFFINITY=1`, same
+   tiny-config `vllm.LLM()` / `enforce_eager=False` setup as attempts 1-5
+   above, on an actual `trn2.3xlarge` -- after landing the null-block
+   correctness fix (see
    [`deepseek-v4-swa-null-block-bug.md`](deepseek-v4-swa-null-block-bug.md)).
    Same result: `RuntimeError: Parallel trace fork failed (rank=0): ...
    status=ERROR`, with the identical `Eq(u0, 0)` guard failure at
    `_swa_history`'s `if cached_seq_len == 0:` (`model.py:498`) as the
-   underlying cause — the real compile backend's own error surface this
-   time, not just Dynamo's. This is the authoritative confirmation that the
-   correctness fix left this blocker completely untouched, as expected:
-   item 2's redesign (fixed-size gather, tensor-driven `cached_seq_len`,
-   extended masking) is still the real next step, still not attempted.
+   underlying cause -- the real compile backend's own error surface this
+   time, not just Dynamo's. This confirmed the correctness fix alone left
+   this blocker completely untouched, as expected.
+7. `_swa_history` was then redesigned to be Dynamo-shape-static (see the
+   bug doc's "Suggested fix direction" item 2: `gather_recent_window`, a
+   fixed-size gather at a tensor-derived offset, plus
+   `mla_attention_reference`'s new `key_valid` masking). Re-running the
+   same real-hardware attempt against that redesign **advances cleanly
+   past the `_swa_history` guard failure that blocked attempts 5-6** --
+   real, confirmed forward progress on the actual compile backend, not a
+   proxy. It lands on a new blocker one step later: first a pure guard
+   clause (`carry_gather_length`'s `if cached_seq_len < 0:`,
+   `compressor.py` -- fixed the same mechanical way as the other guard
+   clauses in this section, skipped under `torch.compiler.is_compiling()`),
+   then a genuine one: `Could not guard on data-dependent expression
+   Eq(PythonMod(u0, 128), 0)`, from `DeepseekV4Compressor._carry_rows`'s
+   `if gather_n == 0:` (`model.py:215`) -- the compressor carry-state
+   equivalent of `_swa_history`'s old problem, but **not** self-contained
+   the same way: fixing it properly cascades into
+   `compress_hca_chunk`/`compress_csa_chunk`'s internal windowing, the
+   write-side slot-filtering, and the compressed-entry RoPE position math
+   all needing to become consistent with a fixed-candidate-count,
+   filter-on-write design -- real, substantial, separate work with
+   correctness risk if rushed. See the bug doc's "Suggested fix direction"
+   item 3 for the full account. Not attempted.
 
 Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile-retry/`
 holds the two new full logs (`attempt-position-ids-fix-retry.log`,
@@ -424,6 +445,10 @@ error; `attempt-scatter-guard-fix-retry.log`, confirming that fix and
 showing the new `_swa_history` error). Attempt 6's real-hardware re-run
 after the null-block fix is
 `artifacts/deepseek-v4/20260819T022008Z-8df62fb/p6-null-block-fix-step5d-retry/attempt-post-null-block-fix.log`.
+Attempt 7's two real-hardware re-runs (post-`_swa_history`-fix landing on
+`_carry_rows`; post-`carry_gather_length`-guard-fix landing on the same
+`_carry_rows` line) are in
+`artifacts/deepseek-v4/<run-id>/p6-dynamo-shape-static-swa/`.
 
 **What this means for Step 0's open question.** The toolchain-level question
 that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
