@@ -365,3 +365,187 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
         )
 
     torch.testing.assert_close(real_out.squeeze(0), my_out, rtol=1e-3, atol=5e-4)
+
+
+def test_attention_matches_real_module_after_swa_eviction_past_one_window(real_and_dev):
+    """Regression test for docs/model-dev/deepseek-v4-swa-null-block-bug.md:
+    drives the device path past one sliding window so a real block-table
+    column actually gets null-remapped, then checks the post-eviction step
+    still matches the real (unpaged) module. The test above
+    (``sliding_window=128``, ``tokens=5``) never reaches eviction at all --
+    this is the case the bug doc calls out as the missing coverage.
+
+    Uses vLLM's real ``KVCacheManager``/``SlidingWindowSpec`` (same pattern
+    as ``test_deepseek_cache_lifecycle.py``'s
+    ``test_sliding_window_remapping_uses_null_blocks_but_latents_remain_stable``)
+    to produce a block table shaped exactly like a real engine would, rather
+    than hand-rolling the null-remap logic.
+    """
+    pytest.importorskip("vllm")
+    from transformers.masking_utils import create_sliding_window_causal_mask
+    from vllm import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.kv_cache_interface import (
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        SlidingWindowSpec,
+    )
+    from vllm.v1.request import Request
+
+    config = hf_config()
+    torch.manual_seed(2)
+    sliding_window = 4
+    block_size = 32  # matches the device model's swa_cache default block_size
+    sliding_config = DeepseekV4Config(
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        moe_intermediate_size=config.moe_intermediate_size,
+        num_local_experts=config.num_local_experts,
+        num_experts_per_tok=config.num_experts_per_tok,
+        vocab_size=config.vocab_size,
+        num_hidden_layers=1,
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=1,
+        head_dim=config.head_dim,
+        q_lora_rank=config.q_lora_rank,
+        sliding_window=sliding_window,
+        layer_types=["sliding_attention"],
+        mlp_layer_types=["moe"],
+    )
+    real = tm.DeepseekV4ForCausalLM(sliding_config).eval()
+    with torch.no_grad():
+        for p in real.parameters():
+            p.uniform_(-0.1, 0.1)
+    real_attn = real.model.layers[0].self_attn
+
+    device_model = dev.DeepseekV4ForCausalLM.from_configs(sliding_config).eval()
+    my_attn = device_model.model.layers[0].attention
+    with torch.no_grad():
+        my_attn.q_a_proj.weight.copy_(real_attn.q_a_proj.weight)
+        my_attn.q_a_norm.weight.copy_(real_attn.q_a_norm.weight)
+        my_attn.q_b_proj.weight.copy_(real_attn.q_b_proj.weight)
+        my_attn.kv_proj.weight.copy_(real_attn.kv_proj.weight)
+        my_attn.kv_norm.weight.copy_(real_attn.kv_norm.weight)
+        my_attn.sinks.copy_(real_attn.sinks)
+        my_attn.o_a_proj.weight.copy_(real_attn.o_a_proj.weight)
+        my_attn.o_b_proj.weight.copy_(real_attn.o_b_proj.weight)
+
+    # Past one sliding_window (4) and past one full evicted block: with
+    # sliding_window=4, block_size=32, the first block (tokens [0,32)) is
+    # fully skipped once cached_seq_len >= 32 + sliding_window - 1 = 35;
+    # chunk1=40 comfortably clears that, so chunk2 (the decode step) reads
+    # against a block table with column 0 already null-remapped.
+    chunk1_len, chunk2_len = 40, 3
+    total_len = chunk1_len + chunk2_len
+    hidden = torch.randn(1, total_len, sliding_config.hidden_size)
+    position_ids = torch.arange(total_len).unsqueeze(0)
+    cos, sin = real.model.rotary_emb(
+        hidden, position_ids=position_ids, layer_type=real_attn.rope_layer_type
+    )
+    position_embeddings = {real_attn.rope_layer_type: (cos, sin)}
+    # Unlike the plain-triu causal_mask above, this must be a real
+    # sliding-window mask: eager_attention_forward's `sliding_window` kwarg
+    # is unused by this model's attention_interface -- the window is instead
+    # baked into the mask tensor itself, normally built once per model
+    # forward by DeepseekV4Model.forward via this same helper. A plain
+    # causal mask here would silently test unwindowed attention (this is
+    # exactly why the test above, sliding_window=128 >> tokens=5, never
+    # exercised windowing at all).
+    causal_mask = create_sliding_window_causal_mask(
+        config=sliding_config,
+        inputs_embeds=hidden,
+        attention_mask=None,
+        past_key_values=None,
+        position_ids=position_ids,
+    )
+    with torch.no_grad():
+        # One-shot full-sequence forward against the real (unpaged) module.
+        real_out, _ = real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
+
+    specs = device_model.get_kv_spec().layers
+    caches = {
+        s.name: [torch.zeros((64, 1, s.block_size or block_size, s.head_size), dtype=s.dtype)]
+        for s in specs
+    }
+    device_model.bind_kv_cache(caches)
+
+    # Real vLLM block-table lifecycle: allocate chunk 1 (nothing evicted
+    # yet), then advance num_computed_tokens and allocate chunk 2 -- vLLM's
+    # KVCacheManager.allocate_slots evicts (null-remaps) blocks that have
+    # fully fallen out of the window as part of that second call, exactly
+    # as it would for a real decode step.
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=64,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["layer.0"],
+                    SlidingWindowSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=sliding_config.head_dim,
+                        dtype=torch.bfloat16,
+                        sliding_window=sliding_window,
+                    ),
+                )
+            ],
+        ),
+        max_model_len=256,
+        scheduler_block_size=block_size,
+        hash_block_size=block_size,
+        max_num_batched_tokens=128,
+        enable_caching=False,
+    )
+    req = Request("swa_evict", [1] * chunk1_len, SamplingParams(max_tokens=8), None)
+    manager.allocate_slots(req, chunk1_len)
+    block_ids_1 = tuple(b.block_id for b in manager.get_blocks("swa_evict").blocks[0])
+    req.num_computed_tokens = chunk1_len
+    manager.allocate_slots(req, chunk2_len)
+    block_ids_2 = tuple(b.block_id for b in manager.get_blocks("swa_evict").blocks[0])
+
+    def block_table_row(block_ids, width=8):
+        padded = list(block_ids) + [0] * (width - len(block_ids))
+        return torch.tensor([padded], dtype=torch.int32)
+
+    def slot_mapping_for(block_ids, positions):
+        return torch.tensor(
+            [
+                block_ids[pos // block_size] * block_size + pos % block_size
+                for pos in positions
+            ],
+            dtype=torch.int64,
+        )
+
+    def attn_metadata_for(block_ids, positions, cached_seq_len):
+        return {
+            specs[0].name: {
+                "block_table_tensor": block_table_row(block_ids),
+                "slot_mapping": slot_mapping_for(block_ids, positions),
+                "max_query_len": len(positions),
+                "block_size": block_size,
+                "max_blocks_per_seq": 8,
+                "decode_token_threshold": 1,
+                "cached_seq_len": torch.tensor([[cached_seq_len]], dtype=torch.int32),
+                "kv_segment_size": 0,
+            }
+        }
+
+    hidden_flat = hidden.squeeze(0)
+    with torch.no_grad():
+        my_attn(
+            hidden_flat[:chunk1_len],
+            self_attn_name="model.layers.0.self_attn",
+            attn_metadata=attn_metadata_for(block_ids_1, range(0, chunk1_len), 0),
+        )
+        chunk2_out = my_attn(
+            hidden_flat[chunk1_len:],
+            self_attn_name="model.layers.0.self_attn",
+            attn_metadata=attn_metadata_for(
+                block_ids_2, range(chunk1_len, total_len), chunk1_len
+            ),
+        )
+
+    torch.testing.assert_close(
+        real_out.squeeze(0)[chunk1_len:], chunk2_out, rtol=1e-3, atol=5e-4
+    )

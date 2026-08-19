@@ -218,11 +218,19 @@ class DeepseekV4Compressor(nn.Module):
         # coff*ratio, matching get_kv_spec); the scheduler remaps blocks
         # older than that to a null block once evicted, same as
         # DeepseekV4Attention._swa_history. gather_n never exceeds coff*ratio
-        # by construction (carry_gather_length), so this cap always covers it
-        # while never walking into evicted/null territory.
+        # by construction (carry_gather_length), so capping the *length*
+        # alone would still be enough to stay within the live window's real
+        # data size -- but the block table's real data has moved to
+        # ever-higher columns as eviction progresses, so the read must also
+        # start at the live window's actual start column
+        # (start_token=max(0, cached_seq_len-window)), not column 0 (see
+        # docs/model-dev/deepseek-v4-swa-null-block-bug.md).
         window = self.coff * self.ratio
         rows = gather_paged_latent(
-            self.state_cache, block_table_row, min(cached_seq_len, window)
+            self.state_cache,
+            block_table_row,
+            min(cached_seq_len, window),
+            start_token=max(0, cached_seq_len - window),
         )
         rows = rows.squeeze(1)[-gather_n:].unsqueeze(0)
         return rows[..., : self.width], rows[..., self.width :]
@@ -478,16 +486,23 @@ class DeepseekV4Attention(nn.Module):
         blocks older than the window to a null block once the window has
         rolled past them (T1's
         ``test_sliding_window_remapping_uses_null_blocks_but_latents_remain_stable``
-        covers this). Gathering the raw ``cached_seq_len`` count would walk
-        into those remapped/invalid blocks once a request outgrows the
-        window, so the gather length is capped here, mirroring the same cap
-        the scheduler itself applies to the block table.
+        covers this), but it never compacts the block table -- the live
+        window's real data keeps living at ever-higher column indices as
+        generation continues, it does not stay at column 0. Capping the
+        gather *length* alone is not enough once a request outgrows the
+        window: the read must also start at the live window's actual start
+        column (``start_token=max(0, cached_seq_len - sliding_window)``), or
+        it silently returns null-block content instead of history -- see
+        docs/model-dev/deepseek-v4-swa-null-block-bug.md.
         """
         if cached_seq_len == 0:
             return self.swa_cache.new_zeros((0, self.swa_cache.shape[-1]))
         gather_len = min(cached_seq_len, self.sliding_window)
         return gather_paged_latent(
-            self.swa_cache, block_table_row, gather_len
+            self.swa_cache,
+            block_table_row,
+            gather_len,
+            start_token=max(0, cached_seq_len - self.sliding_window),
         ).squeeze(1)
 
     def _compressed_history(

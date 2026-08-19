@@ -72,7 +72,10 @@ def build_simulated_cache_and_block_table():
 def main() -> int:
     cache, block_table_row = build_simulated_cache_and_block_table()
     gather_len = min(CACHED_SEQ_LEN, SLIDING_WINDOW)
-    result = gather_paged_latent(cache, block_table_row, gather_len).squeeze(1).squeeze(-1)
+    live_start_token = max(0, CACHED_SEQ_LEN - SLIDING_WINDOW)
+    result = gather_paged_latent(
+        cache, block_table_row, gather_len, start_token=live_start_token
+    ).squeeze(1).squeeze(-1)
     expected = [float(t) for t in range(CACHED_SEQ_LEN - gather_len, CACHED_SEQ_LEN)]
 
     print(f"cached_seq_len={CACHED_SEQ_LEN} sliding_window={SLIDING_WINDOW}")

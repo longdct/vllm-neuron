@@ -45,35 +45,15 @@ def test_scatter_paged_latent_round_trips_with_gather():
     torch.testing.assert_close(gathered, values)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known bug, not yet fixed -- see "
-        "docs/model-dev/deepseek-v4-swa-null-block-bug.md. "
-        "gather_paged_latent(cache, block_table, sequence_length) always reads "
-        "block_table[:required] (columns 0..required-1), which only holds the "
-        "true recent window while nothing has been evicted yet. Real vLLM's "
-        "SlidingWindowManager never compacts a block table -- it remaps only "
-        "the columns that have fallen entirely outside the window to a shared "
-        "null block, in place, while the live window's real data moves to "
-        "ever-higher column indices as generation continues. Once a sequence "
-        "has run for more than one sliding_window's worth of tokens, reading "
-        "columns 0..required-1 unconditionally returns null-block content "
-        "instead of history. Affects DeepseekV4Attention._swa_history (the raw "
-        "SWA cache) and DeepseekV4Compressor._carry_rows (the compressor's "
-        "state_cache, same SWA eviction lifecycle) in model.py; does NOT "
-        "affect _compressed_history (the compressed-entries mla_cache is a "
-        "non-evicting MLAAttentionSpec group, so reading from column 0 stays "
-        "correct there). When this is fixed, delete this xfail marker -- "
-        "strict=True will fail the suite here as a reminder if it's forgotten."
-    ),
-)
 def test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced():
-    """Reproduces the bug directly: a block table shaped exactly like real
-    vLLM produces once a sliding-window sequence has run past one window --
-    old (low-index) columns remapped to the null block (id 0, matching this
-    plugin's own ``test_sliding_window_remapping_uses_null_blocks_but_
-    latents_remain_stable``), live data at high-index columns. See
+    """Reproduces the (now-fixed) bug directly: a block table shaped exactly
+    like real vLLM produces once a sliding-window sequence has run past one
+    window -- old (low-index) columns remapped to the null block (id 0,
+    matching this plugin's own ``test_sliding_window_remapping_uses_null_
+    blocks_but_latents_remain_stable``), live data at high-index columns.
+    ``gather_paged_latent`` must be given ``start_token`` (the live window's
+    true start) to read the right columns -- see
+    docs/model-dev/deepseek-v4-swa-null-block-bug.md and
     ``tools/deepseek_v4/check_swa_null_block_bug.py`` for a standalone,
     narrated version of this same repro.
     """
@@ -102,7 +82,9 @@ def test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced():
     block_table = torch.tensor(block_table_row, dtype=torch.long)
 
     gather_len = min(cached_seq_len, sliding_window)
-    gathered = gather_paged_latent(cache, block_table, gather_len).squeeze(1).squeeze(-1)
+    gathered = gather_paged_latent(
+        cache, block_table, gather_len, start_token=live_start_token
+    ).squeeze(1).squeeze(-1)
     expected = torch.arange(cached_seq_len - gather_len, cached_seq_len, dtype=torch.float32)
     torch.testing.assert_close(gathered, expected)
 

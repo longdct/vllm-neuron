@@ -40,17 +40,39 @@ def gather_paged_latent(
     cache: torch.Tensor,
     block_table: torch.Tensor,
     sequence_length: int,
+    *,
+    start_token: int = 0,
 ) -> torch.Tensor:
-    """Gather native-token order from ``[blocks,heads,slots,latent]`` storage."""
+    """Gather native-token order from ``[blocks,heads,slots,latent]`` storage.
+
+    ``start_token`` is the absolute token offset the read begins at --
+    default 0 reads from column 0, exactly as before. Any caller reading
+    from an *evicting* sliding-window cache group must pass the true live
+    window's start (``max(0, cached_seq_len - window)``), not rely on the
+    default: real vLLM's ``SlidingWindowManager`` never compacts a block
+    table on eviction, it remaps only the columns that have fallen entirely
+    out of the window to a shared null block, in place, while the live
+    window's real data keeps living at ever-higher column indices as
+    generation continues. Reading columns ``[0:required]`` unconditionally
+    (the old, and still the default, behavior) is therefore only correct
+    while nothing has been evicted yet -- see
+    ``docs/model-dev/deepseek-v4-swa-null-block-bug.md`` for the full account
+    of the bug this parameter fixes.
+    """
     if cache.ndim != 4 or block_table.ndim != 1:
         raise ValueError("cache must be 4-D and block_table must be 1-D")
     if sequence_length < 0:
         raise ValueError("sequence_length must be non-negative")
+    if start_token < 0:
+        raise ValueError("start_token must be non-negative")
+    if sequence_length == 0:
+        return cache.new_zeros((0, cache.shape[1], cache.shape[3]))
     slots_per_block = cache.shape[2]
-    required = math.ceil(sequence_length / slots_per_block) if sequence_length else 0
-    if required > block_table.numel():
+    start_col = start_token // slots_per_block
+    end_col = -(-(start_token + sequence_length) // slots_per_block)  # ceil div
+    if end_col > block_table.numel():
         raise ValueError("block table is too short for sequence_length")
-    blocks = block_table[:required].long()
+    blocks = block_table[start_col:end_col].long()
     # Pure input-validation guard, skipped while torch.compile is tracing --
     # see the matching comment on mhc.py::sinkhorn_positive.
     if not torch.compiler.is_compiling() and (
@@ -58,7 +80,8 @@ def gather_paged_latent(
     ):
         raise ValueError("block table contains an invalid physical block")
     gathered = cache[blocks].permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
-    return gathered[:sequence_length]
+    front_trim = start_token - start_col * slots_per_block
+    return gathered[front_trim : front_trim + sequence_length]
 
 
 def scatter_paged_latent(

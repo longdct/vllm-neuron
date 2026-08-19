@@ -381,24 +381,49 @@ real, forward progress, not a different flavor of the same error.
    while designing that redesign — see
    [`deepseek-v4-swa-null-block-bug.md`](deepseek-v4-swa-null-block-bug.md)
    for the full account.** `_swa_history`'s `block_table[:required]` read
-   (via `gather_paged_latent`) silently returns null-block content instead
-   of real history once `cached_seq_len` exceeds one `sliding_window` —
+   (via `gather_paged_latent`) silently returned null-block content instead
+   of real history once `cached_seq_len` exceeded one `sliding_window` —
    confirmed by direct reproduction, not caught by any existing test.
-   `_carry_rows` (the compressor's `state_cache`) has the identical bug;
-   `_compressed_history` (the non-evicting `mla_cache`) does not. Fixing the
-   Dynamo shape problem and this correctness bug are naturally one piece of
-   work, since both live in the same column-selection logic — read that doc
-   before starting either. Not attempted in this pass: it is real,
-   non-trivial numerical-correctness surface (attention masking, cache-write
-   filtering), not a mechanical trace-compatibility fix, and deserves its
-   own pass with dedicated oracle comparisons rather than being rushed
-   alongside two guard-clause fixes.
+   `_carry_rows` (the compressor's `state_cache`) had the identical bug;
+   `_compressed_history` (the non-evicting `mla_cache`) did not.
+
+   **That correctness bug is now fixed** (`gather_paged_latent` takes a
+   `start_token` offset; see the bug doc's status block) — but only the
+   correctness half. It was fixed with a variable-length gather driven by a
+   Python-int `cached_seq_len`, the same dynamic-shape behavior as before,
+   so it does **not** close this attempt-5 Dynamo blocker: `_swa_history`'s
+   `if cached_seq_len == 0:` and its runtime-length-dependent
+   `gather_paged_latent` call are unchanged in shape, and the fixed-size
+   gather + extended `mla_attention_reference` masking redesign described
+   above is still real, not-yet-attempted work.
+
+6. **Confirmed directly on real Trn2 silicon, not just predicted.** First a
+   CPU-only proxy (`torch.compile(fullgraph=True, dynamic=True)` on the
+   default `eager` backend, no hardware) reproduced the identical
+   `Could not guard on data-dependent expression Eq(u0, 0)` error at the
+   identical `_swa_history` line. Then this exact attempt was re-run for
+   real — `VLLM_NEURON_ENABLE_DEEPSEEK_V4=1`,
+   `NEURON_PLATFORM_TARGET_OVERRIDE=trn2`, `NEURON_LOGICAL_NC_CONFIG=2`,
+   `NEURON_SKIP_EFA_AFFINITY=1`, same tiny-config `vllm.LLM()` /
+   `enforce_eager=False` setup as attempts 1-5 above, on an actual
+   `trn2.3xlarge` — after landing the null-block correctness fix (see
+   [`deepseek-v4-swa-null-block-bug.md`](deepseek-v4-swa-null-block-bug.md)).
+   Same result: `RuntimeError: Parallel trace fork failed (rank=0): ...
+   status=ERROR`, with the identical `Eq(u0, 0)` guard failure at
+   `_swa_history`'s `if cached_seq_len == 0:` (`model.py:498`) as the
+   underlying cause — the real compile backend's own error surface this
+   time, not just Dynamo's. This is the authoritative confirmation that the
+   correctness fix left this blocker completely untouched, as expected:
+   item 2's redesign (fixed-size gather, tensor-driven `cached_seq_len`,
+   extended masking) is still the real next step, still not attempted.
 
 Artifacts: `artifacts/deepseek-v4/<run-id>/p6-full-model-compile-retry/`
 holds the two new full logs (`attempt-position-ids-fix-retry.log`,
 confirming the position_ids fix and showing the new `scatter_paged_latent`
 error; `attempt-scatter-guard-fix-retry.log`, confirming that fix and
-showing the new `_swa_history` error).
+showing the new `_swa_history` error). Attempt 6's real-hardware re-run
+after the null-block fix is
+`artifacts/deepseek-v4/20260819T022008Z-8df62fb/p6-null-block-fix-step5d-retry/attempt-post-null-block-fix.log`.
 
 **What this means for Step 0's open question.** The toolchain-level question
 that blocked the 0.26 attempt (Torch 2.9 vs. 2.11) is answered further than
