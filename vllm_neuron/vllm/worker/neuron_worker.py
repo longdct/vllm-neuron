@@ -44,6 +44,7 @@ from vllm_neuron.utils.hardware_config import (
 from vllm.utils.network_utils import get_open_port
 from vllm_neuron.parallel.neuron_parallel_state import tp_barrier
 from vllm_neuron.vllm.platform import NeuronPlatform
+from vllm_neuron.vllm.worker.hlo_cache import quarantine_incomplete_hlo_captures
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
     NeuronProfiler,
@@ -1172,6 +1173,23 @@ class NeuronWorker(WorkerBase):
         # torch.compile wrapper directly to StableHLO/NEFF.
         native_compile_only = envs.is_native_backend()
         if has_capture_backend or native_compile_only:
+            if not native_compile_only:
+                # A process that died after graph capture but before compilation
+                # leaves an incomplete rank directory that parallel_compile()
+                # would otherwise submit alongside this run's graphs.
+                from libtorch_neuronx_lite import envs as libtorch_envs
+                from libtorch_neuronx_lite.compile.platform import get_server_prefix
+
+                compile_base_dir = self.model_runner.compile_options.get(
+                    "compiler_workdir", libtorch_envs.get_neuron_compile_cache_dir()
+                )
+                tp_group = get_tp_group()
+                tp_rank = tp_group.rank_in_group if tp_group.world_size >= 1 else 0
+                quarantine_incomplete_hlo_captures(
+                    compile_base_dir,
+                    get_server_prefix(),
+                    tp_rank,
+                )
             if skip_prefill_warmup:
                 logger.info(
                     "Skipping prefill graph extraction (kv_role=%s, decode-only server)",
