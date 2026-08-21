@@ -120,6 +120,7 @@ def load_checkpoint_weights(
     weights,
     *,
     expert_dtype: ExpertDType = "bf16",
+    strict: bool = False,
 ) -> set[str]:
     """Load a checkpoint iterator through the mapped/fused parameter contract."""
     torch = __import__("torch")
@@ -157,7 +158,29 @@ def load_checkpoint_weights(
                     )
                 weight_loader(parameter, loaded_weight, shard_id)
             elif weight_loader is not None:
-                weight_loader(parameter, loaded_weight)
+                if hasattr(weight_loader, "load"):
+                    class _TensorSlice:
+                        def __init__(self, tensor):
+                            self.tensor = tensor
+
+                        def get_shape(self):
+                            return tuple(self.tensor.shape)
+
+                        def __getitem__(self, index):
+                            return self.tensor[index]
+
+                    rank = 0
+                    if torch.distributed.is_initialized():
+                        rank = torch.distributed.get_rank()
+                    transformed = weight_loader.load(
+                        [_TensorSlice(loaded_weight)], rank
+                    )
+                    require_weight_shape(
+                        source_name, tuple(transformed.shape), tuple(parameter.shape)
+                    )
+                    parameter.copy_(transformed)
+                else:
+                    weight_loader(parameter, loaded_weight)
             else:
                 require_weight_shape(
                     source_name,
@@ -167,4 +190,11 @@ def load_checkpoint_weights(
                 parameter.copy_(loaded_weight)
         loaded_destinations.add(destination)
         loaded_params.add(target_name)
+    if strict:
+        missing = sorted(set(params) - loaded_params)
+        if missing:
+            raise ValueError(
+                "DeepSeek-V4 checkpoint did not load parameter(s): "
+                + ", ".join(missing)
+            )
     return loaded_params

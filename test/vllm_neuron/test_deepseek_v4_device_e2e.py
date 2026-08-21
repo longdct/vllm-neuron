@@ -174,7 +174,7 @@ def _run(tensor_parallel_size: int):
         max_model_len=64,
         block_size=32,
         tensor_parallel_size=tensor_parallel_size,
-        enforce_eager=True,
+        enforce_eager=False,
         enable_prefix_caching=False,
         skip_tokenizer_init=True,
         num_gpu_blocks_override=256,

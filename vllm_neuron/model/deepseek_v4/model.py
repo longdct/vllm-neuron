@@ -67,40 +67,10 @@ from .compressor import (
     compress_hca_chunk,
     finalize_compressed_entries,
 )
-from .config import normalize_config
+from .config import DeepseekV4ModelConfig
 from .mhc import apply_hyperconnection, hyperconnection_reference
 from .moe import hash_topk, routed_topk
-from .tiny_model import (
-    TinyDeepseekV4Config,
-    TinyLayerConfig,
-)
 from .weight_loaders import ExpertDType, load_checkpoint_weights
-
-
-def reference_config_from_hf(hf_config) -> TinyDeepseekV4Config:
-    """Build a small-expert reference geometry from a validated HF config."""
-    normalized = normalize_config(hf_config)
-    hidden_size = int(hf_config.hidden_size)
-    vocab_size = int(hf_config.vocab_size)
-    if hidden_size < 1 or vocab_size < 1:
-        raise ValueError("DeepSeek-V4 hidden and vocabulary sizes must be positive")
-    return TinyDeepseekV4Config(
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        latent_size=normalized.head_dim,
-        sliding_window=normalized.sliding_window,
-        num_experts=normalized.n_routed_experts,
-        topk=normalized.num_experts_per_tok,
-        hc_mult=normalized.hc_mult,
-        hc_sinkhorn_iters=normalized.hc_sinkhorn_iters,
-        rms_norm_eps=float(getattr(hf_config, "rms_norm_eps", 1e-6)),
-        hc_eps=float(getattr(hf_config, "hc_eps", 1e-6)),
-        swiglu_limit=float(getattr(hf_config, "swiglu_limit", 10.0)),
-        layers=tuple(
-            TinyLayerConfig(layer.compress_ratio, layer.mlp.value)
-            for layer in normalized.layers
-        ),
-    )
 
 
 def _decode_token_threshold(attn_metadata: dict, name: str) -> tuple[bool, dict]:
@@ -112,7 +82,7 @@ def _decode_token_threshold(attn_metadata: dict, name: str) -> tuple[bool, dict]
 class DeepseekV4HyperConnection(nn.Module):
     """Thin owner of the mHC parameters; math lives in ``mhc.py``."""
 
-    def __init__(self, config: TinyDeepseekV4Config):
+    def __init__(self, config: DeepseekV4ModelConfig):
         super().__init__()
         hc = config.hc_mult
         mix = (2 + hc) * hc
@@ -143,7 +113,7 @@ class DeepseekV4HyperConnection(nn.Module):
 
 
 class DeepseekV4HyperHead(nn.Module):
-    def __init__(self, config: TinyDeepseekV4Config):
+    def __init__(self, config: DeepseekV4ModelConfig):
         super().__init__()
         hc = config.hc_mult
         self.fn = nn.Parameter(torch.randn(hc, hc * config.hidden_size) * 0.02)
@@ -324,6 +294,39 @@ class DeepseekV4Compressor(nn.Module):
         )
 
 
+class NeuronDeepseekV4RotaryEmbedding(
+    __import__(
+        "transformers.models.deepseek_v4.modeling_deepseek_v4",
+        fromlist=["DeepseekV4RotaryEmbedding"],
+    ).DeepseekV4RotaryEmbedding
+):
+    """DeepSeek-V4 RoPE without an in-graph cross-device copy.
+
+    The inherited frequency buffers move with the model. Calling
+    ``.to(x.device)`` again inside ``forward`` makes FX-to-HLO replay attempt
+    an unsupported XLA-to-Neuron copy.
+    """
+
+    @torch.no_grad()
+    def forward(self, x, position_ids, layer_type=None):
+        inv_freq = getattr(self, f"{layer_type}_inv_freq")
+        attention_scaling = getattr(
+            self, f"{layer_type}_attention_scaling"
+        )
+        inv_freq_expanded = (
+            inv_freq[None, :, None]
+            .float()
+            .expand(position_ids.shape[0], -1, 1)
+        )
+        position_ids_expanded = position_ids[:, None, :].float()
+        freqs = torch.matmul(
+            inv_freq_expanded, position_ids_expanded
+        ).transpose(1, 2)
+        cos = freqs.cos() * attention_scaling
+        sin = freqs.sin() * attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
 class DeepseekV4GroupedLinear(nn.Linear):
     """Block-diagonal grouped linear -- the real architecture's output
     projection's first stage (``o_a_proj``).
@@ -348,12 +351,21 @@ class DeepseekV4GroupedLinear(nn.Linear):
         self.n_groups = n_groups
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_shape = x.shape[:-2]
-        hidden_dim = x.shape[-1]
-        w = self.weight.view(self.n_groups, -1, hidden_dim).transpose(1, 2)
-        x = x.reshape(-1, self.n_groups, hidden_dim).transpose(0, 1)
-        y = torch.bmm(x, w).transpose(0, 1)
-        return y.reshape(*input_shape, self.n_groups, -1)
+        # Keep this as a fixed Python loop. The mathematically equivalent
+        # grouped ``bmm`` used by Transformers is vectorized by neuronx-cc in
+        # a way that fails with NCC_IMGN901 for the singleton-token decode
+        # graph. Independent rank-2 linears avoid that compiler path while
+        # preserving the packed parameter layout (and therefore checkpoint
+        # names and TP sharding) exactly.
+        outputs = []
+        out_features_per_group = self.out_features // self.n_groups
+        for group in range(self.n_groups):
+            start = group * out_features_per_group
+            end = start + out_features_per_group
+            outputs.append(
+                F.linear(x[..., group, :], self.weight[start:end], bias=None)
+            )
+        return torch.stack(outputs, dim=-2)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -395,7 +407,7 @@ class DeepseekV4Attention(nn.Module):
 
     def __init__(
         self,
-        config: TinyDeepseekV4Config,
+        config: DeepseekV4ModelConfig,
         ratio: int,
         rms_norm_eps: float,
         *,
@@ -465,6 +477,47 @@ class DeepseekV4Attention(nn.Module):
             self.o_groups * o_lora_rank, config.hidden_size, bias=False
         )
         self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
+
+        # Head-sharded checkpoint parameters. Replicated q_a/kv parameters
+        # intentionally have no loader and therefore remain identical on ranks.
+        if self.world_size > 1:
+            from vllm_neuron.utils.weight_loader import (
+                set_weight_loader,
+                sharding_weight_loader,
+            )
+
+            set_weight_loader(
+                self.q_b_proj.weight,
+                sharding_weight_loader(
+                    shard_dim=0,
+                    shard_size=self.q_b_proj.out_features,
+                    num_shards=self.world_size,
+                ),
+            )
+            set_weight_loader(
+                self.o_a_proj.weight,
+                sharding_weight_loader(
+                    shard_dim=0,
+                    shard_size=self.o_a_proj.out_features,
+                    num_shards=self.world_size,
+                ),
+            )
+            set_weight_loader(
+                self.o_b_proj.weight,
+                sharding_weight_loader(
+                    shard_dim=1,
+                    shard_size=self.o_b_proj.in_features,
+                    num_shards=self.world_size,
+                ),
+            )
+            set_weight_loader(
+                self.sinks,
+                sharding_weight_loader(
+                    shard_dim=0,
+                    shard_size=self.heads_per_rank,
+                    num_shards=self.world_size,
+                ),
+            )
         # K=V broadcast to every head: mla_attention_reference projects a
         # shared latent to per-head K/V via key_weight/value_weight matrices,
         # designed for a *learned* up-projection. The real architecture has
@@ -687,15 +740,20 @@ class DeepseekV4Attention(nn.Module):
     def forward(
         self,
         hidden: torch.Tensor,
+        positions: torch.Tensor,
         *,
         self_attn_name: str,
         attn_metadata: dict,
     ) -> torch.Tensor:
-        """``hidden`` is ``[tokens, hidden_size]`` for one request's chunk."""
-        request = 0  # see module docstring: one request per forward call.
-        cached_seq_len_row = attn_metadata[f"{self_attn_name}.swa_cache"][
-            "cached_seq_len"
-        ][request]
+        """Run single-request prefill or fixed-shape multi-request decode."""
+        entry = attn_metadata[f"{self_attn_name}.swa_cache"]
+        is_decode = entry["max_query_len"] <= entry["decode_token_threshold"]
+        num_requests = entry["block_table_tensor"].shape[0]
+        tokens_per_request = (
+            hidden.shape[0] // num_requests if is_decode else hidden.shape[0]
+        )
+        if is_decode and hidden.shape[0] % num_requests:
+            raise ValueError("decode tokens must divide evenly across request rows")
         # base_position_id stays a real tensor end to end and feeds
         # `_forward_one_token`'s RoPE `position_ids` -- see that method's
         # docstring for why an int/list round trip broke Dynamo tracing.
@@ -704,7 +762,6 @@ class DeepseekV4Attention(nn.Module):
         # `_carry_rows`, and now `_compressed_history` all consume
         # `position_ids` directly instead -- see
         # docs/model-dev/deepseek-v4-swa-null-block-bug.md.
-        base_position_id = cached_seq_len_row[0:1].to(dtype=torch.long).view(1, 1)
         attended_rows = []
         for local_index in range(hidden.shape[0]):
             attended_rows.append(
@@ -712,9 +769,11 @@ class DeepseekV4Attention(nn.Module):
                     hidden[local_index : local_index + 1],
                     self_attn_name=self_attn_name,
                     attn_metadata=attn_metadata,
-                    request=request,
+                    request=local_index // tokens_per_request if is_decode else 0,
                     local_index=local_index,
-                    position_ids=base_position_id + local_index,
+                    position_ids=positions[local_index : local_index + 1]
+                    .long()
+                    .view(1, 1),
                 )
             )
         attended = torch.cat(attended_rows, dim=0)
@@ -770,12 +829,12 @@ class DeepseekV4MoE(nn.Module):
     not wired here -- see module docstring) to be *efficient*.
     """
 
-    def __init__(self, config: TinyDeepseekV4Config, kind: str):
+    def __init__(self, config: DeepseekV4ModelConfig, kind: str):
         super().__init__()
         self.kind = kind
         self.topk = config.topk
         self.num_experts = config.num_experts
-        intermediate = config.hidden_size * 2
+        intermediate = config.expert_intermediate_size
 
         from vllm_neuron.parallel.neuron_parallel_state import (
             get_neuron_ep_degree,
@@ -800,8 +859,11 @@ class DeepseekV4MoE(nn.Module):
             ]
         )
         self.shared_experts = DeepseekV4Expert(
-            config.hidden_size, intermediate, config.swiglu_limit
+            config.hidden_size,
+            intermediate * config.n_shared_experts,
+            config.swiglu_limit,
         )
+        self.routed_scaling_factor = config.routed_scaling_factor
         self.correction_bias = nn.Parameter(torch.zeros(config.num_experts))
         self._vocab_size = config.vocab_size
         self.register_buffer(
@@ -844,9 +906,13 @@ class DeepseekV4MoE(nn.Module):
     def forward(self, hidden: torch.Tensor, token_id: torch.Tensor) -> torch.Tensor:
         logits = self.gate(hidden)
         if self.kind == "hash_moe":
-            ids, weights = hash_topk(logits, token_id, self.tid2eid)
+            ids, weights = hash_topk(
+                logits, token_id, self.tid2eid, self.routed_scaling_factor
+            )
         else:
-            ids, weights = routed_topk(logits, self.correction_bias, self.topk)
+            ids, weights = routed_topk(
+                logits, self.correction_bias, self.topk, self.routed_scaling_factor
+            )
 
         routed = torch.zeros_like(hidden)
         for slot in range(self.topk):
@@ -897,8 +963,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: TinyDeepseekV4Config,
-        layer: TinyLayerConfig,
+        config: DeepseekV4ModelConfig,
+        layer,
         *,
         hf_config,
         rotary_emb,
@@ -912,7 +978,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             hf_config=hf_config,
             rotary_emb=rotary_emb,
         )
-        self.moe = DeepseekV4MoE(config, layer.mlp_kind)
+        self.moe = DeepseekV4MoE(config, layer.mlp.value)
         self.attn_hc = DeepseekV4HyperConnection(config)
         self.ffn_hc = DeepseekV4HyperConnection(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -922,6 +988,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self,
         streams: torch.Tensor,
         token_id: torch.Tensor,
+        positions: torch.Tensor,
         *,
         self_attn_name: str,
         attn_metadata: dict,
@@ -929,6 +996,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         post, comb, hidden = self.attn_hc(streams)
         attended = self.attention(
             self.input_layernorm(hidden),
+            positions,
             self_attn_name=self_attn_name,
             attn_metadata=attn_metadata,
         )
@@ -942,7 +1010,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 class DeepseekV4Model(nn.Module):
     """Decoder body with checkpoint-compatible top-level parameter names."""
 
-    def __init__(self, config: TinyDeepseekV4Config, hf_config):
+    def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -951,11 +1019,7 @@ class DeepseekV4Model(nn.Module):
         # holds both the "main" (sliding-window layers) and "compress"
         # (compressed-attention layers and their compressors) inv_freq
         # tables internally, selected per call via layer_type.
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-            DeepseekV4RotaryEmbedding,
-        )
-
-        rotary_emb = DeepseekV4RotaryEmbedding(hf_config)
+        rotary_emb = NeuronDeepseekV4RotaryEmbedding(hf_config)
         self.layers = nn.ModuleList(
             [
                 DeepseekV4DecoderLayer(
@@ -974,17 +1038,27 @@ class DeepseekV4Model(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        positions: torch.Tensor,
         attn_metadata: dict,
+        inputs_embeds: torch.Tensor | None = None,
+        is_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if input_ids.ndim != 1:
             raise ValueError("DeepSeek-V4 expects a flat [tokens] input_ids tensor")
         hidden = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            if is_token_ids is None:
+                raise ValueError("is_token_ids is required with inputs_embeds")
+            if inputs_embeds.shape != hidden.shape:
+                raise ValueError("inputs_embeds shape must match embedded token shape")
+            hidden = torch.where(is_token_ids.view(-1, 1), hidden, inputs_embeds)
         streams = hidden.unsqueeze(-2).expand(-1, self.config.hc_mult, -1)
         for index, layer in enumerate(self.layers):
             self_attn_name = f"model.layers.{index}.self_attn"
             streams = layer(
                 streams,
                 input_ids,
+                positions,
                 self_attn_name=self_attn_name,
                 attn_metadata=attn_metadata,
             )
@@ -996,16 +1070,46 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     is_text_generation_model = True
 
-    def __init__(self, config: TinyDeepseekV4Config, hf_config):
+    def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
         self.config = config
         self.model = DeepseekV4Model(config, hf_config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        from vllm_neuron import nn as neuron_nn
+
+        self.on_device_sampling_config = (
+            config.neuron_config.on_device_sampling_config
+            if config.neuron_config is not None
+            else None
+        )
+        self._gather_logits = bool(
+            config.neuron_config is not None
+            and config.neuron_config.max_logprobs != 0
+        )
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            self.lm_head_tp_group = get_tp_group()
+            device_group = self.lm_head_tp_group.device_group
+        except AssertionError:
+            self.lm_head_tp_group = None
+            device_group = None
+        self.lm_head = neuron_nn.ColumnParallelLinear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+            dtype=config.torch_dtype,
+            gather_output=self.on_device_sampling_config is None,
+            tp_group=device_group,
+        )
+        if self.on_device_sampling_config is not None:
+            self.sampler = neuron_nn.Sampler(
+                self.on_device_sampling_config, process_group=device_group
+            )
 
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None):
-        del neuron_config
-        return cls(reference_config_from_hf(hf_config), hf_config)
+        config = DeepseekV4ModelConfig.from_configs(hf_config, neuron_config)
+        return cls(config, hf_config)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
@@ -1119,11 +1223,30 @@ class DeepseekV4ForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         is_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del positions, sampling_params, spec_decode_metadata, logit_mask, rank
-        del inputs_embeds, is_token_ids
-        hidden = self.model(input_ids, attn_metadata)
+        if spec_decode_metadata is not None:
+            raise ValueError("DeepSeek-V4 does not support speculative/MTP decoding")
+        hidden = self.model(
+            input_ids,
+            positions,
+            attn_metadata,
+            inputs_embeds=inputs_embeds,
+            is_token_ids=is_token_ids,
+        )
         selected = torch.index_select(hidden, 0, sampling_positions)
-        return self.compute_logits(selected)
+        logits = self.compute_logits(selected.to(self.config.torch_dtype))
+        if self.on_device_sampling_config is None:
+            return logits
+        gathered_logits = None
+        if self._gather_logits:
+            gathered_logits = (
+                self.lm_head_tp_group.all_gather(logits, dim=1)
+                if self.lm_head_tp_group is not None
+                else logits
+            )
+        sampled_tokens = self.sampler(
+            logits, sampling_params, logit_mask=logit_mask, tp_rank=rank
+        )
+        return sampled_tokens, gathered_logits
 
     def load_weights(
         self,
@@ -1184,4 +1307,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                     for name in handle.keys():
                         yield name, handle.get_tensor(name)
 
-        load_checkpoint_weights(self, _weights(), expert_dtype=expert_dtype)
+        load_checkpoint_weights(
+            self, _weights(), expert_dtype=expert_dtype, strict=True
+        )

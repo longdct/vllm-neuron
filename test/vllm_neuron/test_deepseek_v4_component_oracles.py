@@ -26,6 +26,7 @@ from vllm_neuron.model.deepseek_v4.mhc import (
     sinkhorn_positive,
 )
 from vllm_neuron.model.deepseek_v4.moe import hash_experts, hash_topk, routed_topk
+from vllm_neuron.model.deepseek_v4.model import DeepseekV4GroupedLinear
 
 
 def tiny_config():
@@ -40,6 +41,41 @@ def tiny_config():
         layer_types=["compressed_sparse_attention"],
         mlp_layer_types=["moe"],
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 4, 8), (3, 4, 8), (2, 3, 4, 8)])
+def test_grouped_linear_matches_packed_bmm_oracle(dtype, shape):
+    """The decode-safe formulation preserves the checkpoint operation."""
+    generator = torch.Generator().manual_seed(31)
+    module = DeepseekV4GroupedLinear(8, 24, 4).to(dtype=dtype).eval()
+    with torch.no_grad():
+        module.weight.copy_(
+            torch.randn(module.weight.shape, generator=generator).to(dtype)
+        )
+    x = torch.randn(shape, generator=generator).to(dtype)
+    weight = module.weight.view(4, -1, 8).transpose(1, 2)
+    flat = x.reshape(-1, 4, 8).transpose(0, 1)
+    expected = torch.bmm(flat, weight).transpose(0, 1).reshape(*shape[:-2], 4, -1)
+
+    actual = module(x)
+
+    tolerance = 1e-6 if dtype is torch.float32 else 1e-2
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_grouped_linear_export_has_no_batched_matmul_or_dynamic_scalar_ops():
+    module = DeepseekV4GroupedLinear(8, 24, 4).eval()
+    exported = torch.export.export(module, (torch.randn(1, 4, 8),))
+    graph = str(exported.graph_module.graph)
+    forbidden = (
+        "bmm",
+        "_local_scalar_dense",
+        "_assert_scalar",
+        "sym_size",
+        "nonzero",
+    )
+    assert not any(operation in graph for operation in forbidden), graph
 
 
 def test_sinkhorn_projection_matches_extracted_transformers_math():

@@ -47,10 +47,12 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+
 __all__ = [
     "SUPPORTED_COMPRESS_RATIOS",
     "AttentionKind",
     "DeepseekV4ConfigError",
+    "DeepseekV4ModelConfig",
     "LayerSpec",
     "MLPKind",
     "NormalizedDeepseekV4Config",
@@ -189,6 +191,71 @@ class NormalizedDeepseekV4Config:
     def layer_indices_for(self, key: tuple[str, int]) -> tuple[int, ...]:
         """Indices of the layers bound to one cache-layout group."""
         return tuple(l.index for l in self.layers if l.cache_group_key == key)
+
+
+@dataclass(frozen=True)
+class DeepseekV4ModelConfig:
+    """Checkpoint-derived runtime configuration for the serving model."""
+
+    vocab_size: int
+    hidden_size: int
+    latent_size: int
+    sliding_window: int
+    num_experts: int
+    topk: int
+    expert_intermediate_size: int
+    n_shared_experts: int
+    routed_scaling_factor: float
+    hc_mult: int
+    hc_sinkhorn_iters: int
+    rms_norm_eps: float
+    hc_eps: float
+    swiglu_limit: float
+    layers: tuple[LayerSpec, ...]
+    torch_dtype: Any
+    tie_word_embeddings: bool
+    neuron_config: Any = None
+
+    @classmethod
+    def from_configs(cls, hf_config: Any, neuron_config: Any = None):
+        import torch
+
+        normalized = normalize_config(hf_config)
+        dtype = getattr(hf_config, "torch_dtype", None) or getattr(
+            hf_config, "dtype", None
+        )
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype, None)
+        if dtype is None:
+            dtype = torch.bfloat16
+        if dtype is not torch.bfloat16:
+            raise DeepseekV4ConfigError(
+                f"DeepSeek-V4 core serving supports BF16 only, got {dtype!r}"
+            )
+        return cls(
+            vocab_size=_require_positive_int(hf_config, "vocab_size"),
+            hidden_size=_require_positive_int(hf_config, "hidden_size"),
+            latent_size=normalized.head_dim,
+            sliding_window=normalized.sliding_window,
+            num_experts=normalized.n_routed_experts,
+            topk=normalized.num_experts_per_tok,
+            expert_intermediate_size=_require_positive_int(
+                hf_config, "moe_intermediate_size"
+            ),
+            n_shared_experts=normalized.n_shared_experts,
+            routed_scaling_factor=float(
+                _get(hf_config, "routed_scaling_factor", 1.0)
+            ),
+            hc_mult=normalized.hc_mult,
+            hc_sinkhorn_iters=normalized.hc_sinkhorn_iters,
+            rms_norm_eps=float(_get(hf_config, "rms_norm_eps", 1e-6)),
+            hc_eps=float(_get(hf_config, "hc_eps", 1e-6)),
+            swiglu_limit=float(_get(hf_config, "swiglu_limit", 10.0)),
+            layers=normalized.layers,
+            torch_dtype=dtype,
+            tie_word_embeddings=bool(_get(hf_config, "tie_word_embeddings", False)),
+            neuron_config=neuron_config,
+        )
 
 
 def _get(config: Any, name: str, default: Any = _MISSING) -> Any:
