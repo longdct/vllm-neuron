@@ -326,7 +326,8 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
         (width + 1, 1, state_spec.block_size, state_spec.head_size), dtype=state_spec.dtype
     )
     mla_cache = torch.zeros(
-        (2, 1, mla_spec.block_size, mla_spec.head_size), dtype=mla_spec.dtype
+        (-(-total_len // mla_spec.block_size) + 2, 1, mla_spec.block_size, mla_spec.head_size),
+        dtype=mla_spec.dtype,
     )
 
     def null_remapped_block_table(cached_seq_len, window, block_size):
@@ -359,7 +360,7 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
             state_col, state_off = t // state_spec.block_size, t % state_spec.block_size
             state_slot = state_row[state_col] * state_spec.block_size + state_off
             raw_slot = 1 * mla_spec.block_size + t
-            mla_slot = compressed_entry_slot_mapping(torch.tensor([raw_slot]), ratio)
+            mla_slot = compressed_entry_slot_mapping(torch.tensor([raw_slot]), ratio, mla_spec.block_size, mla_cache.shape[2])
             my_comp(
                 hidden_flat[t : t + 1],
                 position_ids=torch.tensor([[t]], dtype=torch.long),
@@ -375,7 +376,7 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     # up before comparing against the real module's fp32 output; the wider
     # tolerance below accounts for that quantization, not just floating-point
     # summation-order noise.
-    written = mla_cache[0, 0, entry_base : entry_base + num_entries, :].float().unsqueeze(0)
+    written = mla_cache[1:, 0, :entry_base, :].reshape(-1, mla_spec.head_size)[:num_entries].float().unsqueeze(0)
     entry_positions = (torch.arange(num_entries) * ratio).unsqueeze(0)
     with torch.no_grad():
         cos, sin = my_comp.rotary_emb(real_normed, position_ids=entry_positions, layer_type="compress")
@@ -406,9 +407,10 @@ def test_compressed_history_gathers_full_prefix_with_correct_validity_mask(
     mla_spec = {s.name: s for s in device_model.get_kv_spec().layers}[
         f"model.layers.{layer_index}.self_attn"
     ]
-    storage_block_size = mla_spec.block_size
+    storage_block_size = mla_spec.block_size // ratio
     num_cols = 3
     my_attn.mla_cache = torch.zeros((num_cols + 1, 1, storage_block_size, mla_spec.head_size))
+    my_attn.mla_raw_block_size = mla_spec.block_size
     block_table_row = torch.arange(1, num_cols + 1, dtype=torch.long)
     max_entries = num_cols * storage_block_size
 
@@ -530,6 +532,7 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
     with torch.no_grad():
         my_out = my_attn(
             hidden.squeeze(0),
+            position_ids.squeeze(0),
             self_attn_name="model.layers.0.self_attn",
             attn_metadata=attn_metadata,
         )
@@ -705,11 +708,13 @@ def test_attention_matches_real_module_after_swa_eviction_past_one_window(real_a
     with torch.no_grad():
         my_attn(
             hidden_flat[:chunk1_len],
+            position_ids.squeeze(0)[:chunk1_len],
             self_attn_name="model.layers.0.self_attn",
             attn_metadata=attn_metadata_for(block_ids_1, range(0, chunk1_len), 0),
         )
         chunk2_out = my_attn(
             hidden_flat[chunk1_len:],
+            position_ids.squeeze(0)[chunk1_len:],
             self_attn_name="model.layers.0.self_attn",
             attn_metadata=attn_metadata_for(
                 block_ids_2, range(chunk1_len, total_len), chunk1_len

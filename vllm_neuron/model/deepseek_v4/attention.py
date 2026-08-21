@@ -42,6 +42,7 @@ def gather_paged_latent(
     sequence_length: int,
     *,
     start_token: int = 0,
+    logical_slots_per_block: int | None = None,
 ) -> torch.Tensor:
     """Gather native-token order from ``[blocks,heads,slots,latent]`` storage.
 
@@ -67,7 +68,10 @@ def gather_paged_latent(
         raise ValueError("start_token must be non-negative")
     if sequence_length == 0:
         return cache.new_zeros((0, cache.shape[1], cache.shape[3]))
-    slots_per_block = cache.shape[2]
+    physical_stride = cache.shape[2]
+    slots_per_block = physical_stride if logical_slots_per_block is None else logical_slots_per_block
+    if slots_per_block < 1 or slots_per_block > physical_stride:
+        raise ValueError("logical_slots_per_block must fit within the physical page stride")
     start_col = start_token // slots_per_block
     end_col = -(-(start_token + sequence_length) // slots_per_block)  # ceil div
     if end_col > block_table.numel():
@@ -79,7 +83,7 @@ def gather_paged_latent(
         (blocks < 0).any() or (blocks >= cache.shape[0]).any()
     ):
         raise ValueError("block table contains an invalid physical block")
-    gathered = cache[blocks].permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
+    gathered = cache[blocks, :, :slots_per_block, :].permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
     front_trim = start_token - start_col * slots_per_block
     return gathered[front_trim : front_trim + sequence_length]
 
@@ -195,6 +199,8 @@ def scatter_paged_latent(
 def compressed_entry_slot_mapping(
     raw_slot_mapping: torch.Tensor,
     compress_ratio: int,
+    raw_block_size: int,
+    physical_page_stride: int,
 ) -> torch.Tensor:
     """Map a per-token raw-cache slot to its compressed-entry storage slot.
 
@@ -216,8 +222,17 @@ def compressed_entry_slot_mapping(
     """
     if compress_ratio < 1:
         raise ValueError("compress_ratio must be positive")
-    valid = (raw_slot_mapping >= 0) & ((raw_slot_mapping + 1) % compress_ratio == 0)
-    entry_slot = torch.div(raw_slot_mapping, compress_ratio, rounding_mode="floor")
+    if raw_block_size < 1 or raw_block_size % compress_ratio:
+        raise ValueError("raw_block_size must be a positive multiple of compress_ratio")
+    logical_entries = raw_block_size // compress_ratio
+    if physical_page_stride < logical_entries:
+        raise ValueError("physical_page_stride is smaller than the logical compressed page")
+    safe_raw = raw_slot_mapping.clamp(min=0)
+    physical_block = torch.div(safe_raw, raw_block_size, rounding_mode="floor")
+    raw_offset = safe_raw % raw_block_size
+    valid = (raw_slot_mapping >= 0) & ((raw_offset + 1) % compress_ratio == 0)
+    logical_offset = torch.div(raw_offset, compress_ratio, rounding_mode="floor")
+    entry_slot = physical_block * physical_page_stride + logical_offset
     return torch.where(valid, entry_slot, torch.full_like(raw_slot_mapping, -1))
 
 

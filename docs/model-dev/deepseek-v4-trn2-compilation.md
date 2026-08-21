@@ -21,6 +21,43 @@ production. In particular, the tiny model currently emits Neuron runtime
 scatter/gather out-of-bounds notifications during warmup. Compilation and cache
 lifecycle are green; device numerical correctness is still under investigation.
 
+## Validation result: 2026-08-21
+
+The publication correctness gate is **not green** on the repository's
+`trn2.3xlarge` development instance. The padding-aware compressed-cache fix
+passes the CPU correctness suites, and the cold Trn2 run compiled all three
+requested graphs and generated four in-range tokens, but Neuron runtime
+notifications make the device run a failure even though the process exited
+successfully.
+
+The isolated-cache TP1/O1 run produced:
+
+| Target/stage | Cache key | Result |
+| --- | --- | --- |
+| Decode `(1,64)` | `0d435021887b05d515c462b4a73a1e8a` | compiled in 25.1s; out-of-bounds notifications |
+| Prefill 8 | `cd57d45bf690aec8abf10247f4befb24` | compiled in 71.9s; warmup clean |
+| Prefill 64 | `9ff77ad7f1524aa87c9bc77e75faa0a3` | compiled in 834.8s; out-of-bounds notifications |
+| Parallel trace | all three | 178.8s |
+| Engine initialization | all three | 1057.5s |
+| Generation | prompt 8, four tokens | completed, but invalidated by notifications |
+
+The runtime reported vector-DGE scatter/gather out-of-bounds access for
+prefill-64 and vector- plus scalar-DGE out-of-bounds access for decode. The
+engine still logged warmup success and exited zero, confirming that validation
+must scan captured subprocess output rather than trust process status alone.
+
+Shutdown independently reproduced:
+
+```text
+RuntimeError: device_allocator INTERNAL ASSERT FAILED at
+CachingDeviceAllocator.h:252. Allocator for neuron is not a DeviceAllocator.
+```
+
+A restart/cache-reuse run was not accepted because the cold run already failed
+the notification gate. The three completed entries remain available for
+diagnosis. Do not publish this as a clean correctness result until the accesses
+are fixed and a restart proves three cache hits with zero submitted HLOs.
+
 ## Hardware choices
 
 The procedure was verified on this repository's `trn2.3xlarge` development

@@ -619,9 +619,10 @@ class DeepseekV4Attention(nn.Module):
         always-compute redesign documents; not a concern for this pass's
         synthetic validation config, a real cost at production scale.
         """
-        max_entries = block_table_row.shape[0] * self.mla_cache.shape[2]
+        max_entries = block_table_row.shape[0] * (self.mla_raw_block_size // self.ratio)
         gathered = gather_paged_latent(
-            self.mla_cache, block_table_row, max_entries
+            self.mla_cache, block_table_row, max_entries,
+            logical_slots_per_block=self.mla_raw_block_size // self.ratio,
         ).squeeze(1)
         cached_seq_len = position_ids.view(()).long()
         num_entries = torch.div(cached_seq_len, self.ratio, rounding_mode="floor")
@@ -696,7 +697,8 @@ class DeepseekV4Attention(nn.Module):
             mla_entry = attn_metadata[self_attn_name]
             state_entry = attn_metadata[f"{self_attn_name}.compressor.state_cache"]
             mla_slot = compressed_entry_slot_mapping(
-                mla_entry["slot_mapping"][local_index : local_index + 1], self.ratio
+                mla_entry["slot_mapping"][local_index : local_index + 1], self.ratio,
+                self.mla_raw_block_size, self.mla_cache.shape[2]
             )
             self.compressor(
                 hidden,
@@ -1205,6 +1207,10 @@ class DeepseekV4ForCausalLM(nn.Module):
             layer.attention.swa_cache = kv_caches[f"{prefix}.swa_cache"][0]
             if layer.attention.compressor is not None:
                 layer.attention.mla_cache = kv_caches[prefix][0]
+                layer.attention.mla_raw_block_size = next(s.block_size for s in self.get_kv_spec().layers if s.name == prefix)
+                logical_width = layer.attention.mla_raw_block_size // layer.attention.ratio
+                if layer.attention.mla_cache.shape[2] < logical_width:
+                    raise ValueError(f"{prefix} physical stride is smaller than logical compressed width")
                 layer.attention.compressor.state_cache = kv_caches[
                     f"{prefix}.compressor.state_cache"
                 ][0]

@@ -98,7 +98,7 @@ def test_compressed_entry_slot_mapping_matches_upstream_formula(ratio):
     positions = torch.arange(0, 3 * ratio)
     block_table_stub = torch.zeros(1, dtype=torch.long)  # single block, block 0
     raw_slot = positions  # block_size == ratio*k for some k; use block 0 only
-    entry_slot = compressed_entry_slot_mapping(raw_slot, ratio)
+    entry_slot = compressed_entry_slot_mapping(raw_slot, ratio, 3 * ratio, 3)
     expected_valid = (positions + 1) % ratio == 0
     assert torch.equal(entry_slot >= 0, expected_valid)
     assert torch.equal(entry_slot[expected_valid], positions[expected_valid] // ratio)
@@ -107,7 +107,7 @@ def test_compressed_entry_slot_mapping_matches_upstream_formula(ratio):
 
 def test_compressed_entry_slot_mapping_treats_padding_as_invalid():
     raw_slot = torch.tensor([-1, 3, 6, -1])
-    entry_slot = compressed_entry_slot_mapping(raw_slot, 4)
+    entry_slot = compressed_entry_slot_mapping(raw_slot, 4, 8, 2)
     # slot 3: (3+1)%4==0 -> completes entry 0. slot 6: (6+1)%4==3 -> not a
     # boundary, invalid regardless of padding.
     assert entry_slot.tolist() == [-1, 0, -1, -1]

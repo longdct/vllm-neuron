@@ -47,7 +47,9 @@ def hf_config():
 def fresh_caches(model, num_blocks=64):
     caches = {}
     for spec in model.get_kv_spec().layers:
-        shape = (num_blocks, 1, spec.block_size or 32, spec.head_size)
+        ratio = getattr(spec, "compress_ratio", 1) or 1
+        physical_slots = (spec.block_size // ratio) if ratio > 1 else (spec.block_size or 32)
+        shape = (num_blocks, 1, physical_slots, spec.head_size)
         caches[spec.name] = [torch.zeros(shape, dtype=spec.dtype)]
     return caches
 
@@ -94,7 +96,7 @@ def run_chunked(model, specs, tokens_list):
         n = len(chunk)
         attn_metadata = build_attn_metadata(specs, cached, n)
         input_ids = torch.tensor(chunk)
-        positions = torch.arange(n)
+        positions = torch.arange(cached[specs[0].name], cached[specs[0].name] + n)
         sampling_positions = torch.arange(n)
         logits = model(input_ids, positions, attn_metadata, sampling_positions)
         outputs.append(logits)
