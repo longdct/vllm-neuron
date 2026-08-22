@@ -1107,6 +1107,13 @@ class NeuronWorker(WorkerBase):
         # CPU eager mode: skip warmup (no NEFFs to compile, shapes are dynamic)
         if envs.VLLM_NEURON_CPU_MODE and self.vllm_config.model_config.enforce_eager:
             logger.info("CPU eager mode — skipping warmup")
+            # Device execution enables capture below, after warmup, so warmup
+            # tensors are not persisted.  CPU eager has no warmup, but must
+            # still enable the registry before returning or every configured
+            # hook remains dormant and the capture directory stays empty.
+            if self.model_runner.neuron_config.tensor_capture:
+                self.model_runner.enable_capture()
+                logger.info("Tensor capture enabled (CPU eager mode)")
             return CompilationTimes(language_model=0.0, encoder=0.0)
 
         # Determine which warmup phases to run based on kv_role.

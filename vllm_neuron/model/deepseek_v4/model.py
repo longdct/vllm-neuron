@@ -498,6 +498,16 @@ class DeepseekV4Attention(nn.Module):
             self.o_groups * o_lora_rank, config.hidden_size, bias=False
         )
         self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
+        # Hookable no-op boundaries for focused CPU/Neuron accuracy capture.
+        # They have no parameters and compile away when no capture hook is
+        # registered, while avoiding unconditional manual-capture outputs in
+        # ordinary tensor-capture runs.
+        self.capture_q_roped = nn.Identity()
+        self.capture_kv_roped = nn.Identity()
+        self.capture_history = nn.Identity()
+        self.capture_key_valid = nn.Identity()
+        self.capture_attended_roped = nn.Identity()
+        self.capture_attended = nn.Identity()
 
         # Head-sharded checkpoint parameters. Replicated q_a/kv parameters
         # intentionally have no loader and therefore remain identical on ranks.
@@ -722,15 +732,24 @@ class DeepseekV4Attention(nn.Module):
         cos, sin = self.rotary_emb(hidden, position_ids=position_ids, layer_type=self.rope_layer_type)
 
         q = self.q_b_proj(self.q_a_norm(self.q_a_proj(hidden)))
-        q = q.view(1, 1, self.heads_per_rank, self.head_dim)
+        # Rotate the query in the same rank-3 layout as KV.  Neuron's
+        # lowering of the rank-4 partial-RoPE concat zeroed the two rotary
+        # channels while the otherwise identical rank-3 KV path was correct.
+        # The leading dimension is one token here by construction; restore
+        # the singleton attention-time dimension after rotation.
+        q = q.view(1, self.heads_per_rank, self.head_dim)
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.q_a_norm.eps).to(q.dtype)
         cos_h, sin_h = cos.unsqueeze(2), sin.unsqueeze(2)  # broadcast over heads
-        q_roped = apply_partial_rotary(q, cos_h, sin_h, rope_dim=self.qk_rope_head_dim)
+        q_roped = apply_partial_rotary(
+            q, cos, sin, rope_dim=self.qk_rope_head_dim
+        ).unsqueeze(1)
+        q_roped = self.capture_q_roped(q_roped)
 
         kv = self.kv_norm(self.kv_proj(hidden))  # [1, head_dim]
         kv_roped = apply_partial_rotary(
             kv.unsqueeze(0), cos, sin, rope_dim=self.qk_rope_head_dim
         ).squeeze(0)
+        kv_roped = self.capture_kv_roped(kv_roped)
         updated_swa_cache = scatter_paged_latent(swa_cache, swa_slot, kv_roped)
 
         # position_ids is already this token's absolute position as a real
@@ -773,6 +792,8 @@ class DeepseekV4Attention(nn.Module):
             # excludes the padding itself from attention entirely.
             key_valid = torch.cat((compressed_valid, key_valid), dim=0)
 
+        history = self.capture_history(history)
+        key_valid = self.capture_key_valid(key_valid)
         attended = mla_attention_reference(
             q_roped,
             history.view(1, -1, history.shape[-1]),
@@ -782,9 +803,11 @@ class DeepseekV4Attention(nn.Module):
             sliding_window=self.sliding_window if self.ratio == 0 else None,
             key_valid=key_valid,
         )  # [1, 1, heads_per_rank, head_dim]
+        attended = self.capture_attended_roped(attended)
         attended = apply_partial_rotary(
             attended, cos_h, sin_h, rope_dim=self.qk_rope_head_dim, inverse=True
         )
+        attended = self.capture_attended(attended)
         return attended.reshape(1, self.heads_per_rank * self.head_dim), updated_swa_cache
 
     def forward(

@@ -25,15 +25,30 @@ def main() -> None:
         type=Path,
         help="Capture decoder-layer and lm-head outputs for accuracy diagnosis.",
     )
+    parser.add_argument(
+        "--capture-attention-internals-layer",
+        type=int,
+        choices=range(3),
+        metavar="{0,1,2}",
+        help="Capture only one layer plus its attention projection internals.",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=64,
+        help="Model length for focused diagnostics (default: 64).",
+    )
     args = parser.parse_args()
+    if args.max_model_len < 12:
+        parser.error("--max-model-len must fit the 8-token prompt and 4 outputs")
 
     neuron_config = {
-        "num_batched_tokens_buckets": [8, 64],
+        "num_batched_tokens_buckets": sorted({8, args.max_model_len}),
         "on_device_sampling_config": None,
     }
     if args.capture_dir is not None:
-        neuron_config["tensor_capture"] = {
-            "modules": [
+        if args.capture_attention_internals_layer is None:
+            capture_modules = [
                 "model.embed_tokens",
                 *[
                     f"model.layers.{layer}.{module}"
@@ -49,7 +64,38 @@ def main() -> None:
                 ],
                 *(f"model.layers.{layer}" for layer in range(3)),
                 "lm_head",
-            ],
+            ]
+        else:
+            layer = args.capture_attention_internals_layer
+            prefix = f"model.layers.{layer}"
+            capture_modules = [
+                "model.embed_tokens",
+                f"{prefix}.attn_hc",
+                f"{prefix}.input_layernorm",
+                f"{prefix}.attention",
+                *(
+                    f"{prefix}.attention.{module}"
+                    for module in (
+                        "q_a_proj",
+                        "q_a_norm",
+                        "q_b_proj",
+                        "kv_proj",
+                        "kv_norm",
+                        "capture_q_roped",
+                        "capture_kv_roped",
+                        "capture_history",
+                        "capture_key_valid",
+                        "capture_attended_roped",
+                        "capture_attended",
+                        "o_a_proj",
+                        "o_b_proj",
+                    )
+                ),
+                prefix,
+                "lm_head",
+            ]
+        neuron_config["tensor_capture"] = {
+            "modules": capture_modules,
             "capture_dir": str(args.capture_dir),
         }
 
@@ -57,7 +103,7 @@ def main() -> None:
         model=str(args.checkpoint),
         load_format="dummy",
         max_num_seqs=1,
-        max_model_len=64,
+        max_model_len=args.max_model_len,
         block_size=32,
         tensor_parallel_size=1,
         enforce_eager=args.enforce_eager,

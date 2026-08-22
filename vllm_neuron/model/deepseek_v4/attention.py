@@ -30,10 +30,18 @@ def apply_partial_rotary(
         raise ValueError("rope_dim must be even and within the head dimension")
     if rope_dim == 0:
         return x
-    prefix, rotary = x[..., :-rope_dim], x[..., -rope_dim:]
+    rotary = x[..., -rope_dim:]
     if inverse:
         sin = -sin
-    return torch.cat((prefix, apply_rotary(rotary, cos, sin)), dim=-1)
+    rotated = apply_rotary(rotary, cos, sin)
+    rotary_indices = torch.arange(
+        x.shape[-1] - rope_dim, x.shape[-1], device=x.device
+    )
+    # A functional overwrite avoids Neuron lowering the small rotated suffix
+    # as a dead/zero concat operand (observed for rank-4 query tensors with a
+    # two-channel rotary suffix).  The indices and output shape are entirely
+    # static for a compiled model.
+    return torch.index_copy(x, -1, rotary_indices, rotated)
 
 
 def gather_paged_latent(
