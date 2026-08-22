@@ -43,7 +43,8 @@ def gather_paged_latent(
     *,
     start_token: int = 0,
     logical_slots_per_block: int | None = None,
-) -> torch.Tensor:
+    return_validity: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Gather native-token order from ``[blocks,heads,slots,latent]`` storage.
 
     ``start_token`` is the absolute token offset the read begins at --
@@ -67,25 +68,27 @@ def gather_paged_latent(
     if start_token < 0:
         raise ValueError("start_token must be non-negative")
     if sequence_length == 0:
-        return cache.new_zeros((0, cache.shape[1], cache.shape[3]))
+        empty = cache.new_zeros((0, cache.shape[1], cache.shape[3]))
+        validity = torch.zeros(0, dtype=torch.bool, device=cache.device)
+        return (empty, validity) if return_validity else empty
     physical_stride = cache.shape[2]
     slots_per_block = physical_stride if logical_slots_per_block is None else logical_slots_per_block
     if slots_per_block < 1 or slots_per_block > physical_stride:
         raise ValueError("logical_slots_per_block must fit within the physical page stride")
-    start_col = start_token // slots_per_block
-    end_col = -(-(start_token + sequence_length) // slots_per_block)  # ceil div
-    if end_col > block_table.numel():
-        raise ValueError("block table is too short for sequence_length")
-    blocks = block_table[start_col:end_col].long()
-    # Pure input-validation guard, skipped while torch.compile is tracing --
-    # see the matching comment on mhc.py::sinkhorn_positive.
-    if not torch.compiler.is_compiling() and (
-        (blocks < 0).any() or (blocks >= cache.shape[0]).any()
-    ):
-        raise ValueError("block table contains an invalid physical block")
-    gathered = cache[blocks, :, :slots_per_block, :].permute(0, 2, 1, 3).reshape(-1, cache.shape[1], cache.shape[3])
-    front_trim = start_token - start_col * slots_per_block
-    return gathered[front_trim : front_trim + sequence_length]
+    if block_table.numel() == 0 or cache.shape[0] == 0:
+        raise ValueError("cache and block table must contain storage")
+    positions = start_token + torch.arange(sequence_length, device=block_table.device)
+    columns = torch.div(positions, slots_per_block, rounding_mode="floor")
+    offsets = positions % slots_per_block
+    column_valid = columns < block_table.numel()
+    safe_columns = columns.clamp(min=0, max=block_table.numel() - 1)
+    candidate_blocks = block_table[safe_columns].long()
+    block_valid = (candidate_blocks >= 0) & (candidate_blocks < cache.shape[0])
+    valid = column_valid & block_valid
+    safe_blocks = candidate_blocks.clamp(min=0, max=cache.shape[0] - 1)
+    gathered = cache[safe_blocks, :, offsets, :]
+    gathered = torch.where(valid[:, None, None], gathered, torch.zeros_like(gathered))
+    return (gathered, valid) if return_validity else gathered
 
 
 def gather_recent_window(
@@ -133,14 +136,16 @@ def gather_recent_window(
     positions = positions.clamp(min=0)
     columns = torch.div(positions, slots_per_block, rounding_mode="floor")
     slot_offsets = positions % slots_per_block
-    blocks = block_table[columns].long()
-    # Pure input-validation guard, skipped while torch.compile is tracing --
-    # see the matching comment on gather_paged_latent above.
-    if not torch.compiler.is_compiling() and (
-        (blocks < 0).any() or (blocks >= cache.shape[0]).any()
-    ):
-        raise ValueError("block table contains an invalid physical block")
+    if block_table.numel() == 0 or cache.shape[0] == 0:
+        raise ValueError("cache and block table must contain storage")
+    column_valid = columns < block_table.numel()
+    columns = columns.clamp(max=block_table.numel() - 1)
+    candidate_blocks = block_table[columns].long()
+    block_valid = (candidate_blocks >= 0) & (candidate_blocks < cache.shape[0])
+    valid = valid & column_valid & block_valid
+    blocks = candidate_blocks.clamp(min=0, max=cache.shape[0] - 1)
     gathered = cache[blocks, :, slot_offsets, :]
+    gathered = torch.where(valid[:, None, None], gathered, torch.zeros_like(gathered))
     return gathered, valid
 
 
@@ -148,7 +153,7 @@ def scatter_paged_latent(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     values: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     """Write ``values`` into ``[blocks,heads,slots,latent]`` storage in place.
 
     ``slot_mapping`` is a flat cache-relative slot index per row of ``values``
@@ -160,40 +165,47 @@ def scatter_paged_latent(
     """
     if cache.ndim != 4:
         raise ValueError("cache must be 4-D: [blocks, heads, slots, latent]")
+    if cache.shape[1] != 1:
+        raise ValueError("DeepSeek latent cache must have exactly one head")
     if slot_mapping.ndim != 1 or values.ndim != 2:
         raise ValueError("slot_mapping must be 1-D and values must be 2-D")
     if slot_mapping.shape[0] != values.shape[0]:
         raise ValueError("slot_mapping and values must have the same row count")
     storage_block_size = cache.shape[2]
-    valid = slot_mapping >= 0
-    # Padding rows are dropped rather than redirected to a dummy slot: an
-    # earlier version wrote padding rows back to slot 0 with their
-    # pre-existing value to keep this a plain unconditional index_put_, but
-    # index_put_ makes no ordering guarantee between rows that collide on the
-    # same physical index -- whenever a real row's slot happened to be 0 too,
-    # the padding row's "restore" write could nondeterministically clobber
-    # it. Filtering to the valid rows costs a data-dependent shape (fine here
-    # -- this pass is eager/CPU-mode; see the module docstring's scope note)
-    # but is unconditionally correct.
-    slot_mapping = slot_mapping[valid]
-    values = values[valid]
-    # No early "nothing to write" return on slot_mapping.numel() == 0: under
-    # torch.compile/Dynamo, that numel() came from the data-dependent
-    # boolean-mask filter just above, so branching on it trips "Could not
-    # guard on data-dependent expression" (unbacked SymInt from `valid`
-    # filtering -- same family of issue as the sinkhorn_positive/
-    # gather_paged_latent guard-clause fixes elsewhere in this pass, see
-    # docs/model-dev/deepseek-v4-024-device-validation.md Step 5d). Like
-    # those, this was a throughput short-circuit only, not a correctness
-    # requirement: index_put_ with an empty (possibly data-dependent-sized)
-    # index is already a well-defined no-op, so running it unconditionally
-    # is numerically identical, just skips the early-out.
-    blk_idx = torch.div(slot_mapping, storage_block_size, rounding_mode="floor")
-    pos_idx = slot_mapping % storage_block_size
-    cache.index_put_(
-        (blk_idx.long(), torch.zeros_like(blk_idx.long()), pos_idx.long()),
-        values.to(cache.dtype),
+    capacity = cache.shape[0] * storage_block_size
+    if capacity == 0:
+        raise ValueError("cache must contain storage")
+    if not torch.compiler.is_compiling() and (
+        (slot_mapping >= capacity).any()
+    ):
+        raise ValueError("slot_mapping contains an out-of-range positive slot")
+    valid = (slot_mapping >= 0) & (slot_mapping < capacity)
+    # Keep every intermediate shape independent of the number of valid rows.
+    # Invalid rows target scratch slot zero but contribute neither an update
+    # nor an update count, so they cannot race with a genuine write to slot 0.
+    safe_slots = torch.where(valid, slot_mapping, torch.zeros_like(slot_mapping)).long()
+    storage_slots = torch.arange(capacity, device=cache.device)
+    if values.shape[0] == 1:
+        update_mask = (storage_slots == safe_slots[0])[:, None] & valid[0]
+        updates = values[0].to(cache.dtype).expand(capacity, -1)
+    else:
+        row_targets = safe_slots[:, None] == storage_slots[None, :]
+        row_targets = row_targets & valid[:, None]
+        flat_counts = row_targets.sum(dim=0, keepdim=False).unsqueeze(-1)
+        flat_updates = (
+            row_targets.to(cache.dtype).transpose(0, 1) @ values.to(cache.dtype)
+        )
+        update_mask = flat_counts > 0
+        # Slot mappings are expected to be unique. Averaging duplicates keeps
+        # the operation deterministic without changing the normal case.
+        updates = flat_updates / flat_counts.clamp(min=1)
+    cache_head = cache[:, 0, :, :].reshape(capacity, cache.shape[3])
+    updated_head = torch.where(update_mask, updates, cache_head).reshape(
+        cache.shape[0], storage_block_size, cache.shape[3]
     )
+    updated_cache = updated_head.unsqueeze(1)
+    cache.copy_(updated_cache)
+    return updated_cache
 
 
 def compressed_entry_slot_mapping(

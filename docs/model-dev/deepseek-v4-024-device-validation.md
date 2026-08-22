@@ -1,5 +1,13 @@
 # DeepSeek-V4 on vLLM 0.24: device validation
 
+> **2026-08-22 update:** the tiny TP1 model now compiles and executes through
+> prefill and decode without the PJRT crash described below. Cache correctness
+> fixes have reduced the remaining blocker to a finite CPU/Neuron numerical
+> divergence on the fourth generated token. See
+> [`deepseek-v4-tiny-tp1-neuron-investigation.md`](deepseek-v4-tiny-tp1-neuron-investigation.md)
+> for the current result, exact experiments, and continuation commands. The
+> historical sections below are retained as the chronology of earlier gates.
+
 How to validate the `deepseek-V4-on-0.24` branch on a Trainium instance, in
 dependency order, and what each step does and does not prove.
 

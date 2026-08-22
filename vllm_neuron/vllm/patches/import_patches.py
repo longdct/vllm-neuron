@@ -30,3 +30,12 @@ def _pin_memory() -> None:
     from vllm_neuron.vllm.patches.pin_memory_patch import apply_pin_memory_patch
 
     apply_pin_memory_patch()
+
+
+@register(Phase.IMPORT, "neuron_accelerator_empty_cache")
+def _neuron_accelerator_empty_cache() -> None:
+    from vllm_neuron.vllm.patches.accelerator_cache_patch import (
+        apply_neuron_empty_cache_patch,
+    )
+
+    apply_neuron_empty_cache_patch()

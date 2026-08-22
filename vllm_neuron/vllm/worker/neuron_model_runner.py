@@ -13,6 +13,7 @@ import os
 import threading
 import time
 from copy import copy, deepcopy
+from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -4262,7 +4263,61 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
 
+        if envs.VLLM_NEURON_VALIDATE_CACHE_METADATA:
+            self._validate_attention_metadata(attn_metadata)
         return attn_metadata
+
+    def _validate_attention_metadata(self, attn_metadata: dict) -> None:
+        """Validate the real, merged per-group metadata before graph capture.
+
+        This deliberately runs only behind a diagnostic environment flag: it
+        materializes device predicates on the host and would otherwise add a
+        synchronization to every batch.
+        """
+        seen: set[int] = set()
+        for layer_name, metadata in attn_metadata.items():
+            # Layers in one heterogeneous cache group share this dictionary.
+            if id(metadata) in seen:
+                continue
+            seen.add(id(metadata))
+            table = metadata["block_table_tensor"]
+            slots = metadata["slot_mapping"]
+            block_size = int(metadata["block_size"])
+            declared_width = int(metadata["max_blocks_per_seq"])
+            prefix = f"cache metadata for {layer_name}"
+            if table.ndim != 2 or table.shape[1] != declared_width:
+                raise ValueError(
+                    f"{prefix}: block-table shape {tuple(table.shape)} does not "
+                    f"match declared width {declared_width}"
+                )
+            cache = self._kv_cache_full_tensors.get(layer_name)
+            if cache is None:
+                raise ValueError(f"{prefix}: allocated cache tensor is missing")
+            if cache.ndim == 4:
+                physical_blocks = cache.shape[0]
+                physical_stride = cache.shape[2]
+            elif cache.ndim >= 5 and cache.shape[0] == 2:
+                physical_blocks = cache.shape[1]
+                physical_stride = cache.shape[3]
+            else:
+                raise ValueError(
+                    f"{prefix}: unsupported allocated cache shape {tuple(cache.shape)}"
+                )
+            if block_size <= 0 or physical_stride <= 0:
+                raise ValueError(
+                    f"{prefix}: logical page width {block_size} and physical "
+                    f"stride {physical_stride} must both be positive"
+                )
+            if bool(((table < -1) | (table >= physical_blocks)).any().item()):
+                raise ValueError(
+                    f"{prefix}: physical block id must be -1 padding or in "
+                    f"[0, {physical_blocks})"
+                )
+            capacity = physical_blocks * block_size
+            if bool(((slots < -1) | (slots >= capacity)).any().item()):
+                raise ValueError(
+                    f"{prefix}: slot mapping must be -1 padding or in [0, {capacity})"
+                )
 
     def _build_warmup_attention_metadata(
         self,
@@ -4465,7 +4520,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_tokens = bucket_size
 
         # Create synthetic inputs: 1 request with bucket_size tokens
-        input_ids = torch.arange(1, num_tokens + 1, dtype=torch.int32).to(device)
+        # Buckets can be as large as (or larger than) a tiny diagnostic
+        # vocabulary. Keep synthetic IDs valid; their values are irrelevant to
+        # graph shape and compilation coverage.
+        input_ids = (
+            torch.arange(1, num_tokens + 1, dtype=torch.int32)
+            % self.vocab_size
+        ).to(device)
         # Positions start from cached_seq_len (simulating continuation after cached prefix)
         positions = torch.arange(
             cached_seq_len, cached_seq_len + num_tokens, dtype=torch.long
@@ -8080,6 +8141,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # The metadata is created and updated by InputBatch.refresh_metadata() in _update_cached_states()
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        validation_dir = envs.VLLM_NEURON_TINY_VALIDATION_DIR
+        if validation_dir and not self.on_device_sampling:
+            capture_dir = Path(validation_dir)
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            step = getattr(self, "_tiny_validation_step", 0)
+            torch.save(
+                model_output_tensor.detach().float().cpu(),
+                capture_dir / f"logits-{step:04d}.pt",
+            )
+            self._tiny_validation_step = step + 1
 
         if self.use_async_scheduling:
             if spec_decode_metadata is not None:
@@ -8521,11 +8592,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Initialize the KV Cache tensors
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        isolate_shared_tensors = bool(
+            getattr(self.model, "requires_independent_kv_cache_tensors", False)
+        )
         for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
-            # Case where the KV cache is shared across layers
-            for layer_name in tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = raw_tensor
+            if isolate_shared_tensors:
+                # DeepSeek's compiled functional cache updates return complete
+                # logical views. Keep each heterogeneous cache group on its own
+                # backing allocation so overlapping BF16/FP32 aliases cannot
+                # clobber one another when graph outputs are written back.
+                for layer_name in tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = torch.zeros(
+                        tensor.size, dtype=torch.int8, device=self.device
+                    )
+            else:
+                raw_tensor = torch.zeros(
+                    tensor.size, dtype=torch.int8, device=self.device
+                )
+                # Case where the KV cache is shared across layers
+                for layer_name in tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = raw_tensor
 
         # Cache raw.view(dtype) per (raw_tensor, dtype) so layers pooled onto one
         # buffer reuse ONE reinterpret -> their K/V share a single ._base.

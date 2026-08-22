@@ -40,6 +40,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
+    VLLM_NEURON_VALIDATE_CACHE_METADATA: bool = False
+    VLLM_NEURON_TINY_VALIDATION_DIR: Optional[str] = None
     VLLM_NEURON_SKIP_PREFILL_WARMUP: bool = False
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP: bool = False
@@ -192,6 +194,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable NKI kernels — forces can_run_kernel() to return False
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_NKI_KERNELS")) or False
+    ),
+    # Expensive device-to-host validation for correctness qualification runs.
+    "VLLM_NEURON_VALIDATE_CACHE_METADATA": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_VALIDATE_CACHE_METADATA")) or False
+    ),
+    # Optional directory for per-step CPU logits captured before sampling.
+    "VLLM_NEURON_TINY_VALIDATION_DIR": lambda: os.getenv(
+        "VLLM_NEURON_TINY_VALIDATION_DIR", None
     ),
     # Skip prefill warmup/compilation without requiring kv-transfer-config.
     # Useful for decode-only profiling workflows.

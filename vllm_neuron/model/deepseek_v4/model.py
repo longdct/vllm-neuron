@@ -51,6 +51,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 from ..kv_cache import CacheKind, KVSpec, LayerSpec
 from .attention import (
@@ -308,6 +309,26 @@ class NeuronDeepseekV4RotaryEmbedding(
     """
 
     @torch.no_grad()
+    def reinitialize_deterministic_buffers(self) -> None:
+        """Restore derived RoPE state after meta-device ``to_empty()``.
+
+        These buffers are deliberately non-persistent in Transformers, so a
+        Hugging Face checkpoint does not contain them. Materializing a model
+        constructed on ``meta`` therefore has to recompute them from config.
+        """
+        for layer_type in self.layer_types:
+            inv_freq_buffer = getattr(self, f"{layer_type}_inv_freq")
+            rope_init_fn = self.compute_default_rope_parameters
+            if self.rope_type[layer_type] != "default":
+                rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type[layer_type]]
+            inv_freq, attention_scaling = rope_init_fn(
+                self.config, inv_freq_buffer.device, layer_type=layer_type
+            )
+            inv_freq_buffer.copy_(inv_freq)
+            getattr(self, f"{layer_type}_original_inv_freq").copy_(inv_freq)
+            setattr(self, f"{layer_type}_attention_scaling", attention_scaling)
+
+    @torch.no_grad()
     def forward(self, x, position_ids, layer_type=None):
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
         attention_scaling = getattr(
@@ -547,8 +568,23 @@ class DeepseekV4Attention(nn.Module):
         self.swa_cache: torch.Tensor | None = None
         self.mla_cache: torch.Tensor | None = None
 
+    @torch.no_grad()
+    def reinitialize_deterministic_buffers(self) -> None:
+        """Restore the identity K/V projection after meta materialization."""
+        identity = torch.eye(
+            self.head_dim,
+            device=self.identity_kv_weight.device,
+            dtype=self.identity_kv_weight.dtype,
+        )
+        self.identity_kv_weight.copy_(
+            identity.unsqueeze(0).expand(self.heads_per_rank, -1, -1)
+        )
+
     def _swa_history(
-        self, block_table_row: torch.Tensor, current_position: torch.Tensor
+        self,
+        block_table_row: torch.Tensor,
+        current_position: torch.Tensor,
+        cache: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fixed-size ``sliding_window`` window of uncompressed latents
         ending at (and including) this token's own absolute position.
@@ -584,7 +620,10 @@ class DeepseekV4Attention(nn.Module):
         docs/model-dev/deepseek-v4-swa-null-block-bug.md.
         """
         gathered, valid = gather_recent_window(
-            self.swa_cache, block_table_row, self.sliding_window, current_position
+            (self.swa_cache if cache is None else cache),
+            block_table_row,
+            self.sliding_window,
+            current_position,
         )
         return gathered.squeeze(1), valid
 
@@ -627,6 +666,12 @@ class DeepseekV4Attention(nn.Module):
         cached_seq_len = position_ids.view(()).long()
         num_entries = torch.div(cached_seq_len, self.ratio, rounding_mode="floor")
         valid = torch.arange(max_entries, device=gathered.device) < num_entries
+        # Invalid physical rows may contain allocator garbage or a non-finite
+        # candidate from a compressor call that did not complete a logical
+        # window. Masking attention logits alone is insufficient because the
+        # value path still evaluates ``0 * NaN``. Neutralize invalid storage
+        # before it reaches either the key or value projection.
+        gathered = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
         return gathered, valid
 
     def _forward_one_token(
@@ -638,7 +683,8 @@ class DeepseekV4Attention(nn.Module):
         request: int,
         local_index: int,
         position_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        swa_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend and update caches for exactly one token.
 
         Called once per token, even during prefill: a compressed window
@@ -685,13 +731,15 @@ class DeepseekV4Attention(nn.Module):
         kv_roped = apply_partial_rotary(
             kv.unsqueeze(0), cos, sin, rope_dim=self.qk_rope_head_dim
         ).squeeze(0)
-        scatter_paged_latent(self.swa_cache, swa_slot, kv_roped)
+        updated_swa_cache = scatter_paged_latent(swa_cache, swa_slot, kv_roped)
 
         # position_ids is already this token's absolute position as a real
         # tensor (see the docstring above) -- reused directly as
         # _swa_history's current_position rather than reintroducing a
         # Python-int cached_seq_len dependency here.
-        history, key_valid = self._swa_history(swa_block_table, position_ids)
+        history, key_valid = self._swa_history(
+            swa_block_table, position_ids, cache=updated_swa_cache
+        )
 
         if self.compressor is not None:
             mla_entry = attn_metadata[self_attn_name]
@@ -737,7 +785,7 @@ class DeepseekV4Attention(nn.Module):
         attended = apply_partial_rotary(
             attended, cos_h, sin_h, rope_dim=self.qk_rope_head_dim, inverse=True
         )
-        return attended.reshape(1, self.heads_per_rank * self.head_dim)
+        return attended.reshape(1, self.heads_per_rank * self.head_dim), updated_swa_cache
 
     def forward(
         self,
@@ -765,19 +813,21 @@ class DeepseekV4Attention(nn.Module):
         # `position_ids` directly instead -- see
         # docs/model-dev/deepseek-v4-swa-null-block-bug.md.
         attended_rows = []
+        swa_cache = self.swa_cache
         for local_index in range(hidden.shape[0]):
-            attended_rows.append(
-                self._forward_one_token(
-                    hidden[local_index : local_index + 1],
-                    self_attn_name=self_attn_name,
-                    attn_metadata=attn_metadata,
-                    request=local_index // tokens_per_request if is_decode else 0,
-                    local_index=local_index,
-                    position_ids=positions[local_index : local_index + 1]
-                    .long()
-                    .view(1, 1),
-                )
+            attended_row, swa_cache = self._forward_one_token(
+                hidden[local_index : local_index + 1],
+                self_attn_name=self_attn_name,
+                attn_metadata=attn_metadata,
+                request=local_index // tokens_per_request if is_decode else 0,
+                local_index=local_index,
+                position_ids=positions[local_index : local_index + 1]
+                .long()
+                .view(1, 1),
+                swa_cache=swa_cache,
             )
+            attended_rows.append(attended_row)
+        self.swa_cache.copy_(swa_cache)
         attended = torch.cat(attended_rows, dim=0)
 
         grouped = attended.reshape(attended.shape[0], self.o_groups, -1)
@@ -1071,6 +1121,11 @@ class DeepseekV4ForCausalLM(nn.Module):
     """Device-shaped DeepSeek-V4: batched, ``attn_metadata``-driven forward."""
 
     is_text_generation_model = True
+    # Functional cache updates return whole tensor views from captured graphs.
+    # Those outputs cannot safely alias the heterogeneous BF16/FP32 byte pools
+    # that vLLM normally shares across cache groups: Neuron's alias rewrite
+    # would let the final whole-view output overwrite the preceding groups.
+    requires_independent_kv_cache_tensors = True
 
     def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
@@ -1302,7 +1357,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         # scenario only -- see the docstring above).
         self.to_empty(device=device)
         for module in self.modules():
-            if isinstance(module, DeepseekV4MoE):
+            if isinstance(
+                module,
+                (
+                    DeepseekV4MoE,
+                    DeepseekV4Attention,
+                    NeuronDeepseekV4RotaryEmbedding,
+                ),
+            ):
                 module.reinitialize_deterministic_buffers()
         if not files:
             return

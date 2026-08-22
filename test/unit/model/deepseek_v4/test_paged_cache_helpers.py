@@ -14,6 +14,7 @@ torch = pytest.importorskip("torch")
 from vllm_neuron.model.deepseek_v4.attention import (
     compressed_entry_slot_mapping,
     gather_paged_latent,
+    gather_recent_window,
     scatter_paged_latent,
 )
 from vllm_neuron.model.deepseek_v4.compressor import (
@@ -44,6 +45,54 @@ def test_scatter_paged_latent_round_trips_with_gather():
     block_table = torch.arange(3, dtype=torch.long)
     gathered = gather_paged_latent(cache, block_table, 5).squeeze(1)
     torch.testing.assert_close(gathered, values)
+
+
+def test_scatter_paged_latent_all_padding_is_noop():
+    cache = torch.randn(2, 1, 4, 3)
+    before = cache.clone()
+    scatter_paged_latent(cache, torch.full((5,), -1), torch.randn(5, 3))
+    torch.testing.assert_close(cache, before, rtol=0, atol=0)
+
+
+def test_scatter_padding_scratch_cannot_clobber_real_slot_zero():
+    cache = torch.randn(2, 1, 4, 3)
+    before = cache.clone()
+    value = torch.tensor([7.0, 8.0, 9.0])
+    scatter_paged_latent(
+        cache,
+        torch.tensor([-1, 0, -1, -1]),
+        torch.stack((torch.randn(3), value, torch.randn(3), torch.randn(3))),
+    )
+    torch.testing.assert_close(cache[0, 0, 0], value, rtol=0, atol=0)
+    torch.testing.assert_close(cache.reshape(-1, 3)[1:], before.reshape(-1, 3)[1:])
+
+
+def test_scatter_rejects_positive_out_of_range_slot_eagerly():
+    with pytest.raises(ValueError, match="out-of-range positive slot"):
+        scatter_paged_latent(
+            torch.zeros(1, 1, 2, 3), torch.tensor([2]), torch.ones(1, 3)
+        )
+
+
+def test_gathers_clamp_invalid_storage_and_propagate_validity():
+    cache = torch.arange(8, dtype=torch.float32).reshape(2, 1, 2, 2)
+    table = torch.tensor([0, -1, 8])
+    gathered, valid = gather_paged_latent(
+        cache, table, 7, return_validity=True
+    )
+    assert valid.tolist() == [True, True, False, False, False, False, False]
+    assert torch.equal(gathered[~valid], torch.zeros_like(gathered[~valid]))
+
+
+@pytest.mark.parametrize("end", [-2, 1, 20])
+def test_recent_window_is_bounds_safe_for_leading_and_over_capacity_rows(end):
+    cache = torch.randn(2, 1, 2, 3)
+    gathered, valid = gather_recent_window(
+        cache, torch.tensor([0, 1]), 5, torch.tensor(end)
+    )
+    assert gathered.shape == (5, 1, 3)
+    assert valid.shape == (5,)
+    assert torch.equal(gathered[~valid], torch.zeros_like(gathered[~valid]))
 
 
 def test_gather_paged_latent_reads_stale_columns_once_swa_window_has_advanced():

@@ -16,7 +16,12 @@ pytest.importorskip("transformers")
 
 from transformers import DeepseekV4Config
 
-from vllm_neuron.model.deepseek_v4.model import DeepseekV4ForCausalLM
+from vllm_neuron.model.deepseek_v4.model import (
+    DeepseekV4Attention,
+    DeepseekV4ForCausalLM,
+    DeepseekV4MoE,
+    NeuronDeepseekV4RotaryEmbedding,
+)
 from vllm_neuron.model.deepseek_v4.weight_loaders import load_checkpoint_weights
 from vllm_neuron.model.kv_cache import CacheKind
 
@@ -118,6 +123,60 @@ def test_hf_config_builds_device_shaped_multi_variant_model():
     ]
     assert "model.embed_tokens.weight" in dict(model.named_parameters())
     assert "lm_head.weight" in dict(model.named_parameters())
+
+
+def test_load_weights_restores_nonpersistent_buffers_after_meta_materialization(
+    tmp_path,
+):
+    """HF checkpoints omit derived buffers, so load must rebuild them."""
+    reference = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    with torch.device("meta"):
+        materialized = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+
+    # An empty directory exercises materialization without masking the result
+    # by loading parameters. The deterministic buffers must still be valid.
+    materialized.load_weights(str(tmp_path), torch.device("cpu"), None)
+
+    reference_attention = [
+        module
+        for module in reference.modules()
+        if isinstance(module, DeepseekV4Attention)
+    ]
+    materialized_attention = [
+        module
+        for module in materialized.modules()
+        if isinstance(module, DeepseekV4Attention)
+    ]
+    for expected, actual in zip(reference_attention, materialized_attention):
+        torch.testing.assert_close(actual.identity_kv_weight, expected.identity_kv_weight)
+
+    expected_rope = next(
+        module
+        for module in reference.modules()
+        if isinstance(module, NeuronDeepseekV4RotaryEmbedding)
+    )
+    actual_rope = next(
+        module
+        for module in materialized.modules()
+        if isinstance(module, NeuronDeepseekV4RotaryEmbedding)
+    )
+    for layer_type in expected_rope.layer_types:
+        torch.testing.assert_close(
+            getattr(actual_rope, f"{layer_type}_inv_freq"),
+            getattr(expected_rope, f"{layer_type}_inv_freq"),
+        )
+
+    expected_moe = next(
+        module
+        for module in reference.modules()
+        if isinstance(module, DeepseekV4MoE)
+    )
+    actual_moe = next(
+        module
+        for module in materialized.modules()
+        if isinstance(module, DeepseekV4MoE)
+    )
+    torch.testing.assert_close(actual_moe.tid2eid, expected_moe.tid2eid)
 
 
 def test_device_model_declares_exact_heterogeneous_cache_inventory():
