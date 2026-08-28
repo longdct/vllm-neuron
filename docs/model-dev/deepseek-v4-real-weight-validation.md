@@ -251,6 +251,68 @@ investigation (a per-token RMS reduction) was **wrong**, and one 1.5-second
 compile that returned the intermediates settled it. Localize by measuring
 intermediates, not by reasoning about which op looks riskiest.
 
+## Batched-attention Trn2 result (2026-08-25)
+
+The packed prefill/decode implementation was validated with the official-weight
+slice at `/home/ssm-user/ds-v4-tiny-real` on a `trn2.3xlarge` (LNC2), using
+NeuronX Compiler `2.27.5334.0+f702b353`. The slice is BF16, 7.3 GB, and contains
+one sliding, one ratio-4 CSA/indexer, and one ratio-128 HCA layer.
+
+- Prefill-8, prefill-16, and decode `(batch=1, context=16)` all extracted,
+  compiled, warmed, and executed successfully.
+- Weight loading took 4.54 seconds and used 7.43 GiB of Neuron HBM.
+- Engine initialization took 2,311.60 seconds, including 2,308.50 seconds of
+  compilation. This is a correctness pass, not yet a compile-time success.
+- Prompt `1,2,3,4,5,6,7,8`, greedy decode for four tokens, produced
+  `[2030, 32974, 63376, 76010]`.
+- Transformers' official `DeepseekV4ForCausalLM`, loaded from the same sliced
+  official tensors through `tools/deepseek_v4/hf_reference.py` and run in BF16,
+  produced the identical four-token sequence. Its selected-token logits were
+  `22.75`, `17.0`, `15.0625`, and `15.875`; top-1 margins were `1.625`, `0.375`,
+  `2.0625`, and `1.6875`, respectively. Thus greedy token agreement is 4/4.
+- The same weights on the portable path gave bit-identical final logits and all
+  cache groups for one-shot 8-token prefill versus a `3+5` partition.
+
+The device invocation required the compiler venv on `PATH`,
+`NEURON_VISIBLE_DEVICES=0`, and `NEURON_SKIP_EFA_AFFINITY=1`. Do not set
+`NEURON_RT_VISIBLE_CORES` for the vLLM multiprocessing worker.
+
+### Accepted portable graph-reduction run
+
+The portable de-duplication stage was then run cold with a new isolated cache,
+`/tmp/dsv4-compile-opt-20260825c`, using the same official slice, compiler,
+LNC2 target, BF16 dtype, `-O1`, buckets `[8,16]`, and 32 cache blocks.
+
+- The MoE graph aggregates all six selected ids/weights into dense affinities
+  and evaluates each local expert once. Duplicate ids add their affinities.
+- Shared-latent MLA computes scores and value reduction directly, without the
+  identity K/V projection einsums.
+- Cache writes use bounded indexed updates with a discarded scratch row for
+  negative and positive out-of-range sentinels.
+- Prefill-8, prefill-16, and decode `(batch=1, context=16)` all extracted,
+  compiled, warmed, and executed on Trn2.
+- Engine compilation was **472.80 seconds** and the full profile/cache/warmup
+  phase was **475.79 seconds**, down 79.5% from the 2,308.50-second baseline.
+  This clears the 900-second total gate; the entire cold phase is also below
+  the 600-second per-target ceiling.
+- The three model NEFFs were 15,613,763, 14,059,647, and 11,835,132 bytes.
+  The complete rank-local cache (including small auxiliary kernels and HLOs)
+  was 42 MiB.
+- Weight loading took 3.94 seconds and HBM remained 7.43 GiB.
+- The required greedy output remained exactly
+  `[2030, 32974, 63376, 76010]`.
+- A warm relaunch against the same cache completed its compile/extract/warmup
+  phase in 38.63 seconds and produced the same four tokens; generation after
+  initialization took about 0.20 seconds.
+- The focused portable suites completed with 75 passing tests, including the
+  Transformers routing oracle, model assembly/chunk invariance, cache safety,
+  duplicate routing ids, and direct shared-latent/oracle equivalence.
+
+Because the portable stage already cleared both compilation gates with the
+required device output, NKI MoE/MLA and decoder-layer partitioning were not
+enabled in the accepted configuration. They remain optional runtime follow-up
+work rather than a prerequisite for this compile-time target.
+
 ## Reproducing
 
 Build the slice from official shards, then compare CPU against the reference:

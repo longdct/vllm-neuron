@@ -51,15 +51,10 @@ def load_mhc(path: Path):
 
 
 def resolve_stack() -> tuple[str, str, str]:
-    """Return (label, device, dynamo backend) for whichever stack is installed."""
-    try:
-        import torch_neuronx  # noqa: F401  -- registers the PrivateUse1 'neuron' device
-        return f"torch-neuronx dev {torch_neuronx.__version__}", "neuron:0", "neuron"
-    except ImportError:
-        pass
-    import vllm_neuron  # noqa: F401  -- registers the dynamo backends
-    from vllm_neuron.envs import get_compile_backend_name
-    return "vllm-neuron released (torch-xla)", "neuron:0", get_compile_backend_name()
+    """Return (label, device, backend) for TorchNeuron Native."""
+    import torch_neuronx
+
+    return f"torch-neuronx {torch_neuronx.__version__}", "neuron:0", "neuron"
 
 
 class Gate(torch.nn.Module):

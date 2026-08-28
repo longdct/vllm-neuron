@@ -94,9 +94,7 @@ def test_indexer_tensors_map_onto_plugin_parameters(source, expected):
 
 
 @pytest.mark.parametrize("leaf,shard", [("wkv", 0), ("wgate", 1)])
-def test_indexer_compressor_projections_fuse_separately_from_the_outer_one(
-    leaf, shard
-):
+def test_indexer_compressor_projections_fuse_separately_from_the_outer_one(leaf, shard):
     """The indexer's compressor and the layer's own must not collide.
 
     Both are ``DeepseekV4Compressor``s with a ``fused_wkv_wgate``, distinguished
@@ -172,20 +170,60 @@ def test_attention_weights_are_plain_renames_not_stacked_shards():
         assert resolve_stacked_shard(map_checkpoint_name(source)) is None
 
 
-def test_routed_expert_weights_stack_per_expert():
-    """Each routed expert owns a ``gate_up_proj`` holding its own w1/w3 pair, so
-    expert tensors stack exactly like the shared expert's -- they are not a
-    grouped tensor addressed by expert id, and must not be skipped."""
+def test_routed_expert_weights_target_persistent_grouped_tensors():
     assert resolve_stacked_shard(
         map_checkpoint_name("layers.1.ffn.experts.2.w1.weight")
-    ) == StackedShard("model.layers.1.moe.experts.2.gate_up_proj", 0)
+    ) == StackedShard("model.layers.1.moe.routed_gate_up", 0, 2, True)
     assert resolve_stacked_shard(
         map_checkpoint_name("layers.1.ffn.experts.2.w3.weight")
-    ) == StackedShard("model.layers.1.moe.experts.2.gate_up_proj", 1)
-    # w2 is a plain rename onto its own parameter, not a shard.
+    ) == StackedShard("model.layers.1.moe.routed_gate_up", 1, 2, True)
     mapped = map_checkpoint_name("layers.1.ffn.experts.2.w2.weight")
-    assert mapped == "model.layers.1.moe.experts.2.down_proj"
-    assert resolve_stacked_shard(mapped) is None
+    assert resolve_stacked_shard(mapped) == StackedShard(
+        "model.layers.1.moe.routed_down", 0, 2, True
+    )
+
+
+def test_loader_transposes_official_routed_experts_into_grouped_storage():
+    class Grouped(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.routed_gate_up = torch.nn.Parameter(torch.zeros(3, 4, 2, 5))
+            self.routed_down = torch.nn.Parameter(torch.zeros(3, 5, 4))
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe = Grouped()
+
+    class Inner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([Layer()])
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Inner()
+
+    model = Model()
+    w1 = torch.arange(20.0).view(5, 4)
+    w3 = w1 + 100
+    w2 = torch.arange(20.0).view(4, 5) + 200
+    loaded = load_checkpoint_weights(
+        model,
+        [
+            ("layers.0.ffn.experts.2.w1.weight", w1),
+            ("layers.0.ffn.experts.2.w3.weight", w3),
+            ("layers.0.ffn.experts.2.w2.weight", w2),
+        ],
+    )
+    assert loaded == {
+        "model.layers.0.moe.routed_gate_up",
+        "model.layers.0.moe.routed_down",
+    }
+    torch.testing.assert_close(model.model.layers[0].moe.routed_gate_up[2, :, 0], w1.T)
+    torch.testing.assert_close(model.model.layers[0].moe.routed_gate_up[2, :, 1], w3.T)
+    torch.testing.assert_close(model.model.layers[0].moe.routed_down[2], w2.T)
 
 
 def test_shape_drift_fails_before_copy():

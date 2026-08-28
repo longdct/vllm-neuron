@@ -17,6 +17,8 @@ class StackedShard:
 
     parameter_name: str
     shard_id: int
+    expert_id: int | None = None
+    transpose: bool = False
 
 
 _STACKED_COMPONENTS = (
@@ -65,6 +67,7 @@ _ATTENTION_RENAMES = (
     # is wanted -- they are the same class.
     (".compressor.norm.weight", ".compressor.norm_weight"),
 )
+
 
 def _stack_width(parameter_name: str) -> int:
     """How many checkpoint tensors fuse into *parameter_name*."""
@@ -178,7 +181,7 @@ def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
 
     # ``w2`` is the down projection for both the shared expert and each routed
     # one; ``w1``/``w3`` are stacked later by resolve_stacked_shard.
-    mapped = re.sub(r"(\.(?:shared_experts|experts\.\d+))\.w2", r"\1.down_proj", mapped)
+    mapped = mapped.replace(".shared_experts.w2", ".shared_experts.down_proj")
     for source, target in _ATTENTION_RENAMES:
         mapped = mapped.replace(source, target)
     for source, target in _MHC_RENAMES:
@@ -186,7 +189,9 @@ def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
     for source, target in _CONTAINER_RENAMES:
         mapped = mapped.replace(source, target)
     if mapped.endswith(".scale"):
-        if expert_dtype == "fp4" and re.search(r"\.experts\.\d+\.w[123]\.scale$", mapped):
+        if expert_dtype == "fp4" and re.search(
+            r"\.experts\.\d+\.w[123]\.scale$", mapped
+        ):
             mapped = mapped[: -len(".scale")] + ".weight_scale"
         else:
             mapped = mapped[: -len(".scale")] + ".weight_scale_inv"
@@ -235,6 +240,19 @@ def resolve_stacked_shard(mapped_name: str) -> StackedShard | None:
     expert its own ``gate_up_proj`` parameter holding the ``w1``/``w3``
     concatenation, rather than a single grouped tensor addressed by expert id.
     """
+    routed = re.search(
+        r"^(.*\.moe)\.experts\.(\d+)\.w([123])(?:\.weight)?$", mapped_name
+    )
+    if routed:
+        prefix, expert, component = routed.groups()
+        if component == "2":
+            return StackedShard(f"{prefix}.routed_down", 0, int(expert), transpose=True)
+        return StackedShard(
+            f"{prefix}.routed_gate_up",
+            0 if component == "1" else 1,
+            int(expert),
+            transpose=True,
+        )
     for source, target, shard_id in _STACKED_COMPONENTS:
         if source in mapped_name:
             return StackedShard(mapped_name.replace(source, target), shard_id)
@@ -281,6 +299,7 @@ def load_checkpoint_weights(
     # registered buffer, and a checkpoint that provides one must be able to
     # override the config-derived default rather than silently keeping it.
     params = {**dict(module.named_parameters()), **dict(module.named_buffers())}
+    modules = dict(module.named_modules())
     loaded_params: set[str] = set()
     loaded_destinations: set[tuple[str, int | None]] = set()
     source_names: set[str] = set()
@@ -294,8 +313,19 @@ def load_checkpoint_weights(
         mapped_name = map_checkpoint_name(source_name, expert_dtype)
         stacked = resolve_stacked_shard(mapped_name)
         target_name = stacked.parameter_name if stacked else mapped_name
+        if stacked is not None and stacked.expert_id is not None:
+            owner_name = target_name.rsplit(".", 1)[0]
+            owner = modules.get(owner_name)
+            local_start = int(getattr(owner, "local_start", 0))
+            local_end = int(
+                getattr(owner, "local_end", local_start + params[target_name].shape[0])
+            )
+            # Non-local experts are intentionally absent from this rank.  Skip
+            # before touching the tensor payload in streaming callers.
+            if not local_start <= stacked.expert_id < local_end:
+                continue
         shard_id = stacked.shard_id if stacked else None
-        destination = (target_name, shard_id)
+        destination = (target_name, shard_id, stacked.expert_id if stacked else None)
         if destination in loaded_destinations:
             raise ValueError(
                 f"multiple DeepSeek-V4 weights map to destination {destination!r}"
@@ -310,8 +340,62 @@ def load_checkpoint_weights(
         weight_loader = getattr(parameter, "weight_loader", None)
         with torch.no_grad():
             if stacked is not None:
-                if weight_loader is not None:
-                    weight_loader(parameter, loaded_weight, shard_id)
+                if stacked.expert_id is not None:
+                    owner = modules.get(target_name.rsplit(".", 1)[0])
+                    local_start = int(getattr(owner, "local_start", 0))
+                    expert_id = stacked.expert_id - local_start
+                    if expert_id < 0 or expert_id >= parameter.shape[0]:
+                        raise ValueError(
+                            f"routed expert {expert_id} is outside {target_name!r}"
+                        )
+                    target = (
+                        parameter[expert_id, :, stacked.shard_id, :]
+                        if target_name.endswith("routed_gate_up")
+                        else parameter[expert_id]
+                    )
+                    source = (
+                        loaded_weight.transpose(0, 1)
+                        if stacked.transpose
+                        else loaded_weight
+                    )
+                    expert_tp_degree = int(getattr(owner, "expert_tp_degree", 1))
+                    expert_tp_rank = int(getattr(owner, "expert_tp_rank", 0))
+                    if expert_tp_degree > 1:
+                        shard_dim = 1 if target_name.endswith("routed_gate_up") else 0
+                        shard_size = source.shape[shard_dim] // expert_tp_degree
+                        source = source.narrow(
+                            shard_dim, expert_tp_rank * shard_size, shard_size
+                        )
+                    require_weight_shape(
+                        source_name, tuple(source.shape), tuple(target.shape)
+                    )
+                    _copy_into(target, source)
+                elif weight_loader is not None:
+                    if hasattr(weight_loader, "load"):
+
+                        class _TensorSlice:
+                            def __init__(self, tensor):
+                                self.tensor = tensor
+
+                            def get_shape(self):
+                                return tuple(self.tensor.shape)
+
+                            def __getitem__(self, index):
+                                return self.tensor[index]
+
+                        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                        transformed = weight_loader.load([_TensorSlice(loaded_weight)], rank)
+                        width = _stack_width(target_name)
+                        chunk = parameter.shape[0] // width
+                        require_weight_shape(
+                            source_name, tuple(transformed.shape), (chunk, *parameter.shape[1:])
+                        )
+                        _copy_into(
+                            parameter[shard_id * chunk : (shard_id + 1) * chunk],
+                            transformed,
+                        )
+                    else:
+                        weight_loader(parameter, loaded_weight, shard_id)
                 else:
                     # No shard loader: place the shard directly. A fused
                     # parameter is its shards concatenated on dim 0 in shard-id
@@ -329,17 +413,25 @@ def load_checkpoint_weights(
                             f"{parameter.shape[0]} rows, not divisible into "
                             f"{width} shards"
                         )
+                    owner = modules.get(target_name.rsplit(".", 1)[0])
+                    tp_degree = int(getattr(owner, "tp_degree", 1))
+                    tp_rank = int(getattr(owner, "tp_rank", 0))
+                    source = loaded_weight
+                    if tp_degree > 1 and target_name.endswith("shared_experts.gate_up_proj"):
+                        shard_size = source.shape[0] // tp_degree
+                        source = source.narrow(0, tp_rank * shard_size, shard_size)
                     require_weight_shape(
                         source_name,
-                        tuple(loaded_weight.shape),
+                        tuple(source.shape),
                         (chunk, *tuple(parameter.shape[1:])),
                     )
                     _copy_into(
                         parameter[shard_id * chunk : (shard_id + 1) * chunk],
-                        loaded_weight,
+                        source,
                     )
             elif weight_loader is not None:
                 if hasattr(weight_loader, "load"):
+
                     class _TensorSlice:
                         def __init__(self, tensor):
                             self.tensor = tensor

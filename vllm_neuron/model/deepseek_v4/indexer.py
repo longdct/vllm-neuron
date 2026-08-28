@@ -34,13 +34,102 @@ compared against the Transformers reference directly.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 __all__ = [
     "lightning_index_scores",
     "select_compressed_entries",
     "selection_mask_from_indices",
+    "IndexerSelection",
+    "streaming_topk_compressed_entries",
 ]
+
+
+@dataclass(frozen=True)
+class IndexerSelection:
+    """Bounded CSA selection passed from the indexer to MLA.
+
+    Logical indices are in compressed-sequence order.  Invalid/padded entries
+    are represented by both ``valid=False`` and ``logical_indices=-1``.
+    """
+
+    logical_indices: torch.Tensor
+    valid: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.logical_indices.dtype != torch.int32:
+            raise ValueError("indexer logical indices must be int32")
+        if (
+            self.valid.dtype != torch.bool
+            or self.valid.shape != self.logical_indices.shape
+        ):
+            raise ValueError("indexer validity must be bool and match logical indices")
+
+
+def streaming_topk_compressed_entries(
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    gate: torch.Tensor,
+    visible: torch.Tensor,
+    *,
+    topk: int = 512,
+    page_size: int = 512,
+    key_valid: torch.Tensor | None = None,
+) -> IndexerSelection:
+    """Portable page/merge oracle for the bounded CSA indexer kernel.
+
+    Only the current page and the running ``topk`` candidates are live.  This
+    deliberately mirrors the NKI algorithm and never materializes a second
+    query-by-capacity tensor in addition to the caller-provided key oracle.
+    """
+    if query.ndim != 4:
+        raise ValueError("streamed indexer query must have shape [B,Q,H,D]")
+    if keys.ndim != 3 or keys.shape[0] != query.shape[0]:
+        raise ValueError("streamed indexer keys must have shape [B,S,D]")
+    if gate.shape != query.shape[:-1]:
+        raise ValueError("streamed indexer gate must have shape [B,Q,H]")
+    if visible.shape != query.shape[:2]:
+        raise ValueError("visible must have shape [B,Q]")
+    if key_valid is not None and key_valid.shape != keys.shape[:2]:
+        raise ValueError("key_valid must have shape [B,S]")
+    if topk < 1 or page_size < 1:
+        raise ValueError("topk and page_size must be positive")
+
+    batch, q_count, entries = query.shape[0], query.shape[1], keys.shape[1]
+    width = min(topk, max(entries, 1))
+    running_scores = torch.full(
+        (batch, q_count, width),
+        float("-inf"),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    running_indices = torch.full(
+        (batch, q_count, width), -1, dtype=torch.int64, device=query.device
+    )
+    for start in range(0, entries, page_size):
+        end = min(start + page_size, entries)
+        page_scores = lightning_index_scores(query, keys[:, start:end], gate)
+        page_indices = torch.arange(start, end, device=query.device).view(1, 1, -1)
+        page_indices = page_indices.expand(batch, q_count, -1)
+        page_valid = page_indices < visible[:, :, None]
+        if key_valid is not None:
+            page_valid &= key_valid[:, None, start:end]
+        page_scores = page_scores.masked_fill(~page_valid, float("-inf"))
+        merged_scores = torch.cat((running_scores, page_scores), dim=-1)
+        merged_indices = torch.cat((running_indices, page_indices), dim=-1)
+        take = min(width, merged_scores.shape[-1])
+        running_scores, offsets = torch.topk(merged_scores, take, dim=-1)
+        running_indices = merged_indices.gather(-1, offsets)
+
+    valid = torch.isfinite(running_scores) & (running_indices >= 0)
+    logical = torch.where(valid, running_indices, torch.full_like(running_indices, -1))
+    # topk is descending, therefore finite candidates are prefix packed.
+    return IndexerSelection(
+        logical.reshape(batch * q_count, width).to(torch.int32),
+        valid.reshape(batch * q_count, width),
+    )
 
 
 def lightning_index_scores(

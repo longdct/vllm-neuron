@@ -23,7 +23,13 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from vllm_neuron.model.deepseek_v4.attention import P2_REPRESENTATIVE_BUCKETS
-from libtorch_neuronx_lite.nki.nki_compile import compile_nki
+
+
+def compile_nki(*args, **kwargs):
+    raise RuntimeError(
+        "Standalone lite NKI compilation was removed. Compile this kernel "
+        "through torch_neuronx.nki_hop inside backend='neuron'."
+    )
 
 
 def version(command: list[str]) -> str:

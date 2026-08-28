@@ -9,6 +9,149 @@ from dataclasses import dataclass
 import torch
 
 
+@dataclass(frozen=True)
+class SharedLatentAttentionContract:
+    """Static input contract shared by the portable and opaque MLA paths.
+
+    ``key_indices`` are physical flattened cache slots, never logical sequence
+    positions. Their second dimension is the selected history bound, so no
+    query-by-configured-capacity tensor is part of this interface.
+    """
+
+    query: torch.Tensor
+    paged_latent_cache: torch.Tensor
+    key_indices: torch.Tensor
+    visibility: torch.Tensor
+    sinks: torch.Tensor
+
+
+@dataclass(frozen=True)
+class SharedLatentMLAInputs:
+    """Bounded physical-address inputs for the opaque shared-latent kernel."""
+
+    query: torch.Tensor
+    sliding_cache: torch.Tensor
+    sliding_slots: torch.Tensor
+    sliding_valid: torch.Tensor
+    compressed_cache: torch.Tensor | None
+    compressed_slots: torch.Tensor | None
+    compressed_valid: torch.Tensor | None
+    sinks: torch.Tensor
+
+
+def logical_to_physical_slots_batched(
+    logical_indices: torch.Tensor,
+    valid: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_to_request: torch.Tensor,
+    *,
+    logical_slots_per_block: int,
+    physical_page_stride: int,
+    cache_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and map bounded logical positions into flattened cache slots."""
+    if logical_indices.ndim != 2 or valid.shape != logical_indices.shape:
+        raise ValueError("logical_indices and valid must have shape [queries,keys]")
+    if block_tables.ndim != 2 or token_to_request.shape != logical_indices.shape[:1]:
+        raise ValueError("block tables must be 2-D with one request id per query")
+    if logical_slots_per_block < 1 or physical_page_stride < logical_slots_per_block:
+        raise ValueError("logical page geometry must fit the physical page stride")
+    if cache_blocks < 1 or block_tables.shape[0] < 1 or block_tables.shape[1] < 1:
+        raise ValueError("cache and block tables must contain storage")
+
+    logical = logical_indices.long()
+    requests = token_to_request.long()
+    columns = torch.div(
+        logical.clamp(min=0), logical_slots_per_block, rounding_mode="floor"
+    )
+    offsets = logical.clamp(min=0) % logical_slots_per_block
+    address_valid = valid & (logical >= 0)
+    address_valid &= (requests[:, None] >= 0) & (
+        requests[:, None] < block_tables.shape[0]
+    )
+    address_valid &= columns < block_tables.shape[1]
+    safe_requests = requests.clamp(0, block_tables.shape[0] - 1)
+    safe_columns = columns.clamp(0, block_tables.shape[1] - 1)
+    blocks = block_tables[safe_requests[:, None], safe_columns].long()
+    address_valid &= (blocks >= 0) & (blocks < cache_blocks)
+    slots = blocks.clamp(0, cache_blocks - 1) * physical_page_stride + offsets
+    return torch.where(address_valid, slots, torch.full_like(slots, -1)), address_valid
+
+
+def recent_compressed_logical_indices(
+    positions: torch.Tensor,
+    *,
+    compress_ratio: int,
+    count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a fixed-width suffix of visible compressed logical positions.
+
+    Rows are prefix packed: when fewer than ``count`` entries exist, real
+    logical positions come first and ``-1`` padding follows. This is the HCA
+    selection rule; CSA uses its learned :class:`IndexerSelection` instead.
+    """
+    if positions.ndim != 1:
+        raise ValueError("positions must be one-dimensional")
+    if compress_ratio < 1 or count < 1:
+        raise ValueError("compress_ratio and count must be positive")
+    visible = visible_compressed_entries(positions.long(), compress_ratio)
+    used = visible.clamp(min=0, max=count)
+    offsets = torch.arange(count, device=positions.device)[None, :]
+    start = (visible - used)[:, None]
+    logical = start + offsets
+    valid = offsets < used[:, None]
+    return torch.where(valid, logical, torch.full_like(logical, -1)).to(
+        torch.int32
+    ), valid
+
+
+def recent_sliding_logical_indices(
+    positions: torch.Tensor, *, count: int = 128
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build exactly ``count`` recent raw logical positions per query."""
+    if positions.ndim != 1 or count < 1:
+        raise ValueError("positions must be one-dimensional and count must be positive")
+    offsets = torch.arange(count, device=positions.device)[None, :]
+    logical = positions.long()[:, None] + 1 - count + offsets
+    valid = logical >= 0
+    return torch.where(valid, logical, torch.full_like(logical, -1)).to(
+        torch.int32
+    ), valid
+
+
+def gather_bounded_paged_latent(
+    cache: torch.Tensor,
+    key_indices: torch.Tensor,
+    visibility: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only explicitly selected physical slots from a paged cache."""
+    if cache.ndim != 4 or cache.shape[1] != 1:
+        raise ValueError("latent cache must have shape [blocks,1,block,latent]")
+    if key_indices.ndim != 2 or visibility.shape != key_indices.shape:
+        raise ValueError("key_indices and visibility must have shape [queries,keys]")
+    capacity = cache.shape[0] * cache.shape[2]
+    valid = visibility & (key_indices >= 0) & (key_indices < capacity)
+    safe = key_indices.clamp(min=0, max=capacity - 1).long()
+    flat = cache[:, 0].reshape(capacity, cache.shape[-1])
+    values = flat[safe]
+    return torch.where(valid[..., None], values, torch.zeros_like(values)), valid
+
+
+def shared_latent_attention_contract_reference(
+    contract: SharedLatentAttentionContract,
+) -> torch.Tensor:
+    """CPU oracle for the bounded paged-cache attention contract."""
+    latent, valid = gather_bounded_paged_latent(
+        contract.paged_latent_cache, contract.key_indices, contract.visibility
+    )
+    return shared_latent_attention(
+        contract.query,
+        latent,
+        visibility=valid,
+        attention_sinks=contract.sinks,
+    )
+
+
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """Apply interleaved rotary embedding to the last dimension."""
     if x.shape[-1] % 2:
@@ -34,9 +177,7 @@ def apply_partial_rotary(
     if inverse:
         sin = -sin
     rotated = apply_rotary(rotary, cos, sin)
-    rotary_indices = torch.arange(
-        x.shape[-1] - rope_dim, x.shape[-1], device=x.device
-    )
+    rotary_indices = torch.arange(x.shape[-1] - rope_dim, x.shape[-1], device=x.device)
     # A functional overwrite avoids Neuron lowering the small rotated suffix
     # as a dead/zero concat operand (observed for rank-4 query tensors with a
     # two-channel rotary suffix).  The indices and output shape are entirely
@@ -80,9 +221,13 @@ def gather_paged_latent(
         validity = torch.zeros(0, dtype=torch.bool, device=cache.device)
         return (empty, validity) if return_validity else empty
     physical_stride = cache.shape[2]
-    slots_per_block = physical_stride if logical_slots_per_block is None else logical_slots_per_block
+    slots_per_block = (
+        physical_stride if logical_slots_per_block is None else logical_slots_per_block
+    )
     if slots_per_block < 1 or slots_per_block > physical_stride:
-        raise ValueError("logical_slots_per_block must fit within the physical page stride")
+        raise ValueError(
+            "logical_slots_per_block must fit within the physical page stride"
+        )
     if block_table.numel() == 0 or cache.shape[0] == 0:
         raise ValueError("cache and block table must contain storage")
     positions = start_token + torch.arange(sequence_length, device=block_table.device)
@@ -139,7 +284,9 @@ def gather_recent_window(
         raise ValueError("window must be positive")
     slots_per_block = cache.shape[2]
     start = end_position.view(()).long() + (1 - window)
-    positions = start + torch.arange(window, device=block_table.device, dtype=start.dtype)
+    positions = start + torch.arange(
+        window, device=block_table.device, dtype=start.dtype
+    )
     valid = positions >= 0
     positions = positions.clamp(min=0)
     columns = torch.div(positions, slots_per_block, rounding_mode="floor")
@@ -155,6 +302,82 @@ def gather_recent_window(
     gathered = cache[blocks, :, slot_offsets, :]
     gathered = torch.where(valid[:, None, None], gathered, torch.zeros_like(gathered))
     return gathered, valid
+
+
+def gather_recent_window_batched(
+    cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_to_request: torch.Tensor,
+    window: int,
+    end_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather a fixed recent window for every packed query without loops.
+
+    Returns ``[T,window,heads,latent]`` and ``[T,window]``.  Request ownership
+    is explicit so unequal packed request lengths and mixed decode positions
+    are handled correctly.
+    """
+    if cache.ndim != 4 or block_tables.ndim != 2:
+        raise ValueError("cache must be 4-D and block_tables must be 2-D")
+    if token_to_request.ndim != 1 or end_positions.numel() != token_to_request.numel():
+        raise ValueError("one request id and end position are required per token")
+    if window < 1:
+        raise ValueError("window must be positive")
+    requests = token_to_request.long()
+    ends = end_positions.reshape(-1).long()
+    positions = (
+        ends[:, None]
+        + 1
+        - window
+        + torch.arange(window, device=ends.device, dtype=ends.dtype)[None, :]
+    )
+    valid = positions >= 0
+    safe_positions = positions.clamp(min=0)
+    stride = cache.shape[2]
+    columns = torch.div(safe_positions, stride, rounding_mode="floor")
+    valid = (
+        valid & (requests[:, None] >= 0) & (requests[:, None] < block_tables.shape[0])
+    )
+    valid = valid & (columns < block_tables.shape[1])
+    safe_requests = requests.clamp(min=0, max=block_tables.shape[0] - 1)
+    safe_columns = columns.clamp(min=0, max=block_tables.shape[1] - 1)
+    blocks = block_tables[safe_requests[:, None], safe_columns].long()
+    valid = valid & (blocks >= 0) & (blocks < cache.shape[0])
+    values = cache[
+        blocks.clamp(min=0, max=cache.shape[0] - 1),
+        :,
+        safe_positions % stride,
+        :,
+    ]
+    return torch.where(valid[..., None, None], values, torch.zeros_like(values)), valid
+
+
+def read_compressed_history_batched(
+    cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_to_request: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    compress_ratio: int,
+    raw_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather each packed query's fixed-capacity compressed prefix."""
+    logical = raw_block_size // compress_ratio
+    capacity = block_tables.shape[1] * logical
+    requests = token_to_request.long()
+    indices = torch.arange(capacity, device=positions.device)
+    columns = torch.div(indices, logical, rounding_mode="floor")
+    offsets = indices % logical
+    safe_requests = requests.clamp(min=0, max=block_tables.shape[0] - 1)
+    blocks = block_tables[safe_requests[:, None], columns[None, :]].long()
+    valid = (requests[:, None] >= 0) & (requests[:, None] < block_tables.shape[0])
+    valid = valid & (blocks >= 0) & (blocks < cache.shape[0])
+    visible = visible_compressed_entries(positions.reshape(-1).long(), compress_ratio)
+    valid = valid & (indices[None, :] < visible[:, None])
+    values = cache[
+        blocks.clamp(min=0, max=cache.shape[0] - 1), :, offsets[None, :], :
+    ].squeeze(2)
+    return torch.where(valid[..., None], values, torch.zeros_like(values)), valid
 
 
 def scatter_paged_latent(
@@ -183,37 +406,51 @@ def scatter_paged_latent(
     capacity = cache.shape[0] * storage_block_size
     if capacity == 0:
         raise ValueError("cache must contain storage")
-    if not torch.compiler.is_compiling() and (
-        (slot_mapping >= capacity).any()
-    ):
-        raise ValueError("slot_mapping contains an out-of-range positive slot")
     valid = (slot_mapping >= 0) & (slot_mapping < capacity)
-    # Keep every intermediate shape independent of the number of valid rows.
-    # Invalid rows target scratch slot zero but contribute neither an update
-    # nor an update count, so they cannot race with a genuine write to slot 0.
-    safe_slots = torch.where(valid, slot_mapping, torch.zeros_like(slot_mapping)).long()
-    storage_slots = torch.arange(capacity, device=cache.device)
-    if values.shape[0] == 1:
-        update_mask = (storage_slots == safe_slots[0])[:, None] & valid[0]
-        updates = values[0].to(cache.dtype).expand(capacity, -1)
-    else:
-        row_targets = safe_slots[:, None] == storage_slots[None, :]
-        row_targets = row_targets & valid[:, None]
-        flat_counts = row_targets.sum(dim=0, keepdim=False).unsqueeze(-1)
-        flat_updates = (
-            row_targets.to(cache.dtype).transpose(0, 1) @ values.to(cache.dtype)
-        )
-        update_mask = flat_counts > 0
-        # Slot mappings are expected to be unique. Averaging duplicates keeps
-        # the operation deterministic without changing the normal case.
-        updates = flat_updates / flat_counts.clamp(min=1)
     cache_head = cache[:, 0, :, :].reshape(capacity, cache.shape[3])
-    updated_head = torch.where(update_mask, updates, cache_head).reshape(
-        cache.shape[0], storage_block_size, cache.shape[3]
-    )
+    scratch = torch.zeros((1, cache.shape[3]), dtype=cache.dtype, device=cache.device)
+    update_base = torch.cat((cache_head, scratch), dim=0)
+    safe_slots = torch.where(valid, slot_mapping, capacity).long()
+    updated_head = torch.index_copy(update_base, 0, safe_slots, values.to(cache.dtype))[
+        :capacity
+    ].reshape(cache.shape[0], storage_block_size, cache.shape[3])
     updated_cache = updated_head.unsqueeze(1)
     cache.copy_(updated_cache)
     return updated_cache
+
+
+def shared_latent_attention(
+    query: torch.Tensor,
+    latent: torch.Tensor,
+    *,
+    visibility: torch.Tensor | None = None,
+    attention_sinks: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Direct DeepSeek MLA for the K=V=shared-latent specialization."""
+    if query.ndim != 4 or latent.ndim != 3 or query.shape[0] != latent.shape[0]:
+        raise ValueError("query and latent must have shapes [B,T,H,D] and [B,S,D]")
+    if query.shape[-1] != latent.shape[-1]:
+        raise ValueError("shared query/latent dimensions do not agree")
+    scores = torch.einsum("bthd,bsd->bhts", query.float(), latent.float())
+    scores = scores / math.sqrt(query.shape[-1])
+    if visibility is not None:
+        if visibility.shape == (query.shape[0], latent.shape[1]):
+            visibility = visibility[:, None, :]
+        if visibility.shape != (query.shape[0], query.shape[1], latent.shape[1]):
+            raise ValueError("visibility must have shape [B,S] or [B,T,S]")
+        scores = scores.masked_fill(~visibility[:, None], float("-inf"))
+    if attention_sinks is not None:
+        if attention_sinks.shape != (query.shape[2],):
+            raise ValueError("attention_sinks must have shape [num_heads]")
+        sinks = attention_sinks.float()[None, :, None, None].expand(
+            query.shape[0], -1, query.shape[1], 1
+        )
+        weights = torch.softmax(torch.cat((scores, sinks), dim=-1), dim=-1)[
+            ..., : latent.shape[1]
+        ]
+    else:
+        weights = torch.softmax(scores, dim=-1)
+    return torch.einsum("bhts,bsd->bthd", weights, latent.float()).to(query.dtype)
 
 
 def compressed_entry_slot_mapping(
@@ -246,7 +483,9 @@ def compressed_entry_slot_mapping(
         raise ValueError("raw_block_size must be a positive multiple of compress_ratio")
     logical_entries = raw_block_size // compress_ratio
     if physical_page_stride < logical_entries:
-        raise ValueError("physical_page_stride is smaller than the logical compressed page")
+        raise ValueError(
+            "physical_page_stride is smaller than the logical compressed page"
+        )
     safe_raw = raw_slot_mapping.clamp(min=0)
     physical_block = torch.div(safe_raw, raw_block_size, rounding_mode="floor")
     raw_offset = safe_raw % raw_block_size
@@ -354,7 +593,10 @@ class MLABucket:
     head_dim: int = 512
 
     def __post_init__(self) -> None:
-        if min(self.batch_size, self.query_length, self.context_length, self.head_dim) < 1:
+        if (
+            min(self.batch_size, self.query_length, self.context_length, self.head_dim)
+            < 1
+        ):
             raise ValueError("bucket dimensions must be positive")
         if self.head_dim != 512:
             raise ValueError("DeepSeek-V4 MLA buckets require head_dim=512")
@@ -388,7 +630,10 @@ def mla_attention_reference(
     to Q/K after the latent projection. The implementation is deliberately
     straightforward and never used as a production kernel.
 
-    ``key_valid`` (``[S]``, ``causal=True`` only) marks rows of ``latent``
+    ``key_valid`` may be ``[S]``, ``[B,S]``, or ``[B,T,S]`` and marks rows
+    visible to each packed query.  The latter two forms are the production
+    interface: causality is request- and position-dependent and cannot be
+    represented by aligning packed queries with a single flat key sequence.
     that are real content vs. structural padding -- needed once a caller
     supplies a *fixed-size* ``latent`` that can include rows the local
     ``kpos<=qpos`` ordering check alone can't see are invalid (e.g.
@@ -396,7 +641,10 @@ def mla_attention_reference(
     that much history yet). ``None`` (default) applies no extra masking,
     exactly like before this parameter existed.
     """
-    if latent.shape[-1] != key_weight.shape[1] or key_weight.shape[:2] != value_weight.shape[:2]:
+    if (
+        latent.shape[-1] != key_weight.shape[1]
+        or key_weight.shape[:2] != value_weight.shape[:2]
+    ):
         raise ValueError("latent/projection dimensions do not agree")
     q = query.float()
     k = torch.einsum("bsl,hld->bshd", latent.float(), key_weight.float())
@@ -417,10 +665,18 @@ def mla_attention_reference(
         if sliding_window is not None:
             allowed &= kpos > (qpos - sliding_window)
         if key_valid is not None:
-            if key_valid.shape != (s,):
-                raise ValueError("key_valid must have shape [S]")
-            allowed = allowed & key_valid[None, :]
-        scores = scores.masked_fill(~allowed[None, None], float("-inf"))
+            if key_valid.shape == (s,):
+                visibility = key_valid[None, None, :]
+            elif key_valid.shape == (query.shape[0], s):
+                visibility = key_valid[:, None, :]
+            elif key_valid.shape == (query.shape[0], t, s):
+                visibility = key_valid
+            else:
+                raise ValueError("key_valid must have shape [S], [B,S], or [B,T,S]")
+            allowed = allowed[None, :, :] & visibility
+        else:
+            allowed = allowed[None, :, :]
+        scores = scores.masked_fill(~allowed[:, None], float("-inf"))
     elif key_valid is not None:
         raise ValueError("key_valid requires causal=True")
     if attention_sinks is not None:

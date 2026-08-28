@@ -31,20 +31,16 @@ unset VLLM_NEURON_CPU_MODE VLLM_NEURON_CPU_COMPILE
 # (three NEFFs cold, three hits / zero submitted HLOs warm) is defined against
 # the values below it, so this must never change what a plain invocation runs.
 #
-# Compile cost is dominated by a single graph -- prefill at the longest bucket
-# -- because DeepseekV4Attention.forward unrolls one full attention body per
-# token at trace time (55179 FX nodes at length 64 versus 8475 at length 8).
-# Both overrides attack that directly:
+# The accepted compile-time profile uses the portable packed-attention,
+# de-duplicated MoE, direct shared-latent MLA, and indexed cache-update graph.
+# These overrides keep the official acceptance geometry reproducible:
 #
 #   max-model-len 16       fewer unrolled token bodies. Measured 16min -> ~3min
 #                          in docs/model-dev/deepseek-v4-tiny-tp1-neuron-investigation.md,
 #                          which also records that length 16 still reproduced
 #                          the original fourth-token mismatch exactly.
-#   num-gpu-blocks 32      scatter_paged_latent builds a torch.where over the
-#                          whole cache once per token; capacity is
-#                          num_blocks * storage_block_size, so 256 blocks means
-#                          a [32768, latent] intermediate per token for the MLA
-#                          group. 32 is the smallest safe value: the runner logs
+#   num-gpu-blocks 32      32 is the accepted cache geometry and smallest safe
+#                          value: the runner logs
 #                          max_num_blocks_per_req=[1, 2, 2, 2, 8, 16], so the
 #                          override must clear 16 plus a null block. Re-read
 #                          that log line before lowering it further.

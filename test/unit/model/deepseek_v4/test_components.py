@@ -6,16 +6,185 @@ torch = pytest.importorskip("torch")
 
 from vllm_neuron.model.deepseek_v4.attention import (
     P2_REPRESENTATIVE_BUCKETS,
+    SharedLatentAttentionContract,
     apply_partial_rotary,
     compose_swa_and_compressed_history,
     compressed_entry_slot_mapping,
+    gather_bounded_paged_latent,
     gather_paged_latent,
+    logical_to_physical_slots_batched,
     mla_attention_reference,
+    recent_compressed_logical_indices,
+    recent_sliding_logical_indices,
+    shared_latent_attention,
+    shared_latent_attention_contract_reference,
     visible_compressed_entries,
 )
+
+
+def test_recent_sliding_indices_have_exact_width_and_preserve_leading_holes():
+    logical, valid = recent_sliding_logical_indices(torch.tensor([1, 5]), count=4)
+    assert logical.tolist() == [[-1, -1, 0, 1], [2, 3, 4, 5]]
+    assert valid.tolist() == [
+        [False, False, True, True],
+        [True, True, True, True],
+    ]
+
+
+def test_recent_compressed_indices_are_bounded_prefix_packed_suffixes():
+    logical, valid = recent_compressed_logical_indices(
+        torch.tensor([0, 15, 39]), compress_ratio=4, count=4
+    )
+    assert logical.tolist() == [
+        [-1, -1, -1, -1],
+        [0, 1, 2, 3],
+        [6, 7, 8, 9],
+    ]
+    assert valid.tolist() == [
+        [False, False, False, False],
+        [True, True, True, True],
+        [True, True, True, True],
+    ]
+
+
+def test_bounded_logical_mapping_validates_requests_columns_and_blocks():
+    logical = torch.tensor([[0, 3, 4, -1], [1, 8, 2, 7]], dtype=torch.int32)
+    requested = torch.ones_like(logical, dtype=torch.bool)
+    tables = torch.tensor([[2, -1], [1, 99]])
+    slots, valid = logical_to_physical_slots_batched(
+        logical,
+        requested,
+        tables,
+        torch.tensor([0, 1]),
+        logical_slots_per_block=4,
+        physical_page_stride=8,
+        cache_blocks=3,
+    )
+    assert slots.tolist() == [[16, 19, -1, -1], [9, -1, 10, -1]]
+    assert valid.tolist() == [
+        [True, True, False, False],
+        [True, False, True, False],
+    ]
+
+
+def test_bounded_logical_mapping_rejects_invalid_request_ownership():
+    logical = torch.zeros((2, 1), dtype=torch.int32)
+    slots, valid = logical_to_physical_slots_batched(
+        logical,
+        torch.ones_like(logical, dtype=torch.bool),
+        torch.tensor([[0]]),
+        torch.tensor([-1, 1]),
+        logical_slots_per_block=1,
+        physical_page_stride=1,
+        cache_blocks=1,
+    )
+    assert slots.tolist() == [[-1], [-1]]
+    assert not valid.any()
+
+
+def test_bounded_paged_latent_contract_handles_all_sentinels_and_slot_zero():
+    cache = torch.arange(4 * 1 * 2 * 3, dtype=torch.float32).view(4, 1, 2, 3)
+    indices = torch.tensor([[0, -1, 7, 8], [2, 1, 99, 4]])
+    visibility = torch.tensor([[True, True, True, True], [False, True, True, True]])
+    values, valid = gather_bounded_paged_latent(cache, indices, visibility)
+    assert valid.tolist() == [[True, False, True, False], [False, True, False, True]]
+    torch.testing.assert_close(values[0, 0], cache[0, 0, 0])
+    torch.testing.assert_close(values[0, 2], cache[3, 0, 1])
+    assert torch.count_nonzero(values[0, 1]) == 0
+    assert torch.count_nonzero(values[1, 0]) == 0
+
+
+def test_bounded_attention_contract_matches_direct_selected_history():
+    torch.manual_seed(19)
+    cache = torch.randn(3, 1, 4, 8, dtype=torch.bfloat16)
+    query = torch.randn(2, 1, 4, 8, dtype=torch.bfloat16)
+    indices = torch.tensor([[0, 3, 8, -1], [4, 5, 11, 12]])
+    visible = torch.ones_like(indices, dtype=torch.bool)
+    sinks = torch.randn(4, dtype=torch.bfloat16)
+    contract = SharedLatentAttentionContract(query, cache, indices, visible, sinks)
+    gathered, valid = gather_bounded_paged_latent(cache, indices, visible)
+    expected = shared_latent_attention(
+        query, gathered, visibility=valid, attention_sinks=sinks
+    )
+    torch.testing.assert_close(
+        shared_latent_attention_contract_reference(contract), expected, rtol=0, atol=0
+    )
+
+
 from vllm_neuron.model.deepseek_v4.compressor import compress_chunk
 from vllm_neuron.model.deepseek_v4.mhc import sinkhorn
-from vllm_neuron.model.deepseek_v4.moe import hash_experts, routed_topk
+from vllm_neuron.model.deepseek_v4.moe import (
+    dense_expert_affinities,
+    hash_experts,
+    routed_topk,
+)
+from vllm_neuron.model.deepseek_v4.nki_mla import shared_latent_mla
+
+
+def test_nki_mla_cpu_oracle_supports_per_query_validity_and_sinks():
+    torch.manual_seed(23)
+    query = torch.randn(3, 1, 4, 512, dtype=torch.bfloat16)
+    latent = torch.randn(3, 7, 512, dtype=torch.bfloat16)
+    validity = torch.arange(7)[None] < torch.tensor([[1], [4], [7]])
+    sinks = torch.randn(4, dtype=torch.bfloat16)
+    expected = shared_latent_attention(
+        query, latent, visibility=validity, attention_sinks=sinks
+    )
+    torch.testing.assert_close(
+        shared_latent_mla(query, latent, validity, sinks), expected, rtol=0, atol=0
+    )
+
+
+def test_nki_mla_rejects_an_unsupported_query_bucket(monkeypatch):
+    import vllm_neuron.model.deepseek_v4.nki_mla as mla
+
+    monkeypatch.setattr(mla, "can_run_kernel", lambda _: True)
+    query = torch.zeros(2, 1, 16, 512, dtype=torch.bfloat16)
+    latent = torch.zeros(2, 128, 512, dtype=torch.bfloat16)
+    valid = torch.ones(2, 128, dtype=torch.bool)
+    with pytest.raises(RuntimeError, match="query bucket"):
+        mla.shared_latent_mla(
+            query, latent, valid, torch.zeros(16, dtype=torch.bfloat16)
+        )
+
+
+def test_nki_mla_cpu_oracle_accepts_holes_between_bounded_streams():
+    torch.manual_seed(29)
+    query = torch.randn(1, 1, 2, 512, dtype=torch.bfloat16)
+    latent = torch.randn(1, 9, 512, dtype=torch.bfloat16)
+    valid = torch.tensor([[True, False, True, False, True, True, False, True, False]])
+    sinks = torch.randn(2, dtype=torch.bfloat16)
+    expected = shared_latent_attention(
+        query, latent, visibility=valid, attention_sinks=sinks
+    )
+    torch.testing.assert_close(
+        shared_latent_mla(query, latent, valid, sinks), expected, rtol=0, atol=0
+    )
+
+
+def test_dense_affinities_preserve_duplicate_routing_slots():
+    ids = torch.tensor([[1, 1, 3, -1], [0, 2, 2, 9]])
+    weights = torch.tensor([[0.1, 0.2, 0.4, 7.0], [0.5, 0.1, 0.3, 8.0]])
+    actual = dense_expert_affinities(ids, weights, 4)
+    expected = torch.tensor([[0.0, 0.3, 0.0, 0.4], [0.5, 0.0, 0.4, 0.0]])
+    torch.testing.assert_close(actual, expected)
+
+
+def test_shared_latent_attention_matches_identity_projection_oracle():
+    torch.manual_seed(7)
+    q = torch.randn(3, 1, 4, 8, dtype=torch.bfloat16)
+    latent = torch.randn(3, 6, 8, dtype=torch.bfloat16)
+    visible = torch.rand(3, 6) > 0.3
+    visible[:, 0] = True
+    sinks = torch.randn(4, dtype=torch.bfloat16)
+    eye = torch.eye(8, dtype=torch.bfloat16).expand(4, -1, -1)
+    expected = mla_attention_reference(
+        q, latent, eye, eye, attention_sinks=sinks, key_valid=visible
+    )
+    actual = shared_latent_attention(
+        q, latent, visibility=visible, attention_sinks=sinks
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_512d_mla_matches_explicit_fp32_oracle():
@@ -68,7 +237,9 @@ def test_attention_sinks_consume_probability_without_producing_values():
 def test_paged_decode_gathers_physical_blocks_in_logical_order():
     cache = torch.arange(4 * 1 * 2 * 3.0).view(4, 1, 2, 3)
     gathered = gather_paged_latent(cache, torch.tensor([2, 0]), sequence_length=3)
-    expected = torch.cat((cache[2].transpose(0, 1), cache[0].transpose(0, 1)), dim=0)[:3]
+    expected = torch.cat((cache[2].transpose(0, 1), cache[0].transpose(0, 1)), dim=0)[
+        :3
+    ]
     torch.testing.assert_close(gathered, expected)
 
 
@@ -80,7 +251,10 @@ def test_swa_and_compressed_history_composition():
 
 
 def test_representative_buckets_pin_prefill_and_decode_shapes():
-    assert {bucket.query_length == 1 for bucket in P2_REPRESENTATIVE_BUCKETS} == {False, True}
+    assert {bucket.query_length == 1 for bucket in P2_REPRESENTATIVE_BUCKETS} == {
+        False,
+        True,
+    }
     assert all(bucket.head_dim == 512 for bucket in P2_REPRESENTATIVE_BUCKETS)
 
 
@@ -165,3 +339,5 @@ def test_compressed_entry_is_visible_to_the_query_that_completes_it():
 def test_visible_compressed_entries_rejects_a_non_positive_ratio():
     with pytest.raises(ValueError, match="compress_ratio must be positive"):
         visible_compressed_entries(torch.arange(4), 0)
+    (gather_bounded_paged_latent,)
+    (shared_latent_attention_contract_reference,)

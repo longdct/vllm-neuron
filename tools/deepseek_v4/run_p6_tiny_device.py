@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Run the synthetic structural DeepSeek-V4 model eagerly on Trainium.
+"""Run the synthetic structural DeepSeek-V4 model with TorchNeuron Native.
 
 This diagnostic intentionally uses no vLLM import or checkpoint. It verifies
 that the portable mHC, attention, compressor and MoE primitives execute through
-Torch-XLA, but it does not claim captured-graph or scheduler integration.
+the Native compiler, but it does not claim scheduler integration.
 """
 
 from __future__ import annotations
@@ -22,8 +22,7 @@ from types import ModuleType
 
 import numpy as np
 import torch
-import torch_xla
-import torch_xla.runtime as xr
+import torch_neuronx
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -32,13 +31,9 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 def compile_stack_version() -> str:
     """Report the installed Neuron compile-stack version.
 
-    Upstream ships this under ``torch-neuronx``. On the 0.24 plugin base it
-    lives in ``libtorch-neuronx-lite`` instead (unpinned, resolved against
-    vLLM's torch -- see requirements/core.txt), so ``torch-neuronx`` is not
-    installed at all in that environment. Try both rather than hard failing
-    the whole run after the device work is already done.
+    TorchNeuron Native is supplied by the external ``torch-neuronx`` package.
     """
-    for name in ("torch-neuronx", "libtorch-neuronx-lite"):
+    for name in ("torch-neuronx",):
         try:
             return importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
@@ -83,27 +78,17 @@ def main() -> None:
     input_ids = torch.tensor(args.tokens)
     with torch.no_grad():
         expected, _ = cpu_model(input_ids)
-    device = torch_xla.device()
-    if xr.device_type() != "NEURON":
-        # This SDK's torch_xla build hardcodes `_found_libneuronxla = False`
-        # ("Neuron library initialization is handled by neuronx-cc package
-        # directly") -- the classic PJRT auto-detection this script relies on
-        # to reach Trainium is compiled out. `torch_xla.device()` silently
-        # resolves to the CPU pseudo-device instead of raising, so without this
-        # check the run below would "pass" having executed nothing on
-        # hardware. Fail loudly rather than mislabel a CPU run as this gate.
-        raise SystemExit(
-            "torch_xla resolved PJRT_DEVICE="
-            f"{xr.device_type()!r}, not NEURON -- this environment cannot "
-            "reach Trainium through torch_xla's eager device path. This is "
-            "an SDK/environment gap, not a script bug: see "
-            "docs/model-dev/deepseek-v4-024-device-validation.md Step 1."
-        )
-    device_model = copy.deepcopy(cpu_model).to(device)
+    device = torch.device("neuron:0")
+    device_model = torch.compile(
+        copy.deepcopy(cpu_model).to(device),
+        backend="neuron",
+        fullgraph=True,
+        options={"model_name": "deepseek_v4_structural_tiny"},
+    )
     started = time.monotonic()
     with torch.no_grad():
         actual, state = device_model(input_ids.to(device))
-    torch_xla.sync()
+    torch_neuronx.synchronize()
     wall_seconds = time.monotonic() - started
     actual = actual.cpu()
     absolute = (actual - expected).abs()
@@ -117,14 +102,13 @@ def main() -> None:
         actual=actual.detach().numpy(),
     )
     artifact = {
-        "gate": "P6-direct-torch-xla-device-sub-gate",
-        "scope": "synthetic eager tiny model; no vLLM and no model weights",
+        "gate": "P6-direct-torch-neuronx-native-device-sub-gate",
+        "scope": "synthetic compiled tiny model; no vLLM and no model weights",
         "does_not_prove": [
-            "captured graph execution", "scheduler-driven cache I/O", "performance",
+            "scheduler-driven cache I/O", "performance",
         ],
         "git_revision": command_output(["git", "rev-parse", "HEAD"]),
         "torch": torch.__version__,
-        "torch_xla": importlib.metadata.version("torch-xla"),
         "torch_neuronx": compile_stack_version(),
         "neuron_ls": command_output(["neuron-ls"]),
         "device": str(device),

@@ -28,7 +28,7 @@ from nkilib.core.moe.moe_cte.bwmm_shard_on_block_mx import (
 )
 
 from vllm_neuron import envs
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 

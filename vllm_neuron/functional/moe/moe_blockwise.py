@@ -12,7 +12,7 @@ from nkilib.core.subkernels.indexed_flatten import indexed_flatten
 
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm.distributed.parallel_state import get_world_group
 from vllm_neuron.parallel.neuron_parallel_state import rank_to_col
@@ -102,7 +102,7 @@ def build_blockwise_mapping(
     expert_mask = (expert_affinities != 0).to(torch.float32)
     expert_affinities_masked = _apply_padding_mask(
         expert_affinities, padding_mask
-    ).view(-1, 1)  # [T*E_local, 1]
+    ).reshape(-1, 1)  # [T*E_local, 1]
 
     # Kernel configs
     max_chunk_size = 16384
@@ -220,8 +220,9 @@ def _build_blockwise_mapping_kernel(
             )
         else:
             rank_in_group = moe_group.rank_in_group
-            col_start_id = torch.tensor(
-                [(rank_in_group % tp_degree) * E_kernel],
+            col_start_id = torch.full(
+                (1,),
+                (rank_in_group % tp_degree) * E_kernel,
                 dtype=torch.int32,
                 device=device,
             )
@@ -238,7 +239,10 @@ def _build_blockwise_mapping_kernel(
         tokens_per_expert = moe_group.all_gather(tokens_per_expert_local, dim=0)
     else:
         E_kernel = E_local
-        col_start_id = torch.tensor([0], dtype=torch.int32, device=device)
+        # ``torch.tensor([0], device='neuron')`` lowers through an eager
+        # CPU-to-device copy while Dynamo is constructing fake values.  A
+        # device-native factory is traceable and represents the same constant.
+        col_start_id = torch.zeros(1, dtype=torch.int32, device=device)
 
         # Step 1: Get token indices per expert using kernel (all local experts)
         indices, tokens_per_expert = find_nonzero_indices_nki[2](
@@ -300,7 +304,7 @@ def _build_blockwise_mapping_kernel(
             f_len=f_len,
             output_len=num_blocks * block_size + total_tokens,
             row_offsets=row_offsets.reshape(-1).to(torch.int32),
-            row_offsets_start=torch.tensor([0], dtype=torch.int32, device=device),
+            row_offsets_start=torch.zeros(1, dtype=torch.int32, device=device),
             padding_val=-1,
         )
         token_position_to_id = token_position_to_id_padded[
@@ -530,6 +534,12 @@ def _can_use_indexed_flatten_kernel(
 ) -> bool:
     """Check if indexed_flatten kernel can be used."""
     if not can_run_kernel(tensor):
+        return False
+
+    # Decode and other small-token graphs choose ``T // 16`` as f_len.  For
+    # T < 16 that is zero, which is an unsupported NKI geometry and must fall
+    # back to the PyTorch mapper before the divisibility checks below.
+    if f_len < 1:
         return False
 
     # T must be divisible by f_len

@@ -113,26 +113,15 @@ simplification is the output projection: the real architecture's grouped
 low-rank `o_a_proj`/`o_b_proj` is replaced with a plain dense `Linear` — a
 parameter-count optimization, not a defining MLA characteristic.
 
-## Mid-chunk compression boundaries force a per-token attention loop
+## Mid-chunk compression boundaries require per-query visibility
 
 A single multi-token prefill chunk can span a compression-window boundary:
 tokens after the boundary need to see the compressed entry a token *earlier
-in the same chunk* just completed. A flat batched history built once for the
-whole chunk cannot express that — compression boundaries are positional, not
-chunk-aligned, and there is no single causal cutoff that is correct for both
-the "compressed" and "still local" portions simultaneously once part of the
-chunk is on each side of a boundary.
+in the same chunk* just completed. A single key-valid vector cannot express
+that because compression boundaries are positional rather than chunk-aligned.
 
-`DeepseekV4Attention.forward` therefore loops over tokens one at a time (see
-`_forward_one_token`) even during prefill, reusing exactly the same
-read-then-write-then-attend path decode already needs. This was found by a
-real chunk-invariance failure (see `test_deepseek_v4_model_assembly.py`'s
-`test_batched_forward_is_chunk_invariant_against_single_shot`): a
-whole-chunk-batched first draft of this code diverged from single-token
-decode by up to 76% relative error at a mid-sequence position, not
-floating-point noise. It is a real throughput cost, not a performance nuance
-— the mHC/MoE stages remain batched across a chunk; only attention's
-cache-dependent portion is per-token. Fine for this pass's correctness goal;
-a real batched/graph-capturable version needs more than swapping the loop
-back, since the boundary-crossing case requires attending each query against
-a *different* prefix of "what's compressed so far."
+`DeepseekV4Attention.forward` uses packed prefill/decode paths. Compression
+boundaries inside a chunk are represented by a per-query visibility mask:
+completed entries are visible only to queries at or after their completion
+position. The private `_forward_one_token` helper is retained solely as a
+migration-test oracle; production execution does not dispatch through it.

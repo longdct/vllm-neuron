@@ -6,6 +6,21 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("nki")
 
 from vllm_neuron.functional.moe.moe_block_tkg import moe_block_tkg
+from vllm_neuron.functional.moe import moe_blockwise
+
+
+def test_indexed_flatten_kernel_rejects_one_token_decode_geometry(monkeypatch):
+    monkeypatch.setattr(moe_blockwise, "can_run_kernel", lambda _: True)
+    assert not moe_blockwise._can_use_indexed_flatten_kernel(
+        T=1, tensor=torch.zeros(1, 32), f_len=0
+    )
+
+
+def test_indexed_flatten_kernel_accepts_first_valid_token_geometry(monkeypatch):
+    monkeypatch.setattr(moe_blockwise, "can_run_kernel", lambda _: True)
+    assert moe_blockwise._can_use_indexed_flatten_kernel(
+        T=16, tensor=torch.zeros(16, 32), f_len=1
+    )
 
 
 @pytest.mark.parametrize("input_shape", [(1, 8), (2, 3, 8)])

@@ -170,10 +170,14 @@ def compress_hca_chunk(
     """
     joined_kv, joined_gate = _join_gated_carry(kv, gate, state)
     if carry_valid is not None:
-        if carry_valid.shape != (joined_kv.shape[1],):
-            raise ValueError("carry_valid must have shape [joined sequence length]")
+        if carry_valid.shape not in (
+            (joined_kv.shape[1],),
+            (joined_kv.shape[0], joined_kv.shape[1]),
+        ):
+            raise ValueError("carry_valid must have shape [sequence] or [batch, sequence]")
+        mask = carry_valid.view(1, -1, 1) if carry_valid.ndim == 1 else carry_valid[..., None]
         joined_gate = torch.where(
-            carry_valid.view(1, -1, 1), joined_gate, joined_gate.new_full((), float("-inf"))
+            mask, joined_gate, joined_gate.new_full((), float("-inf"))
         )
     ratio = position_bias.shape[0]
     if ratio < 1 or position_bias.shape != (ratio, kv.shape[-1]):
@@ -215,10 +219,14 @@ def compress_csa_chunk(
     """
     joined_kv, joined_gate = _join_gated_carry(kv, gate, state)
     if carry_valid is not None:
-        if carry_valid.shape != (joined_kv.shape[1],):
-            raise ValueError("carry_valid must have shape [joined sequence length]")
+        if carry_valid.shape not in (
+            (joined_kv.shape[1],),
+            (joined_kv.shape[0], joined_kv.shape[1]),
+        ):
+            raise ValueError("carry_valid must have shape [sequence] or [batch, sequence]")
+        mask = carry_valid.view(1, -1, 1) if carry_valid.ndim == 1 else carry_valid[..., None]
         joined_gate = torch.where(
-            carry_valid.view(1, -1, 1), joined_gate, joined_gate.new_full((), float("-inf"))
+            mask, joined_gate, joined_gate.new_full((), float("-inf"))
         )
     ratio, double_width = position_bias.shape
     if ratio < 1 or double_width % 2 or kv.shape[-1] != double_width:

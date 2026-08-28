@@ -191,9 +191,16 @@ def test_expert_wrapper_matches_real_module(real_and_dev):
         gated = real_experts._apply_gate(gate_up)
         real_routed_out = F.linear(gated, real_experts.down_proj[0])
 
-        my_moe.experts[0].gate_up_proj.copy_(real_experts.gate_up_proj[0])
-        my_moe.experts[0].down_proj.copy_(real_experts.down_proj[0])
-        my_routed_out = my_moe.experts[0](hidden)
+        gate, up = real_experts.gate_up_proj[0].chunk(2, dim=0)
+        my_moe.routed_gate_up[0, :, 0].copy_(gate.T)
+        my_moe.routed_gate_up[0, :, 1].copy_(up.T)
+        my_moe.routed_down[0].copy_(real_experts.down_proj[0].T)
+        my_gate_up = torch.einsum("...h,hgi->...gi", hidden, my_moe.routed_gate_up[0])
+        my_gate = my_gate_up[..., 0, :].clamp(max=config.swiglu_limit)
+        my_up = my_gate_up[..., 1, :].clamp(
+            min=-config.swiglu_limit, max=config.swiglu_limit
+        )
+        my_routed_out = (F.silu(my_gate) * my_up) @ my_moe.routed_down[0]
     torch.testing.assert_close(real_routed_out, my_routed_out, rtol=0, atol=0)
 
     # Shared expert: real DeepseekV4MLP keeps gate_proj/up_proj separate;
@@ -238,7 +245,9 @@ def test_compressor_wrapper_matches_real_module(
     real_comp = real.model.layers[layer_index].self_attn.compressor
     my_comp = device_model.model.layers[layer_index].attention.compressor
     with torch.no_grad():
-        fused_weight = torch.cat([real_comp.kv_proj.weight, real_comp.gate_proj.weight], dim=0)
+        fused_weight = torch.cat(
+            [real_comp.kv_proj.weight, real_comp.gate_proj.weight], dim=0
+        )
         my_comp.fused_wkv_wgate.weight.copy_(fused_weight)
         my_comp.ape.copy_(real_comp.position_bias)
         my_comp.norm_weight.copy_(real_comp.kv_norm.weight)
@@ -250,7 +259,13 @@ def test_compressor_wrapper_matches_real_module(
             # q_residual/past_key_values are unused before kv_norm runs (the
             # indexer that needs them runs after) -- real_comp's forward
             # always computes and norms the compressed entries first.
-            real_comp(hidden, torch.empty(0), torch.arange(tokens).unsqueeze(0), None, layer_index)
+            real_comp(
+                hidden,
+                torch.empty(0),
+                torch.arange(tokens).unsqueeze(0),
+                None,
+                layer_index,
+            )
         except RuntimeError:
             pass
     handle.remove()
@@ -299,7 +314,9 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     my_comp = device_model.model.layers[layer_index].attention.compressor
     assert my_comp.ratio == ratio
     with torch.no_grad():
-        fused_weight = torch.cat([real_comp.kv_proj.weight, real_comp.gate_proj.weight], dim=0)
+        fused_weight = torch.cat(
+            [real_comp.kv_proj.weight, real_comp.gate_proj.weight], dim=0
+        )
         my_comp.fused_wkv_wgate.weight.copy_(fused_weight)
         my_comp.ape.copy_(real_comp.position_bias)
         my_comp.norm_weight.copy_(real_comp.kv_norm.weight)
@@ -308,11 +325,19 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     captured, handle = _capture_pre_norm(real_comp.kv_norm)
     with torch.no_grad():
         try:
-            real_comp(hidden, torch.empty(0), torch.arange(total_len).unsqueeze(0), None, layer_index)
+            real_comp(
+                hidden,
+                torch.empty(0),
+                torch.arange(total_len).unsqueeze(0),
+                None,
+                layer_index,
+            )
         except RuntimeError:
             pass
     handle.remove()
-    real_reduced = captured["pre_norm"]  # [1, num_entries, width] -- chunk-invariant ground truth
+    real_reduced = captured[
+        "pre_norm"
+    ]  # [1, num_entries, width] -- chunk-invariant ground truth
     real_normed = real_comp.kv_norm(real_reduced)
 
     self_attn_name = f"model.layers.{layer_index}.self_attn"
@@ -323,10 +348,16 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     # own (small) block_size, e.g. 8 for HCA/128 blocks over 140 tokens.
     width = -(-total_len // state_spec.block_size) + 1
     my_comp.state_cache = torch.zeros(
-        (width + 1, 1, state_spec.block_size, state_spec.head_size), dtype=state_spec.dtype
+        (width + 1, 1, state_spec.block_size, state_spec.head_size),
+        dtype=state_spec.dtype,
     )
     mla_cache = torch.zeros(
-        (-(-total_len // mla_spec.block_size) + 2, 1, mla_spec.block_size, mla_spec.head_size),
+        (
+            -(-total_len // mla_spec.block_size) + 2,
+            1,
+            mla_spec.block_size,
+            mla_spec.head_size,
+        ),
         dtype=mla_spec.dtype,
     )
 
@@ -356,11 +387,15 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     hidden_flat = hidden.squeeze(0)
     with torch.no_grad():
         for t in range(total_len):
-            state_row = null_remapped_block_table(t, state_spec.sliding_window_size, state_spec.block_size)
+            state_row = null_remapped_block_table(
+                t, state_spec.sliding_window_size, state_spec.block_size
+            )
             state_col, state_off = t // state_spec.block_size, t % state_spec.block_size
             state_slot = state_row[state_col] * state_spec.block_size + state_off
             raw_slot = 1 * mla_spec.block_size + t
-            mla_slot = compressed_entry_slot_mapping(torch.tensor([raw_slot]), ratio, mla_spec.block_size, mla_cache.shape[2])
+            mla_slot = compressed_entry_slot_mapping(
+                torch.tensor([raw_slot]), ratio, mla_spec.block_size, mla_cache.shape[2]
+            )
             my_comp(
                 hidden_flat[t : t + 1],
                 position_ids=torch.tensor([[t]], dtype=torch.long),
@@ -376,11 +411,20 @@ def test_compressor_wrapper_matches_real_module_through_paged_cache_io_past_carr
     # up before comparing against the real module's fp32 output; the wider
     # tolerance below accounts for that quantization, not just floating-point
     # summation-order noise.
-    written = mla_cache[1:, 0, :entry_base, :].reshape(-1, mla_spec.head_size)[:num_entries].float().unsqueeze(0)
+    written = (
+        mla_cache[1:, 0, :entry_base, :]
+        .reshape(-1, mla_spec.head_size)[:num_entries]
+        .float()
+        .unsqueeze(0)
+    )
     entry_positions = (torch.arange(num_entries) * ratio).unsqueeze(0)
     with torch.no_grad():
-        cos, sin = my_comp.rotary_emb(real_normed, position_ids=entry_positions, layer_type="compress")
-    real_finalized = apply_partial_rotary(real_normed, cos, sin, rope_dim=2 * cos.shape[-1])
+        cos, sin = my_comp.rotary_emb(
+            real_normed, position_ids=entry_positions, layer_type="compress"
+        )
+    real_finalized = apply_partial_rotary(
+        real_normed, cos, sin, rope_dim=2 * cos.shape[-1]
+    )
 
     torch.testing.assert_close(real_finalized, written, rtol=1e-2, atol=1e-2)
 
@@ -409,7 +453,9 @@ def test_compressed_history_gathers_full_prefix_with_correct_validity_mask(
     ]
     storage_block_size = mla_spec.block_size // ratio
     num_cols = 3
-    my_attn.mla_cache = torch.zeros((num_cols + 1, 1, storage_block_size, mla_spec.head_size))
+    my_attn.mla_cache = torch.zeros(
+        (num_cols + 1, 1, storage_block_size, mla_spec.head_size)
+    )
     my_attn.mla_raw_block_size = mla_spec.block_size
     block_table_row = torch.arange(1, num_cols + 1, dtype=torch.long)
     max_entries = num_cols * storage_block_size
@@ -501,10 +547,14 @@ def test_attention_matches_real_module_through_paged_cache_io(real_and_dev):
         hidden, position_ids=position_ids, layer_type=real_attn.rope_layer_type
     )
     position_embeddings = {real_attn.rope_layer_type: (cos, sin)}
-    causal_mask = torch.triu(torch.full((1, 1, tokens, tokens), float("-inf")), diagonal=1)
+    causal_mask = torch.triu(
+        torch.full((1, 1, tokens, tokens), float("-inf")), diagonal=1
+    )
 
     with torch.no_grad():
-        real_out, _ = real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
+        real_out, _ = real_attn(
+            hidden, position_embeddings, position_ids, causal_mask, None
+        )
 
     specs = device_model.get_kv_spec().layers
     caches = {
@@ -633,11 +683,15 @@ def test_attention_matches_real_module_after_swa_eviction_past_one_window(real_a
     )
     with torch.no_grad():
         # One-shot full-sequence forward against the real (unpaged) module.
-        real_out, _ = real_attn(hidden, position_embeddings, position_ids, causal_mask, None)
+        real_out, _ = real_attn(
+            hidden, position_embeddings, position_ids, causal_mask, None
+        )
 
     specs = device_model.get_kv_spec().layers
     caches = {
-        s.name: [torch.zeros((64, 1, s.block_size or block_size, s.head_size), dtype=s.dtype)]
+        s.name: [
+            torch.zeros((64, 1, s.block_size or block_size, s.head_size), dtype=s.dtype)
+        ]
         for s in specs
     }
     device_model.bind_kv_cache(caches)

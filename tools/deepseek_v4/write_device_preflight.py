@@ -42,7 +42,7 @@ def main() -> None:
         "python": sys.version,
         "platform": platform.platform(),
         "packages": {name: version(name) for name in (
-            "torch", "torch-xla", "libtorch-neuronx-lite", "torch-neuronx",
+            "torch", "torch-neuronx",
             "neuronx-cc", "neuronxcc", "nki", "vllm",
         )},
         "compiler": command(

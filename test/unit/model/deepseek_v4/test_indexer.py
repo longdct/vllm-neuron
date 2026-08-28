@@ -18,6 +18,7 @@ from vllm_neuron.model.deepseek_v4.indexer import (
     lightning_index_scores,
     select_compressed_entries,
     selection_mask_from_indices,
+    streaming_topk_compressed_entries,
 )
 
 
@@ -76,7 +77,9 @@ class TestSelection:
         visible = torch.arange(6).expand(2, -1)
         chosen = select_compressed_entries(scores, visible, 3)
         real = chosen >= 0
-        assert bool((chosen[real] < visible.unsqueeze(-1).expand_as(chosen)[real]).all())
+        assert bool(
+            (chosen[real] < visible.unsqueeze(-1).expand_as(chosen)[real]).all()
+        )
 
     def test_keeps_exactly_min_of_visible_and_budget(self):
         entries, topk = 8, 3
@@ -214,3 +217,41 @@ class TestGraphSafety:
         graph = str(exported.graph_module.graph)
         forbidden = ("_local_scalar_dense", "_assert_scalar", "sym_size", "nonzero")
         assert not any(operation in graph for operation in forbidden), graph
+
+
+@pytest.mark.parametrize("entries", [0, 17, 512, 513, 1301])
+def test_streamed_page_merge_matches_dense_topk(entries):
+    torch.manual_seed(31 + entries)
+    query = torch.randn(1, 3, 4, 8)
+    keys = torch.randn(1, entries, 8)
+    gate = torch.randn(1, 3, 4)
+    visible = torch.tensor([[0, min(entries, 300), entries]])
+    selected = streaming_topk_compressed_entries(
+        query, keys, gate, visible, topk=512, page_size=512
+    )
+    assert selected.logical_indices.dtype == torch.int32
+    assert torch.equal(selected.valid, selected.logical_indices >= 0)
+    if entries:
+        scores = lightning_index_scores(query, keys, gate)
+        dense = select_compressed_entries(scores, visible, 512)[0]
+        for row in range(3):
+            streamed_ids = selected.logical_indices[row][selected.valid[row]].long()
+            dense_ids = dense[row][dense[row] >= 0]
+            assert streamed_ids.numel() == dense_ids.numel()
+            torch.testing.assert_close(
+                scores[0, row, streamed_ids].sort(descending=True).values,
+                scores[0, row, dense_ids].sort(descending=True).values,
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_streamed_selection_supports_one_independent_history_per_packed_query():
+    torch.manual_seed(41)
+    query = torch.randn(3, 1, 4, 8)
+    keys = torch.randn(3, 700, 8)
+    gate = torch.randn(3, 1, 4)
+    visible = torch.tensor([[0], [17], [700]])
+    selected = streaming_topk_compressed_entries(query, keys, gate, visible)
+    assert selected.logical_indices.shape == (3, 512)
+    assert selected.valid.sum(1).tolist() == [0, 17, 512]

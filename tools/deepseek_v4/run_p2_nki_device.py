@@ -27,13 +27,9 @@ from nkilib.core.attention.attention_cte import attention_cte
 def compile_stack_version() -> str:
     """Report the installed Neuron compile-stack version.
 
-    Upstream ships this under ``torch-neuronx``. On the 0.24 plugin base it
-    lives in ``libtorch-neuronx-lite`` instead (unpinned, resolved against
-    vLLM's torch -- see requirements/core.txt), so ``torch-neuronx`` is not
-    installed at all in that environment. Try both rather than hard failing
-    the whole run after the device work is already done.
+    TorchNeuron Native is supplied by the external ``torch-neuronx`` package.
     """
-    for name in ("torch-neuronx", "libtorch-neuronx-lite"):
+    for name in ("torch-neuronx",):
         try:
             return importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:

@@ -48,27 +48,33 @@ Scope deliberately held simplified for this pass (documented, not silent):
 
 from __future__ import annotations
 
+import logging
+import os
+import re
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_neuron.utils.neuron_utils import can_run_kernel
+
 from ..kv_cache import CacheKind, KVSpec, LayerSpec
 from .attention import (
+    SharedLatentMLAInputs,
     apply_partial_rotary,
     compressed_entry_slot_mapping,
-    gather_paged_latent,
     gather_recent_window,
+    gather_recent_window_batched,
+    logical_to_physical_slots_batched,
     mla_attention_reference,
     read_compressed_history,
+    read_compressed_history_batched,
+    recent_compressed_logical_indices,
+    recent_sliding_logical_indices,
     scatter_paged_latent,
     visible_compressed_entries,
-)
-from .indexer import (
-    lightning_index_scores,
-    select_compressed_entries,
-    selection_mask_from_indices,
 )
 from .compressor import (
     carry_gather_length_tensor,
@@ -77,9 +83,21 @@ from .compressor import (
     finalize_compressed_entries,
 )
 from .config import DeepseekV4ModelConfig
+from .indexer import (
+    lightning_index_scores,
+    select_compressed_entries,
+    selection_mask_from_indices,
+    streaming_topk_compressed_entries,
+)
 from .mhc import apply_hyperconnection, hyperconnection_reference
-from .moe import hash_topk, routed_topk
+from .moe import dense_expert_affinities, hash_topk, routed_topk
+from .nki_indexer import paged_projected_bf16_indexer
+from .nki_mla import paged_shared_latent_mla
+from .parallel import resolve_parallel_topology
 from .weight_loaders import ExpertDType, load_checkpoint_weights
+
+
+logger = logging.getLogger(__name__)
 
 
 def _decode_token_threshold(attn_metadata: dict, name: str) -> tuple[bool, dict]:
@@ -171,9 +189,10 @@ class DeepseekV4HyperHead(nn.Module):
         flat = flat * torch.rsqrt(
             flat.square().mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         )
-        weights = torch.sigmoid(
-            F.linear(flat, self.fn.float()) * self.hc_scale + self.base
-        ) + self.config.hc_eps
+        weights = (
+            torch.sigmoid(F.linear(flat, self.fn.float()) * self.hc_scale + self.base)
+            + self.config.hc_eps
+        )
         return (weights.unsqueeze(-1) * streams).sum(dim=-2).to(streams.dtype)
 
 
@@ -334,9 +353,54 @@ class DeepseekV4Compressor(nn.Module):
         scatter_paged_latent(mla_cache, mla_slot_mapping, finalized.squeeze(0))
 
         # Raw per-token projection feeds the *next* chunk's carry replay.
-        scatter_paged_latent(
-            self.state_cache, state_slot_mapping, kv_gate.squeeze(0)
+        scatter_paged_latent(self.state_cache, state_slot_mapping, kv_gate.squeeze(0))
+
+    def forward_packed(
+        self,
+        hidden: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        token_to_request: torch.Tensor,
+        state_block_tables: torch.Tensor,
+        state_slot_mapping: torch.Tensor,
+        mla_cache: torch.Tensor,
+        mla_slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compress all packed tokens with one projection/gather/scatter body.
+
+        Raw projections are scattered first, so a fixed window ending at each
+        query naturally includes earlier tokens from the same prefill chunk.
+        Non-boundary candidates are computed but discarded through ``-1`` slot
+        mappings, keeping the captured graph independent of runtime boundaries.
+        """
+        assert self.state_cache is not None
+        kv_gate = self.fused_wkv_wgate(hidden)
+        scatter_paged_latent(self.state_cache, state_slot_mapping, kv_gate)
+        window = self.coff * self.ratio
+        replay, valid = gather_recent_window_batched(
+            self.state_cache,
+            state_block_tables,
+            token_to_request,
+            window,
+            positions,
         )
+        replay = replay.squeeze(2)
+        kv, gate = replay[..., : self.width], replay[..., self.width :]
+        compress_fn = compress_csa_chunk if self.overlap else compress_hca_chunk
+        compressed, _ = compress_fn(kv, gate, self.ape, carry_valid=valid)
+        entry = compressed[:, -1:]
+        entry_positions = (
+            torch.div(positions.reshape(-1, 1), self.ratio, rounding_mode="floor")
+            * self.ratio
+        )
+        cos, sin = self.rotary_emb(
+            entry, position_ids=entry_positions, layer_type="compress"
+        )
+        finalized = finalize_compressed_entries(
+            entry, self.norm_weight, self.rms_norm_eps, cos, sin
+        ).squeeze(1)
+        scatter_paged_latent(mla_cache, mla_slot_mapping, finalized)
+        return finalized
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -476,6 +540,69 @@ class DeepseekV4Indexer(nn.Module):
         # the point of use rather than relying on them having stayed equal.
         return valid & selected
 
+    def forward_packed(
+        self,
+        hidden: torch.Tensor,
+        q_residual: torch.Tensor,
+        *,
+        positions: torch.Tensor,
+        token_to_request: torch.Tensor,
+        block_tables: torch.Tensor,
+        state_block_tables: torch.Tensor,
+        state_slot_mapping: torch.Tensor,
+        mla_slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Vectorized lightning selection for every packed query."""
+        self.compressor.forward_packed(
+            hidden,
+            positions=positions,
+            token_to_request=token_to_request,
+            state_block_tables=state_block_tables,
+            state_slot_mapping=state_slot_mapping,
+            mla_cache=self.mla_cache,
+            mla_slot_mapping=mla_slot_mapping,
+        )
+        pos2 = positions.reshape(-1, 1)
+        cos, sin = self.rotary_emb(hidden, position_ids=pos2, layer_type="compress")
+        query = self.q_b_proj(q_residual).view(-1, self.n_heads, self.head_dim)
+        query = apply_partial_rotary(
+            query, cos, sin, rope_dim=self.qk_rope_head_dim
+        ).unsqueeze(1)
+        gate = self.weights_proj(hidden).view(-1, 1, self.n_heads)
+        visible = visible_compressed_entries(positions.reshape(-1), self.ratio)[:, None]
+        if can_run_kernel(query):
+            multiple_requests = not torch.compiler.is_compiling() and bool(
+                (token_to_request != 0).any()
+            )
+            if block_tables.shape[0] != 1 or multiple_requests:
+                raise RuntimeError(
+                    "DeepSeek-V4 NKI CSA milestone supports one TP1 request"
+                )
+            return paged_projected_bf16_indexer(
+                query,
+                gate,
+                self.mla_cache,
+                block_tables[0],
+                visible[:, 0],
+                logical_slots_per_block=self.mla_raw_block_size // self.ratio,
+            )
+        keys, valid = read_compressed_history_batched(
+            self.mla_cache,
+            block_tables,
+            token_to_request,
+            positions,
+            compress_ratio=self.ratio,
+            raw_block_size=self.mla_raw_block_size,
+        )
+        return streaming_topk_compressed_entries(
+            query,
+            keys,
+            gate,
+            visible,
+            topk=self.index_topk,
+            key_valid=valid,
+        )
+
 
 class NeuronDeepseekV4RotaryEmbedding(
     __import__(
@@ -521,18 +648,12 @@ class NeuronDeepseekV4RotaryEmbedding(
     @torch.no_grad()
     def forward(self, x, position_ids, layer_type=None):
         inv_freq = getattr(self, f"{layer_type}_inv_freq")
-        attention_scaling = getattr(
-            self, f"{layer_type}_attention_scaling"
-        )
+        attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
         inv_freq_expanded = (
-            inv_freq[None, :, None]
-            .float()
-            .expand(position_ids.shape[0], -1, 1)
+            inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         )
         position_ids_expanded = position_ids[:, None, :].float()
-        freqs = torch.matmul(
-            inv_freq_expanded, position_ids_expanded
-        ).transpose(1, 2)
+        freqs = torch.matmul(inv_freq_expanded, position_ids_expanded).transpose(1, 2)
         cos = freqs.cos() * attention_scaling
         sin = freqs.sin() * attention_scaling
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
@@ -556,7 +677,11 @@ class DeepseekV4GroupedLinear(nn.Linear):
     """
 
     def __init__(
-        self, in_features_per_group: int, out_features: int, n_groups: int, bias: bool = False
+        self,
+        in_features_per_group: int,
+        out_features: int,
+        n_groups: int,
+        bias: bool = False,
     ):
         super().__init__(in_features_per_group, out_features, bias=bias)
         self.n_groups = n_groups
@@ -638,9 +763,11 @@ class DeepseekV4Attention(nn.Module):
 
         from vllm.distributed.parallel_state import get_tp_group
 
+        self.topology = resolve_parallel_topology()
+
         try:
             self.tp_group = get_tp_group()
-            self.world_size = self.tp_group.world_size
+            self.world_size = self.topology.tp_degree
         except AssertionError:
             # No distributed process group set up (e.g. a module-level CPU
             # test that constructs this class directly rather than through
@@ -701,44 +828,52 @@ class DeepseekV4Attention(nn.Module):
 
         # Head-sharded checkpoint parameters. Replicated q_a/kv parameters
         # intentionally have no loader and therefore remain identical on ranks.
+        self._setup_weight_loaders(
+            config, ratio, rms_norm_eps, rotary_emb, q_lora_rank
+        )
+
+    def _setup_weight_loaders(
+        self,
+        config=None,
+        ratio=None,
+        rms_norm_eps=None,
+        rotary_emb=None,
+        q_lora_rank=None,
+    ) -> None:
+        """Attach rank-aware loaders (also called after ``to_empty``)."""
         if self.world_size > 1:
             from vllm_neuron.utils.weight_loader import (
                 set_weight_loader,
                 sharding_weight_loader,
+                with_rank_override,
             )
+
+            def loader(dim, size):
+                return with_rank_override(
+                    sharding_weight_loader(
+                        shard_dim=dim, shard_size=size, num_shards=self.world_size
+                    ),
+                    rank=self.topology.tp_rank,
+                )
 
             set_weight_loader(
                 self.q_b_proj.weight,
-                sharding_weight_loader(
-                    shard_dim=0,
-                    shard_size=self.q_b_proj.out_features,
-                    num_shards=self.world_size,
-                ),
+                loader(0, self.q_b_proj.out_features),
             )
             set_weight_loader(
                 self.o_a_proj.weight,
-                sharding_weight_loader(
-                    shard_dim=0,
-                    shard_size=self.o_a_proj.out_features,
-                    num_shards=self.world_size,
-                ),
+                loader(0, self.o_a_proj.out_features),
             )
             set_weight_loader(
                 self.o_b_proj.weight,
-                sharding_weight_loader(
-                    shard_dim=1,
-                    shard_size=self.o_b_proj.in_features,
-                    num_shards=self.world_size,
-                ),
+                loader(1, self.o_b_proj.in_features),
             )
             set_weight_loader(
                 self.sinks,
-                sharding_weight_loader(
-                    shard_dim=0,
-                    shard_size=self.heads_per_rank,
-                    num_shards=self.world_size,
-                ),
+                loader(0, self.heads_per_rank),
             )
+        if config is None:
+            return
         # K=V broadcast to every head: mla_attention_reference projects a
         # shared latent to per-head K/V via key_weight/value_weight matrices,
         # designed for a *learned* up-projection. The real architecture has
@@ -945,7 +1080,9 @@ class DeepseekV4Attention(nn.Module):
         # never properly faked. Deriving ``position_ids`` purely through
         # tensor ops (slice + add + view, all real proxied ops) keeps it
         # symbolic-int-friendly end to end.
-        cos, sin = self.rotary_emb(hidden, position_ids=position_ids, layer_type=self.rope_layer_type)
+        cos, sin = self.rotary_emb(
+            hidden, position_ids=position_ids, layer_type=self.rope_layer_type
+        )
 
         # Bound rather than inlined: the lightning indexer projects its own
         # queries from this same residual (reference: DeepseekV4Attention hands
@@ -958,7 +1095,9 @@ class DeepseekV4Attention(nn.Module):
         # The leading dimension is one token here by construction; restore
         # the singleton attention-time dimension after rotation.
         q = q.view(1, self.heads_per_rank, self.head_dim)
-        q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.q_a_norm.eps).to(q.dtype)
+        q = q * torch.rsqrt(
+            q.float().square().mean(-1, keepdim=True) + self.q_a_norm.eps
+        ).to(q.dtype)
         cos_h, sin_h = cos.unsqueeze(2), sin.unsqueeze(2)  # broadcast over heads
         q_roped = apply_partial_rotary(
             q, cos, sin, rope_dim=self.qk_rope_head_dim
@@ -984,8 +1123,10 @@ class DeepseekV4Attention(nn.Module):
             mla_entry = attn_metadata[self_attn_name]
             state_entry = attn_metadata[f"{self_attn_name}.compressor.state_cache"]
             mla_slot = compressed_entry_slot_mapping(
-                mla_entry["slot_mapping"][local_index : local_index + 1], self.ratio,
-                self.mla_raw_block_size, self.mla_cache.shape[2]
+                mla_entry["slot_mapping"][local_index : local_index + 1],
+                self.ratio,
+                self.mla_raw_block_size,
+                self.mla_cache.shape[2],
             )
             self.compressor(
                 hidden,
@@ -1057,7 +1198,9 @@ class DeepseekV4Attention(nn.Module):
             attended, cos_h, sin_h, rope_dim=self.qk_rope_head_dim, inverse=True
         )
         attended = self.capture_attended(attended)
-        return attended.reshape(1, self.heads_per_rank * self.head_dim), updated_swa_cache
+        return attended.reshape(
+            1, self.heads_per_rank * self.head_dim
+        ), updated_swa_cache
 
     def forward(
         self,
@@ -1067,40 +1210,30 @@ class DeepseekV4Attention(nn.Module):
         self_attn_name: str,
         attn_metadata: dict,
     ) -> torch.Tensor:
-        """Run single-request prefill or fixed-shape multi-request decode."""
+        """Dispatch to a single batched prefill or decode graph."""
         entry = attn_metadata[f"{self_attn_name}.swa_cache"]
         is_decode = entry["max_query_len"] <= entry["decode_token_threshold"]
-        num_requests = entry["block_table_tensor"].shape[0]
-        tokens_per_request = (
-            hidden.shape[0] // num_requests if is_decode else hidden.shape[0]
-        )
-        if is_decode and hidden.shape[0] % num_requests:
-            raise ValueError("decode tokens must divide evenly across request rows")
-        # base_position_id stays a real tensor end to end and feeds
-        # `_forward_one_token`'s RoPE `position_ids` -- see that method's
-        # docstring for why an int/list round trip broke Dynamo tracing.
-        # No plain-Python-int `cached_seq_len` is derived here at all
-        # anymore (no `int(...)` device->host read): `_swa_history`,
-        # `_carry_rows`, and now `_compressed_history` all consume
-        # `position_ids` directly instead -- see
-        # docs/model-dev/deepseek-v4-swa-null-block-bug.md.
-        attended_rows = []
-        swa_cache = self.swa_cache
-        for local_index in range(hidden.shape[0]):
-            attended_row, swa_cache = self._forward_one_token(
-                hidden[local_index : local_index + 1],
+        if (
+            "token_to_request" not in entry
+            and entry["block_table_tensor"].shape[0] != 1
+        ):
+            raise ValueError(
+                "DeepSeek-V4 batched attention metadata requires token_to_request"
+            )
+        if is_decode:
+            attended = self.forward_decode(
+                hidden,
+                positions,
                 self_attn_name=self_attn_name,
                 attn_metadata=attn_metadata,
-                request=local_index // tokens_per_request if is_decode else 0,
-                local_index=local_index,
-                position_ids=positions[local_index : local_index + 1]
-                .long()
-                .view(1, 1),
-                swa_cache=swa_cache,
             )
-            attended_rows.append(attended_row)
-        self.swa_cache.copy_(swa_cache)
-        attended = torch.cat(attended_rows, dim=0)
+        else:
+            attended = self.forward_prefill(
+                hidden,
+                positions,
+                self_attn_name=self_attn_name,
+                attn_metadata=attn_metadata,
+            )
 
         grouped = attended.reshape(attended.shape[0], self.o_groups, -1)
         grouped = self.o_a_proj(grouped).flatten(1)
@@ -1108,6 +1241,177 @@ class DeepseekV4Attention(nn.Module):
         if self.world_size > 1:
             out = self.tp_group.all_reduce(out)
         return out
+
+    def forward_prefill(self, hidden, positions, *, self_attn_name, attn_metadata):
+        return self._forward_packed(
+            hidden,
+            positions,
+            self_attn_name=self_attn_name,
+            attn_metadata=attn_metadata,
+        )
+
+    def forward_decode(self, hidden, positions, *, self_attn_name, attn_metadata):
+        return self._forward_packed(
+            hidden,
+            positions,
+            self_attn_name=self_attn_name,
+            attn_metadata=attn_metadata,
+        )
+
+    def _forward_packed(self, hidden, positions, *, self_attn_name, attn_metadata):
+        """One attention body for all scheduled tokens; no token unrolling."""
+        entry = attn_metadata[f"{self_attn_name}.swa_cache"]
+        owners = (
+            entry["token_to_request"].reshape(-1).long()
+            if "token_to_request" in entry
+            else torch.zeros(hidden.shape[0], dtype=torch.long, device=hidden.device)
+        )
+        if owners.shape[0] != hidden.shape[0]:
+            raise ValueError("token_to_request must contain one id per packed token")
+        pos = positions.reshape(-1).long()
+        pos2 = pos[:, None]
+        cos, sin = self.rotary_emb(
+            hidden, position_ids=pos2, layer_type=self.rope_layer_type
+        )
+
+        q_residual = self.q_a_norm(self.q_a_proj(hidden))
+        q = self.q_b_proj(q_residual).view(-1, self.heads_per_rank, self.head_dim)
+        q = q * torch.rsqrt(
+            q.float().square().mean(-1, keepdim=True) + self.q_a_norm.eps
+        ).to(q.dtype)
+        q_roped = self.capture_q_roped(
+            apply_partial_rotary(q, cos, sin, rope_dim=self.qk_rope_head_dim).unsqueeze(
+                1
+            )
+        )
+        kv = self.kv_norm(self.kv_proj(hidden))
+        kv_roped = self.capture_kv_roped(
+            apply_partial_rotary(
+                kv.unsqueeze(1), cos, sin, rope_dim=self.qk_rope_head_dim
+            ).squeeze(1)
+        )
+        scatter_paged_latent(self.swa_cache, entry["slot_mapping"], kv_roped)
+        sliding_logical, sliding_requested = recent_sliding_logical_indices(
+            pos, count=self.sliding_window
+        )
+        sliding_slots, sliding_valid = logical_to_physical_slots_batched(
+            sliding_logical,
+            sliding_requested,
+            entry["block_table_tensor"],
+            owners,
+            logical_slots_per_block=self.swa_cache.shape[2],
+            physical_page_stride=self.swa_cache.shape[2],
+            cache_blocks=self.swa_cache.shape[0],
+        )
+        compressed_slots = None
+        compressed_valid = None
+
+        if self.compressor is not None:
+            mla_entry = attn_metadata[self_attn_name]
+            state_entry = attn_metadata[f"{self_attn_name}.compressor.state_cache"]
+            mla_slots = compressed_entry_slot_mapping(
+                mla_entry["slot_mapping"],
+                self.ratio,
+                self.mla_raw_block_size,
+                self.mla_cache.shape[2],
+            )
+            self.compressor.forward_packed(
+                hidden,
+                positions=pos,
+                token_to_request=owners,
+                state_block_tables=state_entry["block_table_tensor"],
+                state_slot_mapping=state_entry["slot_mapping"],
+                mla_cache=self.mla_cache,
+                mla_slot_mapping=mla_slots,
+            )
+            if self.indexer is None:
+                # HCA uses a deterministic bounded suffix. Prefill always uses
+                # 1024 compressed entries; decode chooses its static geometry
+                # from the compiled context capacity.
+                if hidden.shape[0] == 1:
+                    raw_capacity = (
+                        mla_entry["block_table_tensor"].shape[1]
+                        * self.mla_raw_block_size
+                    )
+                    compressed_count = (
+                        32
+                        if raw_capacity <= 4096
+                        else 256
+                        if raw_capacity <= 32768
+                        else 1024
+                    )
+                else:
+                    compressed_count = 1024
+                logical, requested = recent_compressed_logical_indices(
+                    pos, compress_ratio=self.ratio, count=compressed_count
+                )
+                slots, compressed_valid = logical_to_physical_slots_batched(
+                    logical,
+                    requested,
+                    mla_entry["block_table_tensor"],
+                    owners,
+                    logical_slots_per_block=self.mla_raw_block_size // self.ratio,
+                    physical_page_stride=self.mla_cache.shape[2],
+                    cache_blocks=self.mla_cache.shape[0],
+                )
+                compressed_slots = slots
+            if self.indexer is not None:
+                index_entry = attn_metadata[f"{self_attn_name}.indexer"]
+                index_state = attn_metadata[
+                    f"{self_attn_name}.indexer.compressor.state_cache"
+                ]
+                index_slots = compressed_entry_slot_mapping(
+                    index_entry["slot_mapping"],
+                    self.ratio,
+                    self.indexer.mla_raw_block_size,
+                    self.indexer.mla_cache.shape[2],
+                )
+                selection = self.indexer.forward_packed(
+                    hidden,
+                    q_residual,
+                    positions=pos,
+                    token_to_request=owners,
+                    block_tables=index_entry["block_table_tensor"],
+                    state_block_tables=index_state["block_table_tensor"],
+                    state_slot_mapping=index_state["slot_mapping"],
+                    mla_slot_mapping=index_slots,
+                )
+                slots, compressed_valid = logical_to_physical_slots_batched(
+                    selection.logical_indices,
+                    selection.valid,
+                    mla_entry["block_table_tensor"],
+                    owners,
+                    logical_slots_per_block=self.mla_raw_block_size // self.ratio,
+                    physical_page_stride=self.mla_cache.shape[2],
+                    cache_blocks=self.mla_cache.shape[0],
+                )
+                compressed_slots = slots
+
+        attended = paged_shared_latent_mla(
+            SharedLatentMLAInputs(
+                query=q_roped,
+                sliding_cache=self.swa_cache,
+                sliding_slots=sliding_slots,
+                sliding_valid=sliding_valid,
+                compressed_cache=self.mla_cache
+                if self.compressor is not None
+                else None,
+                compressed_slots=compressed_slots,
+                compressed_valid=compressed_valid,
+                sinks=self.sinks,
+            )
+        )
+        attended = self.capture_attended_roped(attended)
+        attended = apply_partial_rotary(
+            attended,
+            cos.unsqueeze(2),
+            sin.unsqueeze(2),
+            rope_dim=self.qk_rope_head_dim,
+            inverse=True,
+        )
+        return self.capture_attended(attended).reshape(
+            hidden.shape[0], self.heads_per_rank * self.head_dim
+        )
 
 
 class DeepseekV4Expert(nn.Module):
@@ -1123,10 +1427,33 @@ class DeepseekV4Expert(nn.Module):
     ``test_expert_wrapper_matches_real_module``.
     """
 
-    def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        swiglu_limit: float,
+        *,
+        tp_degree: int = 1,
+        tp_rank: int = 0,
+        tp_group=None,
+    ):
         super().__init__()
-        self.gate_up_proj = nn.Parameter(torch.randn(2 * intermediate_size, hidden_size) * 0.02)
-        self.down_proj = nn.Parameter(torch.randn(hidden_size, intermediate_size) * 0.02)
+        if intermediate_size % tp_degree:
+            raise ValueError(
+                f"shared expert intermediate_size={intermediate_size} must be "
+                f"divisible by tp_degree={tp_degree}"
+            )
+        self.full_intermediate_size = intermediate_size
+        intermediate_size //= tp_degree
+        self.tp_degree = tp_degree
+        self.tp_rank = tp_rank
+        self.tp_group = tp_group
+        self.gate_up_proj = nn.Parameter(
+            torch.randn(2 * intermediate_size, hidden_size) * 0.02
+        )
+        self.down_proj = nn.Parameter(
+            torch.randn(hidden_size, intermediate_size) * 0.02
+        )
         self.intermediate_size = intermediate_size
         self.swiglu_limit = swiglu_limit
         # Checkpoints ship gate and up as separate ``w1``/``w3`` tensors while
@@ -1134,13 +1461,37 @@ class DeepseekV4Expert(nn.Module):
         # chunks it back apart). ``weight_loaders.load_checkpoint_weights``
         # places each half; no per-parameter shard loader is attached here
         # because ``to_empty()`` would drop it before loading runs.
+        self._setup_weight_loaders()
+
+    def _setup_weight_loaders(self) -> None:
+        if self.tp_degree == 1:
+            return
+        from vllm_neuron.utils.weight_loader import (
+            set_weight_loader,
+            sharding_weight_loader,
+            with_rank_override,
+        )
+
+        def loader(dim, size):
+            return with_rank_override(
+                sharding_weight_loader(
+                    shard_dim=dim, shard_size=size, num_shards=self.tp_degree
+                ),
+                rank=self.tp_rank,
+            )
+
+        # w1/w3 are independently sliced by the model-specific stacked loader.
+        set_weight_loader(self.down_proj, loader(1, self.intermediate_size))
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         gate_up = F.linear(hidden, self.gate_up_proj)
         gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        return F.linear(F.silu(gate) * up, self.down_proj)
+        output = F.linear(F.silu(gate) * up, self.down_proj)
+        if self.tp_degree > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
 
 
 class DeepseekV4MoE(nn.Module):
@@ -1163,34 +1514,44 @@ class DeepseekV4MoE(nn.Module):
         self.kind = kind
         self.topk = config.topk
         self.num_experts = config.num_experts
+        self.topology = resolve_parallel_topology()
         intermediate = config.expert_intermediate_size
-
-        from vllm_neuron.parallel.neuron_parallel_state import (
-            get_neuron_ep_degree,
-            get_neuron_ep_rank,
+        self.ep_degree = self.topology.ep_degree
+        self.expert_tp_degree = self.topology.expert_tp_degree
+        if intermediate % self.expert_tp_degree:
+            raise ValueError(
+                f"expert_intermediate_size={intermediate} must be divisible by "
+                f"expert_tp_degree={self.expert_tp_degree}"
+            )
+        intermediate //= self.expert_tp_degree
+        self.expert_tp_rank = self.topology.expert_tp_rank
+        self.full_intermediate_size = config.expert_intermediate_size
+        self.num_local_experts = self.num_experts // self.ep_degree
+        self.local_start, self.local_end = self.topology.local_expert_interval(
+            self.num_experts
         )
 
-        self.ep_degree = get_neuron_ep_degree()
-        if self.num_experts % self.ep_degree:
-            raise ValueError(
-                f"num_experts={self.num_experts} must be divisible by "
-                f"ep_degree={self.ep_degree}"
-            )
-        self.num_local_experts = self.num_experts // self.ep_degree
-        ep_rank = get_neuron_ep_rank()
-        self.local_start = ep_rank * self.num_local_experts
+        try:
+            from vllm.distributed.parallel_state import get_tp_group
+            self.tp_group = get_tp_group()
+        except AssertionError:
+            self.tp_group = None
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [
-                DeepseekV4Expert(config.hidden_size, intermediate, config.swiglu_limit)
-                for _ in range(self.num_local_experts)
-            ]
+        self.routed_gate_up = nn.Parameter(
+            torch.randn(self.num_local_experts, config.hidden_size, 2, intermediate)
+            * 0.02
+        )
+        self.routed_down = nn.Parameter(
+            torch.randn(self.num_local_experts, intermediate, config.hidden_size) * 0.02
         )
         self.shared_experts = DeepseekV4Expert(
             config.hidden_size,
-            intermediate * config.n_shared_experts,
+            self.full_intermediate_size * config.n_shared_experts,
             config.swiglu_limit,
+            tp_degree=self.topology.tp_degree,
+            tp_rank=self.topology.tp_rank,
+            tp_group=self.tp_group,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
         self.correction_bias = nn.Parameter(torch.zeros(config.num_experts))
@@ -1239,6 +1600,16 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def forward(self, hidden: torch.Tensor, token_id: torch.Tensor) -> torch.Tensor:
+        original_tokens = hidden.shape[0]
+        cross_dp_ep = self.ep_degree > self.topology.tp_degree
+        dp_group = wide_ep_group = None
+        if cross_dp_ep:
+            from vllm.distributed.parallel_state import get_dp_group, get_wide_ep_group
+
+            dp_group = get_dp_group()
+            wide_ep_group = get_wide_ep_group()
+            hidden = dp_group.all_gather(hidden, dim=0)
+            token_id = dp_group.all_gather(token_id, dim=0)
         logits = self.gate(hidden)
         if self.kind == "hash_moe":
             ids, weights = hash_topk(
@@ -1249,36 +1620,133 @@ class DeepseekV4MoE(nn.Module):
                 logits, self.correction_bias, self.topk, self.routed_scaling_factor
             )
 
-        routed = torch.zeros_like(hidden)
-        for slot in range(self.topk):
-            eid = ids[:, slot]
-            local_idx = eid - self.local_start
-            is_local = (local_idx >= 0) & (local_idx < self.num_local_experts)
-            safe_idx = local_idx.clamp(0, self.num_local_experts - 1)
-            for local_expert in range(self.num_local_experts):
-                mask = is_local & (safe_idx == local_expert)
-                # Always compute, even for an expert no token in this batch
-                # routes to (mask all-False contributes exactly zero either
-                # way) -- the previous `if not bool(mask.any()): continue`
-                # skip was a real optimization but `bool(tensor)` is a
-                # device->host sync and an unconditional Dynamo graph break
-                # ("Data-dependent branching"), found compiling the full
-                # device-shaped model on real Trn2 silicon (see
-                # docs/model-dev/deepseek-v4-024-device-validation.md).
-                # Dense per-token dispatch is already this pass's documented
-                # throughput tradeoff (see this class's docstring); this
-                # just makes the per-*expert* skip the same tradeoff.
-                contribution = self.experts[local_expert](hidden)
-                routed = routed + contribution * (
-                    weights[:, slot : slot + 1] * mask.unsqueeze(-1)
-                )
+        # Routing normalization and duplicate-slot aggregation stay in FP32.
+        # Hash routing can repeat an expert id; scatter_add preserves all six
+        # contributions before block dispatch.
+        affinities = dense_expert_affinities(ids, weights.float(), self.num_experts)
+        if can_run_kernel(hidden):
+            routed = self._forward_nki(hidden, affinities)
+        else:
+            routed = self._forward_portable(hidden, affinities)
 
-        if self.ep_degree > 1:
-            from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_group
-
-            routed = get_neuron_ep_group().all_reduce(routed)
+        if cross_dp_ep:
+            routed = wide_ep_group.all_reduce(routed)
+            start = dp_group.rank_in_group * original_tokens
+            routed = routed[start : start + original_tokens]
+            hidden = hidden[start : start + original_tokens]
+        elif self.topology.tp_degree > 1 and self.tp_group is not None:
+            # One reduction combines both EP placement and expert-TP partials
+            # when all participating ranks are inside the TP world.
+            routed = self.tp_group.all_reduce(routed)
 
         return routed + self.shared_experts(hidden)
+
+    def _forward_portable(
+        self, hidden: torch.Tensor, affinities: torch.Tensor
+    ) -> torch.Tensor:
+        routed = torch.zeros_like(hidden)
+        for local_expert in range(self.num_local_experts):
+            global_expert = self.local_start + local_expert
+            gate_up = torch.einsum(
+                "th,hgi->tgi", hidden, self.routed_gate_up[local_expert]
+            )
+            gate = gate_up[:, 0].clamp(max=self.shared_experts.swiglu_limit)
+            up = gate_up[:, 1].clamp(
+                min=-self.shared_experts.swiglu_limit,
+                max=self.shared_experts.swiglu_limit,
+            )
+            expert_out = (F.silu(gate) * up) @ self.routed_down[local_expert]
+            routed = (
+                routed + expert_out * affinities[:, global_expert : global_expert + 1]
+            )
+        return routed
+
+    def _forward_nki(
+        self, hidden: torch.Tensor, affinities: torch.Tensor
+    ) -> torch.Tensor:
+        """One opaque BF16 shard-on-block routed-MoE call."""
+        if hidden.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"DeepSeek-V4 NKI MoE requires bfloat16 activations, got {hidden.dtype}"
+            )
+        intermediate = self.routed_gate_up.shape[-1]
+        if intermediate < 128 or intermediate % 16:
+            raise RuntimeError(
+                "DeepSeek-V4 NKI MoE requires expert intermediate size >=128 "
+                f"and divisible by 16, got {intermediate}"
+            )
+        if (
+            self.routed_gate_up.dtype != torch.bfloat16
+            or self.routed_down.dtype != torch.bfloat16
+        ):
+            raise RuntimeError(
+                "DeepSeek-V4 NKI MoE requires BF16 routed expert weights"
+            )
+
+        import nki.language as nl
+        from nkilib.core.moe.moe_cte.moe_cte import (
+            ActFnType,
+            ExpertAffinityScaleMode,
+            MoECTEImplementation,
+        )
+
+        import vllm_neuron.functional as NF
+        from vllm.distributed import get_tp_group
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_ep_degree,
+            get_neuron_ep_tp_group,
+        )
+
+        original_tokens = hidden.shape[0]
+        # shard-on-block materializes complete 128-token output tiles. Decode
+        # supplies one token, so carry inert rows through routing and trim the
+        # kernel result. Zero affinities keep padding out of every expert.
+        padded_tokens = ((original_tokens + 127) // 128) * 128
+        if padded_tokens != original_tokens:
+            token_padding = padded_tokens - original_tokens
+            hidden = F.pad(hidden, (0, 0, 0, token_padding))
+            affinities = F.pad(affinities, (0, 0, 0, token_padding))
+
+        local_affinities = affinities[
+            :, self.local_start : self.local_start + self.num_local_experts
+        ]
+        # EP-specific groups are deliberately not constructed for EP1.  In
+        # that geometry the ordinary TP group is the identical communication
+        # domain (and at TP1 both are a single-rank no-op group).
+        group = (
+            get_neuron_ep_tp_group()
+            if get_neuron_ep_degree() > 1
+            else get_tp_group()
+        )
+        masked, token_ids, block_experts, conditions = NF.build_blockwise_mapping(
+            expert_affinities=local_affinities,
+            num_local_experts=self.num_local_experts,
+            num_experts_per_token=self.topk,
+            block_size=128,
+            moe_group=group,
+            tp_degree=self.expert_tp_degree,
+        )
+        output = NF.moe_cte(
+            hidden_states=hidden,
+            expert_affinities_masked=masked,
+            gate_up_proj_weight=self.routed_gate_up,
+            down_proj_weight=self.routed_down,
+            token_position_to_id=token_ids,
+            block_to_expert=block_experts,
+            conditions=conditions,
+            block_size=128,
+            implementation=MoECTEImplementation.shard_on_block,
+            activation_function=ActFnType.SiLU,
+            compute_dtype=nl.bfloat16,
+            expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
+            gate_clamp_upper_limit=10.0,
+            gate_clamp_lower_limit=-10.0,
+            up_clamp_upper_limit=10.0,
+            up_clamp_lower_limit=-10.0,
+            skip_token=True,
+            is_tensor_update_accumulating=True,
+        )
+        return output[:original_tokens]
 
 
 class DeepseekV4DecoderLayer(nn.Module):
@@ -1316,8 +1784,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.moe = DeepseekV4MoE(config, layer.mlp.value)
         self.attn_hc = DeepseekV4HyperConnection(config)
         self.ffn_hc = DeepseekV4HyperConnection(config)
-        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = DeepseekV4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.post_attention_layernorm = DeepseekV4RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -1348,7 +1820,20 @@ class DeepseekV4Model(nn.Module):
     def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
         self.config = config
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.topology = resolve_parallel_topology()
+        if self.topology.tp_degree > 1:
+            from vllm.distributed.parallel_state import get_tp_group
+            from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
+
+            self.embed_tokens = VocabDimShardedEmbedding(
+                vocab_size=config.vocab_size,
+                embed_dim=config.hidden_size,
+                dtype=config.torch_dtype,
+                tp_group=get_tp_group().device_group,
+            )
+        else:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self._setup_weight_loaders()
         # One rotary_emb shared by every layer's attention and compressor,
         # matching the real architecture's single model.rotary_emb -- it
         # holds both the "main" (sliding-window layers) and "compress"
@@ -1370,6 +1855,26 @@ class DeepseekV4Model(nn.Module):
         self.hc_head = DeepseekV4HyperHead(config)
         self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def _setup_weight_loaders(self) -> None:
+        if self.topology.tp_degree == 1:
+            return
+        from vllm_neuron.utils.weight_loader import (
+            set_weight_loader,
+            sharding_weight_loader,
+            with_rank_override,
+        )
+
+        loader = sharding_weight_loader(
+            shard_dim=0,
+            shard_size=self.embed_tokens.vocab_size_per_rank,
+            num_shards=self.topology.tp_degree,
+            pad_shard=True,
+        )
+        set_weight_loader(
+            self.embed_tokens.weight,
+            with_rank_override(loader, rank=self.topology.tp_rank),
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1380,7 +1885,11 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if input_ids.ndim != 1:
             raise ValueError("DeepSeek-V4 expects a flat [tokens] input_ids tensor")
-        hidden = self.embed_tokens(input_ids)
+        hidden = (
+            self.embed_tokens(input_ids, scatter_tokens=False)
+            if self.topology.tp_degree > 1
+            else self.embed_tokens(input_ids)
+        )
         if inputs_embeds is not None:
             if is_token_ids is None:
                 raise ValueError("is_token_ids is required with inputs_embeds")
@@ -1413,6 +1922,27 @@ class DeepseekV4ForCausalLM(nn.Module):
     def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
         self.config = config
+        self.topology = resolve_parallel_topology()
+        self.topology.validate(
+            num_heads=int(hf_config.num_attention_heads),
+            output_groups=int(getattr(hf_config, "o_groups", 8)),
+            num_experts=config.num_experts,
+            expert_intermediate_size=config.expert_intermediate_size,
+        )
+        expert_start, expert_end = self.topology.local_expert_interval(
+            config.num_experts
+        )
+        logger.info(
+            "DeepSeek-V4 topology: TP=%d DP=%d EP=%d expert-TP=%d "
+            "local_experts=[%d,%d) logical_cores=%s",
+            self.topology.tp_degree,
+            self.topology.dp_degree,
+            self.topology.ep_degree,
+            self.topology.expert_tp_degree,
+            expert_start,
+            expert_end,
+            os.environ.get("NEURON_RT_VISIBLE_CORES", "runtime-assigned"),
+        )
         # Every parameter below `DeepseekV4Model` is created by a bare
         # `nn.Linear` / `nn.Embedding` / `nn.Parameter(torch.randn(...))`,
         # none of which take a dtype, so they were all built at
@@ -1443,8 +1973,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else None
         )
         self._gather_logits = bool(
-            config.neuron_config is not None
-            and config.neuron_config.max_logprobs != 0
+            config.neuron_config is not None and config.neuron_config.max_logprobs != 0
         )
         try:
             from vllm.distributed.parallel_state import get_tp_group
@@ -1462,10 +1991,31 @@ class DeepseekV4ForCausalLM(nn.Module):
             gather_output=self.on_device_sampling_config is None,
             tp_group=device_group,
         )
+        self._setup_lm_head_weight_loader()
         if self.on_device_sampling_config is not None:
             self.sampler = neuron_nn.Sampler(
                 self.on_device_sampling_config, process_group=device_group
             )
+
+    def _setup_lm_head_weight_loader(self) -> None:
+        if self.topology.tp_degree == 1:
+            return
+        from vllm_neuron.utils.weight_loader import (
+            set_weight_loader,
+            sharding_weight_loader,
+            with_rank_override,
+        )
+
+        loader = sharding_weight_loader(
+            shard_dim=0,
+            shard_size=self.lm_head.out_features_per_rank,
+            num_shards=self.topology.tp_degree,
+            pad_shard=True,
+        )
+        set_weight_loader(
+            self.lm_head.weight,
+            with_rank_override(loader, rank=self.topology.tp_rank),
+        )
 
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None):
@@ -1597,10 +2147,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             layer.attention.swa_cache = kv_caches[f"{prefix}.swa_cache"][0]
             if layer.attention.compressor is not None:
                 layer.attention.mla_cache = kv_caches[prefix][0]
-                layer.attention.mla_raw_block_size = next(s.block_size for s in self.get_kv_spec().layers if s.name == prefix)
-                logical_width = layer.attention.mla_raw_block_size // layer.attention.ratio
+                layer.attention.mla_raw_block_size = next(
+                    s.block_size for s in self.get_kv_spec().layers if s.name == prefix
+                )
+                logical_width = (
+                    layer.attention.mla_raw_block_size // layer.attention.ratio
+                )
                 if layer.attention.mla_cache.shape[2] < logical_width:
-                    raise ValueError(f"{prefix} physical stride is smaller than logical compressed width")
+                    raise ValueError(
+                        f"{prefix} physical stride is smaller than logical compressed width"
+                    )
                 layer.attention.compressor.state_cache = kv_caches[
                     f"{prefix}.compressor.state_cache"
                 ][0]
@@ -1694,7 +2250,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             source = _get_checkpoint_source(checkpoint_path, ".safetensors", cache_dir)
             for name in source.get_file_names():
                 source.download_file(name)
-            search_root = os.path.dirname(source.get_file_path(source.get_file_names()[0]))
+            search_root = os.path.dirname(
+                source.get_file_path(source.get_file_names()[0])
+            )
 
         files = sorted(glob.glob(os.path.join(search_root, "*.safetensors")))
 
@@ -1709,25 +2267,45 @@ class DeepseekV4ForCausalLM(nn.Module):
         # uninitialized values when no checkpoint is present (a smoke-test
         # scenario only -- see the docstring above).
         self.to_empty(device=device)
+        self.model._setup_weight_loaders()
+        self._setup_lm_head_weight_loader()
         for module in self.modules():
             if isinstance(
                 module,
                 (
                     DeepseekV4MoE,
+                    DeepseekV4Expert,
                     DeepseekV4Attention,
                     NeuronDeepseekV4RotaryEmbedding,
                 ),
             ):
-                module.reinitialize_deterministic_buffers()
+                if hasattr(module, "reinitialize_deterministic_buffers"):
+                    module.reinitialize_deterministic_buffers()
+                if hasattr(module, "_setup_weight_loaders"):
+                    module._setup_weight_loaders()
         if not files:
             return
 
         def _weights():
+            local_start, local_end = self.topology.local_expert_interval(
+                self.config.num_experts
+            )
             for path in files:
                 with safe_open(path, framework="pt", device="cpu") as handle:
                     for name in handle.keys():
+                        routed = re.search(r"\.ffn\.experts\.(\d+)\.", name)
+                        if routed and not local_start <= int(routed.group(1)) < local_end:
+                            continue
                         yield name, handle.get_tensor(name)
 
         load_checkpoint_weights(
             self, _weights(), expert_dtype=expert_dtype, strict=True
+        )
+        parameter_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in self.parameters()
+        )
+        logger.info(
+            "DeepSeek-V4 rank parameter footprint: %.3f GiB",
+            parameter_bytes / (1024**3),
         )

@@ -67,11 +67,11 @@ def test_scatter_padding_scratch_cannot_clobber_real_slot_zero():
     torch.testing.assert_close(cache.reshape(-1, 3)[1:], before.reshape(-1, 3)[1:])
 
 
-def test_scatter_rejects_positive_out_of_range_slot_eagerly():
-    with pytest.raises(ValueError, match="out-of-range positive slot"):
-        scatter_paged_latent(
-            torch.zeros(1, 1, 2, 3), torch.tensor([2]), torch.ones(1, 3)
-        )
+def test_scatter_routes_positive_out_of_range_slot_to_scratch():
+    cache = torch.randn(1, 1, 2, 3)
+    before = cache.clone()
+    scatter_paged_latent(cache, torch.tensor([2, 99]), torch.randn(2, 3))
+    torch.testing.assert_close(cache, before, rtol=0, atol=0)
 
 
 def test_gathers_clamp_invalid_storage_and_propagate_validity():

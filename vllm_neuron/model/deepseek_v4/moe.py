@@ -5,6 +5,24 @@ import torch
 import torch.nn.functional as F
 
 
+def dense_expert_affinities(
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    """Aggregate every selected routing slot into ``[tokens, experts]``."""
+    if expert_ids.shape != expert_weights.shape or expert_ids.ndim != 2:
+        raise ValueError("expert ids and weights must have the same 2-D shape")
+    if num_experts < 1:
+        raise ValueError("num_experts must be positive")
+    valid = (expert_ids >= 0) & (expert_ids < num_experts)
+    safe_ids = torch.where(valid, expert_ids, torch.zeros_like(expert_ids)).long()
+    affinities = expert_weights.new_zeros((expert_ids.shape[0], num_experts))
+    return affinities.scatter_add(
+        1, safe_ids, torch.where(valid, expert_weights, torch.zeros_like(expert_weights))
+    )
+
+
 def routed_topk(
     logits: torch.Tensor,
     correction_bias: torch.Tensor,

@@ -71,35 +71,10 @@ def load_indexer(path: Path):
 
 
 def resolve_stack(preference: str) -> tuple[str, str, str]:
-    """Pick a Neuron backend: vllm-neuron's torch-xla, or from-source torch-neuronx.
-
-    Two independent stacks reach the same hardware and they lower differently --
-    the ``Tensor.split`` defect is present on one and absent on the other. Any
-    claim about "does Neuron get this right" has to name which one it is about.
-
-    Returns ``(device, dynamo backend, description)``.
-    """
-    if preference in ("auto", "xla"):
-        try:
-            import torch_xla
-
-            import vllm_neuron  # noqa: F401  -- registers the dynamo backends
-            from vllm_neuron.envs import get_compile_backend_name
-
-            return (
-                "neuron:0",
-                get_compile_backend_name(),
-                f"vllm-neuron / torch {torch.__version__}"
-                f" / torch-xla {torch_xla.__version__}",
-            )
-        except ImportError:
-            if preference == "xla":
-                raise
-
-    # The from-source torch-neuronx registers a PrivateUse1 'neuron' device and
-    # a 'neuron' dynamo backend, with no torch-xla underneath. It cannot share a
-    # venv with vllm-neuron, which pins torch 2.11.
-    import torch_neuronx  # noqa: F401
+    """Return the TorchNeuron Native device, backend, and description."""
+    if preference == "xla":
+        raise ValueError("The XLA backend was removed; use native or auto")
+    import torch_neuronx
 
     return (
         "neuron:0",
