@@ -26,7 +26,6 @@ from vllm.config import ProfilerConfig
 from vllm.profiler.wrapper import WorkerProfiler
 
 from vllm_neuron import envs
-import libtorch_neuronx_lite.envs as libtorch_envs
 
 import logging
 
@@ -75,7 +74,7 @@ class NeuronProfiler(WorkerProfiler):
     def _start(self) -> None:
         # NRT inspect APIs copy NEFFs from the cache to the profiler output
         # to make the NEFFs available to Neuron explorer.
-        neff_cache_dir = libtorch_envs.get_neuron_compile_cache_dir()
+        neff_cache_dir = envs.get_neuron_compile_cache_dir()
 
         runtime = torch.classes.neuron.Runtime()
         # neuron_cores is not passed here — per-rank gating in NeuronWorker

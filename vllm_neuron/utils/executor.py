@@ -656,9 +656,7 @@ class MPExecutor:
             ranks = [0]
 
         if neff_cache_dir is None:
-            import libtorch_neuronx_lite.envs as libtorch_envs
-
-            neff_cache_dir = libtorch_envs.get_neuron_compile_cache_dir()
+            neff_cache_dir = envs.get_neuron_compile_cache_dir()
 
         profile_kwargs = {
             "output_dir": output_dir,

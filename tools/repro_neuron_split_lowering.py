@@ -37,7 +37,7 @@ runtime rejects one without the other.
 Exits 0 if the backend is correct, 1 if the defect is present.
 
 Observed on: trn2.3xlarge, neuronx-cc 2.27.5334.0, torch/torch-xla 2.11,
-libtorch-neuronx-lite 2.11.
+the retired lite/XLA stack.
 """
 
 from __future__ import annotations

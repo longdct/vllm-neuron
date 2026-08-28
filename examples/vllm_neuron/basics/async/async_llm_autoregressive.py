@@ -200,7 +200,7 @@ def worker_process(
 def model_load():
     model = Model()
     model = model.to("neuron:0")
-    model = torch.compile(model, backend="neuron_libtorch")
+    model = torch.compile(model, backend="neuron")
     return model
 
 

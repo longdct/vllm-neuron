@@ -7,7 +7,7 @@ are inherent to dtype quantization or specific to the Neuron target.
 Two modes:
 
 - **Two-way**: ``assert_close(actual, expected)`` — backward compatible with
-  ``libtorch_neuronx_lite.testing.assert_close`` semantics (rtol normalized by abs_max).
+  ``TorchNeuron Native.testing.assert_close`` semantics (rtol normalized by abs_max).
 
 - **Three-way**: ``assert_close_three_way(baseline, expected, actual)`` — isolates
   target-specific errors from dtype-inherent errors using dynamic thresholds.
@@ -17,7 +17,7 @@ Example::
 
     from vllm_neuron.accuracy.testing import assert_close, assert_close_three_way
 
-    # Two-way (drop-in replacement for libtorch_neuronx_lite.testing.assert_close)
+    # Two-way (drop-in replacement for TorchNeuron Native.testing.assert_close)
     assert_close(neuron_output, hf_output)
 
     # Three-way (no magic rtol needed)
@@ -263,7 +263,7 @@ def assert_close(
     name: str = "tensor",
     enable_histograms: bool = False,
 ) -> AssertCloseResult:
-    """Two-way assertion compatible with libtorch_neuronx_lite.testing.assert_close.
+    """Two-way assertion compatible with TorchNeuron Native.testing.assert_close.
 
     Uses neuron_allclose semantics: rtol normalized by abs_max of expected.
     Supports nested lists/tuples of tensors (compared element-wise).

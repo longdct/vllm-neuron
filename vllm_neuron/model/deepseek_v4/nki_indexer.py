@@ -17,7 +17,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from .indexer import IndexerSelection, streaming_topk_compressed_entries
 
-_SCHEDULER_QUERY_BUCKETS = frozenset((1, 512, 1024, 2048, 4096))
+_SCHEDULER_QUERY_BUCKETS = frozenset((1, 128, 256, 512, 1024, 2048, 4096))
 _PREFILL_MICROCHUNK = 1024
 _INDEXER_QUERIES_PER_LNC = 8
 _INDEXER_QUERY_TILE = 2 * _INDEXER_QUERIES_PER_LNC
@@ -411,7 +411,9 @@ def paged_projected_bf16_indexer(
         and query.shape[0] != _INDEXER_QUERY_TILE
     ):
         raise RuntimeError(
-            "DeepSeek-V4 NKI indexer requires query bucket 1, 512, 1024, 2048, or 4096"
+            "DeepSeek-V4 NKI indexer requires query bucket "
+            f"{sorted(_SCHEDULER_QUERY_BUCKETS)} or the Q{_INDEXER_QUERY_TILE} tile; "
+            f"got {query.shape[0]}"
         )
     if query.shape[1:] != (1, 64, 128) or gate.shape != query.shape[:-1]:
         raise RuntimeError("DeepSeek-V4 NKI indexer requires [Q,1,64,128] query")

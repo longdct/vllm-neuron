@@ -29,8 +29,8 @@ from vllm_neuron.functional.vendored_kernels.rotational_topk import (
     create_topk_config,
     rotational_topk,
 )
-from libtorch_neuronx_lite.nki.nki_dtype import torch_to_nki_dtype
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.utils import map_torch_dtype_to_external
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -472,7 +472,7 @@ def _topk_nki(tensor: Tensor, k: int, dim: int) -> tuple[Tensor, Tensor]:
     kernel_fn = _TOPK_KERNELS[SupportedTopkMethods.ROTATIONAL]
     _log_topk_choice("rotational-nki", n_rows, vocab_size, k)
 
-    nki_dtype = getattr(nl, torch_to_nki_dtype(inp2d.dtype))
+    nki_dtype = map_torch_dtype_to_external(inp2d.dtype)
     config = _get_rotational_topk_config(n_rows, vocab_size, k, nki_dtype)
 
     topk_kernel = wrap_nki(kernel_fn)

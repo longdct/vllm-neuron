@@ -12,7 +12,7 @@ from nkilib.core.utils.common_types import (
     QuantizationType,
 )
 from vllm_neuron import envs
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 if envs.VLLM_NEURON_MLP_FORCE_TKG:

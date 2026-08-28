@@ -47,6 +47,41 @@ def test_recent_compressed_indices_are_bounded_prefix_packed_suffixes():
     ]
 
 
+@pytest.mark.parametrize(
+    ("raw_capacity", "compress_ratio", "count"),
+    [(4096, 128, 32), (32768, 128, 256), (65536, 128, 512), (2048, 4, 512)],
+)
+def test_capacity_sized_compressed_rows_are_identical_for_every_query(
+    raw_capacity, compress_ratio, count
+):
+    """Sizing ``count`` from capacity makes every query request the same rows.
+
+    This is the premise ``nki_mla._build_uniform_span`` rests on, so pin it
+    where the arithmetic lives rather than implicitly inside the kernel. When
+    ``count >= raw_capacity // compress_ratio``, no reachable position can push
+    ``visible`` past ``count``, so ``used == visible``, ``start`` is identically
+    zero, and only ``valid`` varies across queries.
+    """
+    assert count >= raw_capacity // compress_ratio
+    # Every position the context can hold, including its two last ones.
+    positions = torch.tensor(
+        sorted({*range(min(raw_capacity, 4096)), raw_capacity - 2, raw_capacity - 1})
+    )
+    logical, valid = recent_compressed_logical_indices(
+        positions, compress_ratio=compress_ratio, count=count
+    )
+
+    # Every query asks for logical entries 0..count-1; -1 appears only as
+    # padding, exactly where ``valid`` is False.
+    expected = torch.arange(count, dtype=torch.int32).expand(logical.shape[0], -1)
+    assert torch.equal(logical[valid], expected[valid])
+    assert (logical[~valid] == -1).all()
+    # Validity is non-decreasing in position: the last query's prefix is a
+    # superset of every earlier one's, which is why the span is built from it.
+    used = valid.sum(dim=1)
+    assert torch.equal(used, used.cummax(dim=0).values)
+
+
 def test_bounded_logical_mapping_validates_requests_columns_and_blocks():
     logical = torch.tensor([[0, 3, 4, -1], [1, 8, 2, 7]], dtype=torch.int32)
     requested = torch.ones_like(logical, dtype=torch.bool)

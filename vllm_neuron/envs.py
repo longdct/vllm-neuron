@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     VLLM_NEURON_LOG_LEVEL: str = "INFO"
     VLLM_NEURON_DEBUG_MODE: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
-    VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
     # Renderer thread-pool size for the EPD Router's HF preprocessing offload.
     # vLLM defaults this to 1; >1 parallelizes the GIL-releasing native image
     # decode/transform. Only safe because the Router disables the mm processor
@@ -144,11 +143,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Renderer thread-pool size for the EPD Router's HF preprocessing offload.
     "VLLM_NEURON_EPD_RENDERER_WORKERS": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_EPD_RENDERER_WORKERS")) or 4
-    ),
-    # When True, disable the parallel-trace fork pool entirely and run
-    # graph extraction sequentially in the parent process.
-    "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
-        maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (
@@ -284,9 +278,6 @@ def __getattr__(name: str) -> Any:
     """
     Gets environment variables lazily.
 
-    Falls through to libtorch_neuronx_lite.envs for NEURON_LIBTORCH_* names
-    so callers can access libtorch env vars via this module.
-
     Args:
         name: Name of the environment variable to retrieve
 
@@ -304,10 +295,6 @@ def __getattr__(name: str) -> Any:
     """
     if name in environment_variables:
         return environment_variables[name]()
-    if name.startswith("NEURON_LIBTORCH_"):
-        import libtorch_neuronx_lite.envs as libtorch_envs
-
-        return getattr(libtorch_envs, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -356,35 +343,28 @@ def is_set(name: str) -> bool:
 
 
 def is_native_backend() -> bool:
-    """Return True when VLLM_NEURON_BACKEND=neuron_native."""
-    return os.getenv("VLLM_NEURON_BACKEND", "").lower() == "neuron_native"
+    """Validate that TorchNeuron Native is selected."""
+    value = os.getenv("VLLM_NEURON_BACKEND", "").lower()
+    if value == "vllm_neuron":
+        raise ValueError(
+            "VLLM_NEURON_BACKEND=vllm_neuron is retired; install torch-neuronx "
+            "and unset VLLM_NEURON_BACKEND."
+        )
+    if value not in ("", "neuron_native"):
+        raise ValueError(f"Unsupported VLLM_NEURON_BACKEND value: {value!r}")
+    return True
 
 
 def get_compile_backend_name() -> str:
-    """Return the torch.compile backend name.
-
-    The native route registers lite's backend on demand and returns its name.
-    That name is intentionally not "neuron": "neuron" stays reserved for the
-    torch_neuronx package so a separate install keeps upstream semantics.
-    The XLA route uses "neuron_libtorch", registered at lite import.
-    """
-    if is_native_backend():
-        from libtorch_neuronx_lite.compile.native_backend import register
-
-        # register() is idempotent: repeated calls return the same name
-        # without re-registering, so calling it from this getter is safe.
-        return register()
-    return "neuron_libtorch"
+    """Return the TorchNeuron Native torch.compile backend."""
+    is_native_backend()
+    return "neuron"
 
 
 def get_dist_backend() -> str:
-    """Return the distributed backend for the selected execution route.
-
-    The native route needs Gloo for CPU control-plane collectives and Neuron
-    for PrivateUse1 tensor collectives, so it returns a composite backend that
-    lets PyTorch dispatch each collective by its tensor device.
-    """
-    return "cpu:gloo,neuron:neuron" if is_native_backend() else "gloo"
+    """Dispatch CPU and Neuron collectives to their Native backends."""
+    is_native_backend()
+    return "cpu:gloo,neuron:neuron"
 
 
 def get_neuron_compile_cache_dir() -> str:

@@ -7,7 +7,7 @@ from nkilib.core.output_projection.output_projection_cte import (
 )
 from nkilib.core.utils.common_types import QuantizationType
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 P_MAX = 128

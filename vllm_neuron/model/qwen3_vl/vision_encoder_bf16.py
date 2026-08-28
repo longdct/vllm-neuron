@@ -4,7 +4,7 @@
 Complete vision transformer implementation: PatchEmbed → Blocks × depth → Merger.
 Produces main embeddings and deepstack features at specified intermediate layers.
 
-libtorch_neuronx_lite patches F.gelu/nn.GELU with a C extension that torch.compile
+TorchNeuron Native patches F.gelu/nn.GELU with a C extension that torch.compile
 (Dynamo) cannot trace through. This module provides erf-based equivalents
 decorated with @torch.compiler.allow_in_graph.
 

@@ -28,7 +28,7 @@ def model_load(checkpoint_path: str):
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint)
     model.to("neuron:0")
-    model = torch.compile(model, backend="neuron_libtorch")
+    model = torch.compile(model, backend="neuron")
     return model
 
 

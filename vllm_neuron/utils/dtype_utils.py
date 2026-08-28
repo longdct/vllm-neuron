@@ -20,7 +20,7 @@ _FP8_E4M3FN_MAX = 448.0
 
 
 def _resolve_fp8_clamp_max() -> float:
-    from libtorch_neuronx_lite.compile.platform import get_platform_target
+    from torch_neuronx.utils import get_platform_target
 
     try:
         target = get_platform_target()

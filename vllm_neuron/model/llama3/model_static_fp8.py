@@ -52,7 +52,7 @@ from nkilib.core.utils.common_types import NormType, QuantizationType
 
 import torch
 import vllm_neuron.functional as NF
-from libtorch_neuronx_lite.compile.platform import get_platform_target
+from torch_neuronx.utils import get_platform_target
 from vllm_neuron.functional.attention.attention_decode import (
     _swizzle_packed_k,
     _unswizzle_packed_k,

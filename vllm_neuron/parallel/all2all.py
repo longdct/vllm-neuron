@@ -9,7 +9,7 @@ from vllm.logger import init_logger
 from vllm.distributed.parallel_state import get_node_count, get_world_group
 
 from vllm_neuron import envs
-from libtorch_neuronx_lite.compile.platform import get_platform_target
+from torch_neuronx.utils import get_platform_target
 from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
 )

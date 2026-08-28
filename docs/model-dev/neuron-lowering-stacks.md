@@ -1,5 +1,11 @@
 # Which Neuron stack are you talking about?
 
+> Migration note (2026-08-24): this plugin now runs stack 3, TorchNeuron
+> Native, using the external `torch-neuronx` package and `backend="neuron"`.
+> Statements below that stack 3 cannot run the plugin describe the historical
+> lite-based release and are retained as provenance, not current behavior. See
+> [TorchNeuron Native backend](../design/compilation/torch-neuronx-native.md).
+
 Two different things get called "torch 2.12", and they give **opposite answers**
 about the `Tensor.split` defect. Claims about it are irreproducible unless they
 name the stack, so this is the procedure for reproducing any of them, and the

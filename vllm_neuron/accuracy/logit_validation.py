@@ -313,7 +313,7 @@ def logit_validation(
 
         test_device: Device to run validation on. Either "cpu" or "neuron".
             When "cpu", uses a CPU-based allclose implementation. When "neuron",
-            uses neuron_allclose from libtorch_neuronx_lite. Defaults to "cpu".
+            uses neuron_allclose from TorchNeuron Native. Defaults to "cpu".
 
         output_dir: Directory for visualization outputs.
         visualize: Whether to generate plots and save logits.
@@ -1804,7 +1804,7 @@ def multi_prompt_logit_validation(
         colorize: If True, colorize output based on thresholds.
         test_device: Device to run validation on. Either "cpu" or "neuron".
             When "cpu", uses a CPU-based allclose implementation. When "neuron",
-            uses neuron_allclose from libtorch_neuronx_lite. Defaults to "cpu".
+            uses neuron_allclose from TorchNeuron Native. Defaults to "cpu".
         replicate_to_batch_size: If set, replicates each prompt's input_ids
             and logits to this batch size before validation. This simulates
             batched inference without requiring callers to manually duplicate

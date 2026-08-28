@@ -12,12 +12,16 @@ correctness** — every entry here spent time as an unknown-unknown, and several
 looked healthy for weeks. Treat it as a list of known landmines in a field that
 has not been swept.
 
-**Which stack.** Everything below was observed on the stack vLLM runs on:
-`libtorch-neuronx-lite` + `torch-xla` (the `neuron_libtorch` backend), verified
-on both the torch 2.11 and torch 2.12 release lines. The from-source
-`torch-neuronx` is a different lowering path and does not share all of these —
-see [neuron-lowering-stacks.md](neuron-lowering-stacks.md) before quoting any of
-it as "Neuron behaviour".
+**Which stack.** The historical inventory below was observed on the retired
+lite/XLA route. The plugin now uses TorchNeuron Native from the external
+`torch-neuronx` package with `backend="neuron"`. The workarounds remain because
+several divergences only reproduced in production-sized graphs.
+
+On `torch-neuronx==2.12.3.0.0+aa8779f4.dev` with torch 2.12.1, the full harness
+was re-characterized on Trn2. Entries 1 (`split`), 6 (`topk` index dtype), and 9
+(stride-2 partial store) now match CPU. Entry 11 remains rejected, entries 2,
+4, 5, 7, and 10 match in isolation but retain their workarounds, and the
+kernel-level wide-gather case remains outside this torch-op harness.
 
 ## Quick reference
 
@@ -77,10 +81,8 @@ reproduced", never as "fixed".
 Two things the harness had to learn the hard way, both worth copying into any
 similar tool:
 
-* **Each check runs in its own subprocess.** When the backend cannot lower an
-  op it does not raise into Python — `libtorch_neuronx_lite/compile/cache.py`
-  logs "Compilation failed — terminating process for cleanup" and takes the
-  interpreter down. In-process, entry 9 ends the run where it sits.
+* **Each check runs in its own subprocess.** This isolates compiler/runtime
+  failures and keeps one unsupported form from contaminating later checks.
 * **Compile with `fullgraph=True`.** At the default `fullgraph=False`, Dynamo
   graph-breaks around a data-dependent branch and runs it in eager, so entry 11
   passes and hides the exact limitation under test. `fullgraph=True` is also

@@ -15,7 +15,7 @@ from vllm_neuron.parallel.neuron_parallel_state import (
     is_internode_group,
     get_node_group,
 )
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 
 
 def all_to_all_v(

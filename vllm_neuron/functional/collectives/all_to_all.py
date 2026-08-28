@@ -16,14 +16,14 @@ def _compute_use_allgather_fallback() -> bool:
     cross-device all_to_all. We emulate it via all_gather (which uses
     ring/tree algorithms that work cross-device) followed by a local slice.
 
-    The platform helper lives in ``libtorch_neuronx_lite`` and is imported
+    The platform helper lives in ``TorchNeuron Native`` and is imported
     lazily so this module still imports cleanly on CPU/CI hosts where the
     Neuron runtime is absent.
     """
     if envs.VLLM_NEURON_CPU_MODE:
         return False
     try:
-        from libtorch_neuronx_lite.compile.platform import get_platform_target
+        from torch_neuronx.utils import get_platform_target
 
         return get_platform_target() == "trn2"
     except Exception:

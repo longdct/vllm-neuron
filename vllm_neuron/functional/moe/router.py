@@ -10,7 +10,7 @@ import nki
 from nkilib.core.router_topk.router_topk import router_topk
 from nkilib.core.utils.common_types import RouterActFnType
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 router_topk_jit = nki.jit(router_topk)

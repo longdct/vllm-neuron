@@ -2,9 +2,9 @@
 setuptools-scm>=8
 urllib3>=2.6.0
 
-# Neuron torch compile/runtime framework
-# Left unpinned to resolve based on vLLM's torch requirement
-libtorch-neuronx-lite
+# TorchNeuron Native is an external prerequisite. Install it first so dependency
+# resolution does not replace its matching PyTorch build. Tested with
+# torch-neuronx==2.12.3.0.0+aa8779f4.dev and torch==2.12.1.
 
 # vLLM installation
 vllm==0.24.0

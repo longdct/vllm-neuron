@@ -19,7 +19,7 @@ from nkilib.core.utils.mx_torch_common import quantize_mx_golden
 import torch
 import numpy as np
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 

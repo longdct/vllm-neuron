@@ -44,7 +44,6 @@ from vllm_neuron.utils.hardware_config import (
 from vllm.utils.network_utils import get_open_port
 from vllm_neuron.parallel.neuron_parallel_state import tp_barrier
 from vllm_neuron.vllm.platform import NeuronPlatform
-from vllm_neuron.vllm.worker.hlo_cache import quarantine_incomplete_hlo_captures
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
     NeuronProfiler,
@@ -261,7 +260,7 @@ def rendezvous_ccom_bootstrap(data_parallel_index: int = 0):
         # Precedence:
         #   1. NEURON_VISIBLE_DEVICES-derived per-engine port (DI mode). This
         #      MUST win over any inherited NEURON_RT_ROOT_COMM_ID: the runtime
-        #      dep ``libtorch_neuronx_lite`` presets that var at import time to
+        #      dep ``TorchNeuron Native`` presets that var at import time to
         #      MASTER_ADDR:MASTER_PORT (default ``localhost:62182``) — the SAME
         #      value in every co-located engine's process. Treating that shared
         #      preset as a "pin" is exactly what deadlocks the CCOM bootstrap
@@ -792,16 +791,19 @@ class NeuronWorker(WorkerBase):
             data_parallel_index=parallel_config.data_parallel_index
         )
 
-        # Initialize the Neuron runtime NOW — after rendezvous has set the
+        # Select the Native Neuron device NOW — after rendezvous has set the
         # correct NEURON_RT_ROOT_COMM_ID but before NIXL/libfabric tries to
-        # register device memory.  The runtime latches COMM_ID during
-        # initialize() and never re-reads it, so the ordering is critical:
+        # register device memory. Native runtime initialization is lazy, and
+        # set_device is the supported entry point that establishes the worker
+        # device without relying on the retired neuron.Runtime custom class.
+        # The ordering remains critical:
         #   1. gloo init  (above)
         #   2. rendezvous_ccom_bootstrap  →  sets unique COMM_ID per server
-        #   3. runtime.initialize()       →  latches COMM_ID, maps HBM
+        #   3. set_device()               →  Native runtime can latch COMM_ID
         if self._use_neuron_device():
-            runtime = torch.classes.neuron.Runtime()
-            runtime.initialize()
+            import torch_neuronx
+
+            torch_neuronx.set_device(self.local_rank)
 
     def load_model(self) -> None:
         """
@@ -856,9 +858,13 @@ class NeuronWorker(WorkerBase):
         return bytes_free
 
     def _query_runtime_memory_stats(self) -> tuple[int, int]:
-        """Query Neuron runtime for used/free HBM bytes."""
-        runtime = torch.classes.neuron.Runtime()
-        bytes_used, bytes_free = runtime.get_vnc_memory_stats()
+        """Query TorchNeuron Native for used/free HBM bytes."""
+        import torch_neuronx
+
+        device = self.local_rank
+        total_bytes = torch_neuronx.get_device_properties(device).total_memory
+        bytes_used = torch_neuronx.memory_reserved(device)
+        bytes_free = total_bytes - bytes_used
 
         if bytes_used < 0 or bytes_free <= 0:
             raise RuntimeError(
@@ -981,9 +987,12 @@ class NeuronWorker(WorkerBase):
         This is used during CPU Compilation flow and computes bytes used
         based on the model params and buffer sizes.
         """
-        from libtorch_neuronx_lite.compile.platform import get_total_available_memory
+        import torch_neuronx
 
-        total_hbm_bytes = get_total_available_memory() * 1024 * 1024 * 1024
+        props = torch_neuronx.get_device_properties(0)
+        total_hbm_bytes = int(getattr(props, "total_memory", 0))
+        if not total_hbm_bytes:
+            raise RuntimeError("torch-neuronx did not report device memory")
         bytes_used = self._get_byte_used_from_model()
         return self._compute_kv_budget(total_hbm_bytes, bytes_used, gpu_mem_util)
 
@@ -1172,31 +1181,14 @@ class NeuronWorker(WorkerBase):
             or mm_language_model_only
             or (skip_prefill_warmup and not mm_encoder_only)
         )
-        has_capture_backend = (
-            self.model_runner.capture_backend_model is not None
-            or self.model_runner.vision_capture_backend is not None
+        has_compiled_model = (
+            self.model_runner.compiled_warmup_model is not None
+            or self.model_runner.compiled_vision_warmup is not None
         )
         # The native route has no graph-capture sidecar: it precompiles the
         # torch.compile wrapper directly to StableHLO/NEFF.
         native_compile_only = envs.is_native_backend()
-        if has_capture_backend or native_compile_only:
-            if not native_compile_only:
-                # A process that died after graph capture but before compilation
-                # leaves an incomplete rank directory that parallel_compile()
-                # would otherwise submit alongside this run's graphs.
-                from libtorch_neuronx_lite import envs as libtorch_envs
-                from libtorch_neuronx_lite.compile.platform import get_server_prefix
-
-                compile_base_dir = self.model_runner.compile_options.get(
-                    "compiler_workdir", libtorch_envs.get_neuron_compile_cache_dir()
-                )
-                tp_group = get_tp_group()
-                tp_rank = tp_group.rank_in_group if tp_group.world_size >= 1 else 0
-                quarantine_incomplete_hlo_captures(
-                    compile_base_dir,
-                    get_server_prefix(),
-                    tp_rank,
-                )
+        if has_compiled_model or native_compile_only:
             if skip_prefill_warmup:
                 logger.info(
                     "Skipping prefill graph extraction (kv_role=%s, decode-only server)",
@@ -1215,10 +1207,6 @@ class NeuronWorker(WorkerBase):
             )
             logger.info("Barrier: waiting for all ranks to finish graph extraction")
             tp_barrier()
-            if not native_compile_only:
-                # graph.hlo -> XLA compilation. Native fork workers have
-                # already persisted their StableHLO-derived NEFFs.
-                self.model_runner.parallel_compile()
             logger.info("Barrier: waiting for all ranks to finish compilation")
             tp_barrier()
 
@@ -1322,7 +1310,7 @@ class NeuronWorker(WorkerBase):
         target_model = (
             self.model_runner.model
             if native_compile_only
-            else self.model_runner.capture_backend_model
+            else self.model_runner.compiled_warmup_model
         )
         jobs: list[tuple] = []
         for bucket_size, kv_seg_size in sorted(buckets, reverse=True):
@@ -1367,7 +1355,7 @@ class NeuronWorker(WorkerBase):
         target_model = (
             self.model_runner.model
             if native_compile_only
-            else self.model_runner.capture_backend_model
+            else self.model_runner.compiled_warmup_model
         )
         jobs: list[tuple] = []
         for batch_size, ctx_bucket in targets:
@@ -1408,10 +1396,10 @@ class NeuronWorker(WorkerBase):
         """Build vision jobs for XLA capture or native precompile.
 
         Native jobs invoke the separately compiled ``visual`` wrapper used by
-        parent warmup; XLA-capture jobs use ``vision_capture_backend``. Buckets
+        parent warmup; XLA-capture jobs use ``compiled_vision_warmup``. Buckets
         are sorted largest-first (LPT scheduling).
         """
-        if not native_compile_only and self.model_runner.vision_capture_backend is None:
+        if not native_compile_only and self.model_runner.compiled_vision_warmup is None:
             return []
         vnc = self.model_runner.vision_neuron_config
         if vnc is None or vnc.num_vision_tokens_buckets is None:
@@ -1424,7 +1412,7 @@ class NeuronWorker(WorkerBase):
         target_model = (
             unwrapped.visual
             if native_compile_only
-            else self.model_runner.vision_capture_backend
+            else self.model_runner.compiled_vision_warmup
         )
         device = (
             self.model_runner.device if native_compile_only else torch.device("meta")
@@ -1451,33 +1439,6 @@ class NeuronWorker(WorkerBase):
             )
             jobs.append((target_model, kwargs))
         return jobs
-
-    def _run_parallel_trace_jobs(
-        self, jobs: list[tuple], *, native_compile_only: bool = False
-    ) -> bool:
-        """Send target-model trace jobs to the parallel-trace fork pool.
-
-        Returns True if the pool ran, False if it was bypassed via
-        ``VLLM_NEURON_DISABLE_PARALLEL_TRACE`` (caller falls back to
-        the in-process sequential path).
-        """
-        from libtorch_neuronx_lite.compile.parallel_trace import parallel_trace
-
-        if envs.VLLM_NEURON_DISABLE_PARALLEL_TRACE:
-            return False
-        # native_compile_only exists only in the native lite wheel's
-        # parallel_trace(). The XLA route runs on the base image's default lite,
-        # whose older signature would raise TypeError on the kwarg, so only pass
-        # it on the native path.
-        if native_compile_only:
-            parallel_trace(
-                jobs=jobs,
-                parent_rank=self.rank,
-                native_compile_only=True,
-            )
-        else:
-            parallel_trace(jobs=jobs, parent_rank=self.rank)
-        return True
 
     def _prefill_compile_targets(self) -> list[tuple[int, int]]:
         """Enumerate (num_batched_tokens, kv_segment_size) pairs to compile.
@@ -1544,35 +1505,9 @@ class NeuronWorker(WorkerBase):
                 len(vision_jobs),
             )
 
-        prefill_jobs = self._build_prefill_trace_jobs(
-            prefill_buckets, native_compile_only=native_compile_only
-        )
-        decode_jobs = self._build_decode_trace_jobs(
-            decode_targets, native_compile_only=native_compile_only
-        )
-
-        target_jobs = prefill_jobs + decode_jobs + vision_jobs
-
-        if self._run_parallel_trace_jobs(
-            target_jobs, native_compile_only=native_compile_only
-        ):
-            # Drafter graphs run sequentially against ``self.device`` —
-            # the fork pool only handled target-model jobs.
-            if native_compile_only:
-                return
-            has_drafter = self.model_runner.drafter is not None
-            if has_drafter and not skip_prefill:
-                self._extract_prefill_drafter_graphs(prefill_buckets)
-            if has_drafter and not skip_decode:
-                self._extract_decode_drafter_graphs(decode_targets)
-            return
-
-        # Native fallback deliberately does no extraction here. Parent warmups
-        # retrace each bucket, compile StableHLO sequentially, and execute on NRT.
-        if native_compile_only:
-            return
-
-        # Legacy sequential fallback: in-process extraction (target + drafter
+        # Compile every configured bucket deterministically in-process.
+        # CPU compile-only materializes NEFFs without executing them.
+        # Sequential Native warmup: in-process extraction (target + drafter
         # together) for each prefill bucket, then each decode target.
         if not skip_prefill:
             self._extract_prefill_graphs_sequential(prefill_buckets)
@@ -1651,8 +1586,6 @@ class NeuronWorker(WorkerBase):
 
         Drives the capture backend directly with synthetic per-bucket inputs.
         """
-        from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
-
         vnc = self.model_runner.vision_neuron_config
         unwrapped = self._unwrap_vision_model()
         if unwrapped is None:
@@ -1665,7 +1598,7 @@ class NeuronWorker(WorkerBase):
             sorted_buckets,
         )
 
-        capture_backend = self.model_runner.vision_capture_backend
+        compiled_vision = self.model_runner.compiled_vision_warmup
         meta = torch.device("meta")
         for i, bucket in enumerate(sorted_buckets, 1):
             logger.info(
@@ -1692,10 +1625,7 @@ class NeuronWorker(WorkerBase):
             vision_inputs["write_block_ids"] = torch.zeros(
                 num_blocks, dtype=torch.int64, device=meta
             )
-            try:
-                capture_backend(**vision_inputs)
-            except CaptureComplete:
-                pass
+            compiled_vision(**vision_inputs)
             logger.info(
                 "  Successfully extracted vision graph for bucket %s",
                 bucket,
@@ -1819,7 +1749,7 @@ class NeuronWorker(WorkerBase):
         ``self.device``. Caller must ensure a drafter is attached.
 
         TODO: migrate the drafter to the parallel-trace fork pool. Eagle
-        wraps ``propose()`` rather than calling ``capture_backend_model``
+        wraps ``propose()`` rather than calling ``compiled_warmup_model``
         directly, so it doesn't fit the ``(model, kwargs)`` primitive
         without an adapter that exposes ``_orig_mod`` for the meta swap.
         """

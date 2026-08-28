@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from libtorch_neuronx_lite.compile.platform import get_platform_target
+from torch_neuronx.utils import get_platform_target
 
 logger = logging.getLogger(__name__)
 

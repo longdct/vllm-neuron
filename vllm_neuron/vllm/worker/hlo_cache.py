@@ -21,7 +21,7 @@ def quarantine_incomplete_hlo_captures(
 ) -> list[tuple[str, Path]]:
     """Quarantine stale captures owned by this server and TP rank.
 
-    ``parallel_compile`` discovers HLOs in immediate
+    ``Native cache`` discovers HLOs in immediate
     ``<server-prefix>.rank<N>`` children of each cache-key directory. Moving an
     incomplete capture one level below the hidden quarantine directory keeps
     all of its diagnostics while removing it from compiler discovery. The

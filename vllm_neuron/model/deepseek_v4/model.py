@@ -91,8 +91,9 @@ from .indexer import (
 )
 from .mhc import apply_hyperconnection, hyperconnection_reference
 from .moe import dense_expert_affinities, hash_topk, routed_topk
+from .nki_compressor import paged_gated_compressor
 from .nki_indexer import paged_projected_bf16_indexer
-from .nki_mla import paged_shared_latent_mla
+from .nki_mla import _HCA_COUNT_BUCKETS, paged_shared_latent_mla
 from .parallel import resolve_parallel_topology
 from .weight_loaders import ExpertDType, load_checkpoint_weights
 
@@ -365,17 +366,44 @@ class DeepseekV4Compressor(nn.Module):
         state_slot_mapping: torch.Tensor,
         mla_cache: torch.Tensor,
         mla_slot_mapping: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compress all packed tokens with one projection/gather/scatter body.
+    ) -> None:
+        """Project packed tokens and write boundary-completed cache entries.
 
         Raw projections are scattered first, so a fixed window ending at each
-        query naturally includes earlier tokens from the same prefill chunk.
-        Non-boundary candidates are computed but discarded through ``-1`` slot
-        mappings, keeping the captured graph independent of runtime boundaries.
+        completion candidate naturally includes earlier tokens from the same
+        prefill chunk. On Neuron, the boundary-only NKI path gathers and reduces
+        only ``ceil(Q / ratio)`` candidate windows. CPU and the explicit
+        ``VLLM_NEURON_DSV4_NKI_COMPRESSOR=0`` fallback retain the portable
+        per-query oracle.
         """
         assert self.state_cache is not None
         kv_gate = self.fused_wkv_wgate(hidden)
         scatter_paged_latent(self.state_cache, state_slot_mapping, kv_gate)
+        use_nki = can_run_kernel(hidden) and os.environ.get(
+            "VLLM_NEURON_DSV4_NKI_COMPRESSOR", "1"
+        ) != "0"
+        if use_nki:
+            compressed, entry_positions, output_slots, _ = paged_gated_compressor(
+                self.state_cache,
+                positions.reshape(-1),
+                token_to_request.reshape(-1),
+                state_block_tables,
+                mla_slot_mapping,
+                self.ape.to(torch.bfloat16),
+                ratio=self.ratio,
+                overlap=self.overlap,
+            )
+            entry = compressed.unsqueeze(1)
+            entry_positions = entry_positions.reshape(-1, 1)
+            cos, sin = self.rotary_emb(
+                entry, position_ids=entry_positions, layer_type="compress"
+            )
+            finalized = finalize_compressed_entries(
+                entry, self.norm_weight, self.rms_norm_eps, cos, sin
+            ).squeeze(1)
+            scatter_paged_latent(mla_cache, output_slots, finalized)
+            return
+
         window = self.coff * self.ratio
         replay, valid = gather_recent_window_batched(
             self.state_cache,
@@ -400,7 +428,6 @@ class DeepseekV4Compressor(nn.Module):
             entry, self.norm_weight, self.rms_norm_eps, cos, sin
         ).squeeze(1)
         scatter_paged_latent(mla_cache, mla_slot_mapping, finalized)
-        return finalized
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -1305,6 +1332,7 @@ class DeepseekV4Attention(nn.Module):
         )
         compressed_slots = None
         compressed_valid = None
+        compressed_uniform = False
 
         if self.compressor is not None:
             mla_entry = attn_metadata[self_attn_name]
@@ -1325,23 +1353,61 @@ class DeepseekV4Attention(nn.Module):
                 mla_slot_mapping=mla_slots,
             )
             if self.indexer is None:
-                # HCA uses a deterministic bounded suffix. Prefill always uses
-                # 1024 compressed entries; decode chooses its static geometry
-                # from the compiled context capacity.
-                if hidden.shape[0] == 1:
-                    raw_capacity = (
-                        mla_entry["block_table_tensor"].shape[1]
-                        * self.mla_raw_block_size
+                # HCA uses a deterministic bounded suffix sized from the
+                # compiled context capacity, in prefill as well as decode.
+                #
+                # The suffix can never hold more entries than the context can
+                # produce (capacity / ratio), and every slot past that is masked
+                # -inf. The online softmax absorbs those exactly: an all-invalid
+                # tile has tile max -inf, so the merged max is unchanged,
+                # prior_scale is exp(0) == 1, and its sum contribution is zero.
+                # Prefill used to request 1024 entries unconditionally, which at
+                # a 2048-token context is 64x more rows per query than can ever
+                # be valid -- and each gathered row costs a DMA descriptor.
+                #
+                # This is vLLM's own rule (sparse_swa.py:218-223: entries are
+                # bounded by cdiv(prefill_max_model_len, compress_ratio)),
+                # rounded up to the nearest compiled bucket.  Rounding *up* is
+                # load-bearing: it keeps `visible <= count` for every reachable
+                # position, so `recent_compressed_logical_indices` returns
+                # `start == 0` for every query and each query's requested rows
+                # are identical.  That is exactly `compressed_uniform`, which
+                # lets the kernel gather the stream once per launch instead of
+                # once per query.  Never round down.
+                #
+                # `block_table_tensor.shape[1]` is a static shape, so this stays
+                # a trace-time Python int and compiles to one specialization.
+                capacity_entries = mla_entry["block_table_tensor"].shape[1] * (
+                    self.mla_raw_block_size // self.ratio
+                )
+                eligible = [
+                    bucket
+                    for bucket in _HCA_COUNT_BUCKETS
+                    if bucket >= capacity_entries
+                ]
+                if not eligible:
+                    raise RuntimeError(
+                        "DeepSeek-V4 HCA context capacity needs "
+                        f"{capacity_entries} compressed entries; the largest "
+                        f"compiled bucket is {max(_HCA_COUNT_BUCKETS)}"
                     )
-                    compressed_count = (
-                        32
-                        if raw_capacity <= 4096
-                        else 256
-                        if raw_capacity <= 32768
-                        else 1024
+                compressed_count = min(eligible)
+                # The span the kernel builds is one request's block table, so a
+                # launch may not mix requests.  The CSA path already refuses
+                # that (IndexerModule.forward_packed); HCA layers have no
+                # indexer, so state it here rather than inherit it silently.
+                if can_run_kernel(hidden):
+                    multiple_requests = not torch.compiler.is_compiling() and bool(
+                        (owners != 0).any()
                     )
-                else:
-                    compressed_count = 1024
+                    if (
+                        mla_entry["block_table_tensor"].shape[0] != 1
+                        or multiple_requests
+                    ):
+                        raise RuntimeError(
+                            "DeepSeek-V4 NKI HCA milestone supports one TP1 request"
+                        )
+                compressed_uniform = True
                 logical, requested = recent_compressed_logical_indices(
                     pos, compress_ratio=self.ratio, count=compressed_count
                 )
@@ -1399,6 +1465,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_slots=compressed_slots,
                 compressed_valid=compressed_valid,
                 sinks=self.sinks,
+                compressed_uniform=compressed_uniform,
             )
         )
         attended = self.capture_attended_roped(attended)

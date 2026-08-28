@@ -79,7 +79,6 @@ from vllm_neuron.model.interfaces import SupportsMRoPE
 from vllm_neuron.model.neuron_config import (
     NeuronConfig,
 )
-from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
@@ -1242,11 +1241,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         cpu_mode = envs.VLLM_NEURON_CPU_MODE
         cpu_compile = envs.VLLM_NEURON_CPU_COMPILE
         eager_mode = self.vllm_config.model_config.enforce_eager
-        from libtorch_neuronx_lite import envs as libtorch_envs
-
-        skip_graph_capture_backend = (
-            libtorch_envs.NEURON_LIBTORCH_DISABLE_GRAPH_CAPTURE_BACKEND
-        )
         assert not (eager_mode and not cpu_mode), (
             "Eager mode on Neuron is not yet supported."
         )
@@ -1395,44 +1389,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._draft_tensor_capture = None
         self._vision_tensor_capture = None
 
-        # Compile model with vllm_neuron backend for Neuron execution
-        # This is where torch.compile uses the registered "vllm_neuron" backend
-        logger.info("Compiling model with vllm_neuron backend")
+        # Compile the model with TorchNeuron Native's registered backend.
+        logger.info("Compiling model with TorchNeuron Native backend")
 
         # Disable dynamo cache limit — recompilations are caught at runtime
         # by FailOnRecompileLimitHit, so a static limit adds no value.
         torch._dynamo.config.cache_size_limit = 2**62
 
-        # Build compile options
-        self.compile_options = {"alias_meta_to_neuron": True}
+        # Translate vLLM settings into the Native compiler surface.
+        from vllm_neuron.native import native_compile_options
 
-        # FIXME: -O1 and mac-threshold are temporary until NKI adds MAC count estimates for kernels.
-        hlo2tensorizer_opts = "--modular-flow-mac-threshold=10"
-        # The unsafe fp8 cast flag is only needed on Trn2 where kernels use
-        # legacy nl.float8_e4m3 (max=240). Trn3 supports OCP e4m3fn natively.
-        from libtorch_neuronx_lite.compile.platform import get_platform_target
-
-        has_fp8 = self.vllm_config.cache_config.cache_dtype in ("fp8", "fp8_e4m3")
-        if not has_fp8 and self.vllm_config.model_config.quantization in ("modelopt",):
-            has_fp8 = True
-        if not has_fp8:
-            has_fp8 = getattr(self.neuron_config, "quantization", None) == "fp8"
-        if has_fp8 and get_platform_target() not in ("trn3", "trn3pre"):
-            hlo2tensorizer_opts += " --experimental-unsafe-fp8e4m3fn-as-fp8e4m3"
-        # vLLM optimization levels map 1:1 onto neuronx-cc optlevels (CHRS-721).
-        self.compile_options["compiler_args"] = [
+        model_name = self.vllm_config.model_config.model.rsplit("/", 1)[-1]
+        self.compile_options = native_compile_options(
+            model_name=model_name,
+            optimization_level=self.vllm_config.optimization_level.value,
+        )
+        native_flags = [
             "--auto-cast=none",
-            "--verbose=35",
-            f"-O{self.vllm_config.optimization_level.value}",
-            f"--internal-hlo2tensorizer-options={hlo2tensorizer_opts}",
-            # --enable-nested-dynamic-loop: NKI kernels may contain nested
-            # dynamic loops (scf.for inside scf.for). After inline_nki_kernel
-            # inlines kernel BIR into the parent graph, birverifier rejects the
-            # resulting multiple back-edges without this flag.
-            "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
         ]
+        existing_flags = os.environ.get("NEURON_CC_FLAGS", "")
+        os.environ["NEURON_CC_FLAGS"] = " ".join(
+            [existing_flags, *native_flags]
+        ).strip()
         logger.info(
-            "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
+            "TorchNeuron Native optlevel -O%s",
             self.vllm_config.optimization_level.value,
         )
 
@@ -1450,23 +1430,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Note: When eager mode is enabled, torch compile becomes a no op.
         from vllm_neuron.envs import get_compile_backend_name
 
-        if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
-            logger.debug("Graph capture and parallel compilation is disabled.")
-            self.capture_backend_model = None
-        else:
-            self.capture_backend_model = torch.compile(
-                self.model,
-                backend="neuron_libtorch_graph_capture",
-                fullgraph=fullgraph_enabled,
-                options=self.compile_options,
-            )
-
         self.model = torch.compile(
             self.model,
             backend=get_compile_backend_name(),
             fullgraph=fullgraph_enabled,
+            # Every Neuron bucket is a separate static NEFF. Without this,
+            # Dynamo generalizes dimensions after seeing prefill-8 and
+            # prefill-64, then exports decode with an unsupported s64[?] input.
+            dynamic=False,
             options=self.compile_options,
         )
+        # Native compilation is materialized by deterministic warmup calls.
+        self.compiled_warmup_model = self.model
 
         # Compile vision encoder separately (called from embed_multimodal,
         # not from the main text model forward graph).
@@ -1476,25 +1451,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ):
             inner_model = getattr(self.model, "_orig_mod", self.model)
 
-            if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
-                self.vision_capture_backend = None
-            else:
-                self.vision_capture_backend = torch.compile(
-                    inner_model.visual,
-                    backend="neuron_libtorch_graph_capture",
-                    fullgraph=fullgraph_enabled,
-                    options=self.compile_options,
-                )
-
             inner_model.visual = torch.compile(
                 inner_model.visual,
                 backend=get_compile_backend_name(),
                 fullgraph=fullgraph_enabled,
+                dynamic=False,
                 options=self.compile_options,
             )
+            self.compiled_vision_warmup = inner_model.visual
             logger.info("Vision encoder compiled separately")
         else:
-            self.vision_capture_backend = None
+            self.compiled_vision_warmup = None
 
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
@@ -2925,6 +2892,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            token_to_request=torch.repeat_interleave(
+                torch.arange(padded_num_reqs, dtype=torch.int32),
+                max_num_scheduled_tokens_padded,
+            )[:total_num_scheduled_tokens_padded],
         )
 
         # Spec decoding
@@ -4097,6 +4068,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        token_to_request: torch.Tensor | None = None,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -4254,6 +4226,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # not the SWA-windowed view. Currently used by
                 # ``correct_spec_decode_positions_and_slot_mapping``.
                 "full_block_table_tensor": full_blk_table_tensor,
+                # Explicit ownership for packed, unequal-length request rows.
+                # Attention must never infer this from T // B.
+                "token_to_request": (
+                    token_to_request.to(device=self.device, dtype=torch.int32)
+                    if token_to_request is not None
+                    else torch.arange(total_num_scheduled_tokens, device=self.device)
+                    .mul(padded_num_reqs)
+                    .div(total_num_scheduled_tokens, rounding_mode="floor")
+                    .to(torch.int32)
+                ),
             }
             if raw_blk_table_tensor is not None:
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
@@ -4487,6 +4469,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ),
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
+                "token_to_request": torch.arange(num_tokens, device=device)
+                .mul(num_reqs)
+                .div(num_tokens, rounding_mode="floor")
+                .to(torch.int32),
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
@@ -4615,11 +4601,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kv_segment_size: int,
         device: torch.device | None = None,
     ) -> None:
-        """
-        Extract the prefill HLO graphs with a specific bucket size and KV segment size.
-        This uses the neuron graph capture backend to get all the HLO Graphs and throws
-        CaptureComplete exception to dynamo which is suppressed here as it marks
-        successful graph capture.
+        """Materialize a Native prefill bucket through the compiled model.
 
         Args:
             bucket_size: The number of active tokens to warm up (prefill bucket size)
@@ -4627,7 +4609,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device: Override device for synthetic inputs. Defaults to
                 ``self.device``.
         """
-        if self.capture_backend_model is None:
+        if self.compiled_warmup_model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         logger.info(
             "Capturing prefill graphs for: bucket_size=%s, kv_segment_size=%s",
@@ -4637,14 +4619,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kwargs = self._build_prefill_synthetic_inputs(
             bucket_size, kv_segment_size, device=device
         )
-        try:
-            _ = self.capture_backend_model(**kwargs)
-        except CaptureComplete:
-            logger.debug(
-                "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
-                bucket_size,
-                kv_segment_size,
-            )
+        _ = self.compiled_warmup_model(**kwargs)
 
         # === Draft model graph capture ===
         if self.drafter is not None:
@@ -4955,11 +4930,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ctx_bucket: int | None = None,
         device: torch.device | None = None,
     ) -> None:
-        """
-        Extract the decode HLO graphs with a specific bucket size and KV segment size.
-        This uses the neuron graph capture backend to get all the HLO Graphs and throws
-        CaptureComplete exception to dynamo which is suppressed here as it marks
-        successful graph capture.
+        """Materialize a Native decode bucket through the compiled model.
 
         Args:
             batch_size: Number of concurrent decode requests
@@ -4969,7 +4940,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device: Override device for synthetic inputs. Defaults to
                 ``self.device``.
         """
-        if self.capture_backend_model is None:
+        if self.compiled_warmup_model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         logger.info("Capturing decode graphs for batch size: %d", batch_size)
         spec_decode_enabled = (
@@ -4983,12 +4954,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device=device,
             compiled_graph_input=True,
         )
-        try:
-            _ = self.capture_backend_model(**kwargs)
-        except CaptureComplete:
-            logger.debug(
-                "Graph capture for decode completed: batch size=%s", batch_size
-            )
+        _ = self.compiled_warmup_model(**kwargs)
 
         if spec_decode_enabled:
             # === Target model decode WITHOUT spec decode ===
@@ -5005,13 +4971,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 device=device,
                 compiled_graph_input=True,
             )
-            try:
-                _ = self.capture_backend_model(**kwargs)
-            except CaptureComplete:
-                logger.debug(
-                    "Graph capture for target model decode completed: batch size=%s",
-                    batch_size,
-                )
+            _ = self.compiled_warmup_model(**kwargs)
             logger.debug(
                 "Target model decode graph capture WITHOUT spec decode completed: batch size=%s",
                 batch_size,
@@ -5158,34 +5118,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 num_reqs=batch_size,
                 attn_metadata=draft_attn_metadata,
             )
-
-    def parallel_compile(self):
-        """Deterministic parallel compile — requires a barrier before and after.
-
-        Assumes all ranks in the TP group have finished graph extraction and
-        been synchronized via a TP-scoped barrier, so the cache directory
-        contains the complete set of HLOs for this model replica. Only
-        TP-rank 0 performs compilation.
-        """
-        logger.info("Initiating parallel compile for captured graphs")
-        from vllm.distributed.parallel_state import get_tp_group
-
-        tp_group = get_tp_group()
-        rank = tp_group.rank_in_group if tp_group.world_size >= 1 else None
-        world_size = tp_group.world_size if tp_group.world_size >= 1 else None
-
-        from libtorch_neuronx_lite.compile.parallel_compile import (
-            parallel_compile as neuron_parallel_compile,
-        )
-
-        from libtorch_neuronx_lite import envs as libtorch_envs
-
-        neuron_parallel_compile(
-            options=self.compile_options,
-            rank=rank,
-            world_size=world_size,
-            remote_cache_dir=libtorch_envs.NEURON_LIBTORCH_REMOTE_CACHE,
-        )
 
     # ------------------------------------------------------------------------
     # MODEL EXECUTION
@@ -6903,51 +6835,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @contextmanager
     def _snapshot_capture_context(self, positions, spec_decode_metadata):
-        """Scope input-snapshot capture to this model's forward.
-
-        Capture is opt-in debug, so this is a zero-cost no-op when disabled.
-        When enabled, this forward's identity + capture verdict and the lite
-        capture hook are set immediately before the forward and cleared
-        immediately after — so capture is scoped to this model's executes and
-        not, e.g., a draft or vision model's, and a raised forward can't leave a
-        stale context tagging the next one.
-        """
-        if not envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
-            yield
-            return
-
-        from libtorch_neuronx_lite.compile.execute_context import clear_execute_context
-
-        from vllm_neuron.snapshot.context import clear_current_forward
-
-        try:
-            self._publish_snapshot_context(positions, spec_decode_metadata)
-            self._set_snapshot_execute_context()
-            yield
-        finally:
-            clear_current_forward()
-            clear_execute_context()
-
-    def _set_snapshot_execute_context(self):
-        """Set the lite execute context that runs input-snapshot capture.
-
-        The context wraps one shared ``SnapshotCapturer`` (its ``pre_execute`` is
-        the ``pre_execute_hook``), built once per process so the capturer's
-        per-NEFF call index persists across forwards. It is (re)set before every
-        captured forward and cleared after.
-        """
-        from libtorch_neuronx_lite.compile.execute_context import (
-            ExecuteContext,
-            set_execute_context,
-        )
-
-        if self._snapshot_execute_context is None:
-            from vllm_neuron.snapshot.capture import SnapshotCapturer
-
-            self._snapshot_execute_context = ExecuteContext(
-                pre_execute_hook=SnapshotCapturer().pre_execute
+        """Native execution-boundary snapshots are not yet supported."""
+        if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
+            raise RuntimeError(
+                "Runtime input snapshots require a TorchNeuron Native execution "
+                "hook that is unavailable in this build; disable "
+                "VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE."
             )
-        set_execute_context(self._snapshot_execute_context)
+        yield
 
     def _publish_snapshot_context(self, positions, spec_decode_metadata) -> None:
         """Resolve and publish this forward's input-snapshot context.

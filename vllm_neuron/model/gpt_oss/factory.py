@@ -4,7 +4,7 @@
 import torch.nn as nn
 from transformers import PretrainedConfig
 
-from libtorch_neuronx_lite.compile.platform import get_platform_target
+from torch_neuronx.utils import get_platform_target
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 

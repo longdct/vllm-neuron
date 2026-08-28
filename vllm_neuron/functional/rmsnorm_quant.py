@@ -24,7 +24,7 @@ from nkilib.core.rmsnorm.rmsnorm_quant import (
 from nkilib.core.rmsnorm.rmsnorm_quant_constants import RMSNormQuantConstants
 from nkilib.core.utils.common_types import DtypeMode, NormType, QuantizationType
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 

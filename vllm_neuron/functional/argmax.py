@@ -16,7 +16,7 @@ from torch.distributed._functional_collectives import all_gather_tensor
 import nki
 from nkilib.core.max.cascaded_max import cascaded_max
 from vllm_neuron import envs
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 cascaded_max_jit = nki.jit()(cascaded_max)

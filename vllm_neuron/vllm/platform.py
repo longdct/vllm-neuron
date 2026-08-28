@@ -121,7 +121,7 @@ class NeuronPlatform(Platform):
     # OOT (Out-Of-Tree) refers to hardware platforms that are integrated with vLLM
     # through plugin projects.
     _enum = PlatformEnum.OOT
-    # Note we need to make sure libtorch_neuronx_lite has been imported before
+    # Note we need to make sure TorchNeuron Native has been imported before
     # getting here. This is to guarantee the privateuseone binding and
     # neuron renaming has been registered with torch.
     device_name: str = "cpu" if envs.VLLM_NEURON_CPU_MODE else "neuron"
@@ -928,11 +928,13 @@ class NeuronPlatform(Platform):
         if cls._device_count != -1:
             return cls._device_count
 
-        runtime = torch.classes.neuron.Runtime()
-        nc_count = runtime.get_nc_count()
-        if nc_count == -1:
+        import torch_neuronx
+
+        nc_count = torch_neuronx.device_count()
+        if nc_count <= 0:
             raise RuntimeError(
-                "Neuron runtime cannot be initialized; cannot determine the number of available NeuronCores"
+                "TorchNeuron Native found no visible Neuron devices; cannot "
+                "determine the available device count"
             )
         return nc_count
 

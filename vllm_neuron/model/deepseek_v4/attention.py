@@ -27,7 +27,16 @@ class SharedLatentAttentionContract:
 
 @dataclass(frozen=True)
 class SharedLatentMLAInputs:
-    """Bounded physical-address inputs for the opaque shared-latent kernel."""
+    """Bounded physical-address inputs for the opaque shared-latent kernel.
+
+    ``compressed_uniform`` states that every query in the call requests the
+    *same* compressed logical entries, differing only in which of them are
+    valid. HCA sets it: its suffix is sized from the addressable entry capacity,
+    so ``recent_compressed_logical_indices`` returns ``start == 0`` for every
+    query and the rows repeat. CSA never can -- its rows come from a per-query
+    top-k. The kernel uses it to gather the compressed stream once per launch
+    instead of once per query; see ``nki_mla._build_uniform_span``.
+    """
 
     query: torch.Tensor
     sliding_cache: torch.Tensor
@@ -37,6 +46,7 @@ class SharedLatentMLAInputs:
     compressed_slots: torch.Tensor | None
     compressed_valid: torch.Tensor | None
     sinks: torch.Tensor
+    compressed_uniform: bool = False
 
 
 def logical_to_physical_slots_batched(
@@ -89,6 +99,14 @@ def recent_compressed_logical_indices(
     Rows are prefix packed: when fewer than ``count`` entries exist, real
     logical positions come first and ``-1`` padding follows. This is the HCA
     selection rule; CSA uses its learned :class:`IndexerSelection` instead.
+
+    Invariant the NKI span gather rests on: when ``count`` is at least the
+    addressable entry capacity, no reachable position can make ``visible``
+    exceed ``count``, so ``used == visible`` and ``start`` is identically zero.
+    Every query then asks for the same logical entries ``0 .. count-1`` and only
+    ``valid`` differs. Callers that size ``count`` from capacity may therefore
+    set ``SharedLatentMLAInputs.compressed_uniform``; see
+    ``test_capacity_sized_compressed_rows_are_identical_for_every_query``.
     """
     if positions.ndim != 1:
         raise ValueError("positions must be one-dimensional")

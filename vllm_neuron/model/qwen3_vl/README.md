@@ -63,7 +63,7 @@ Reference model: [`model/gpt_oss/model_bf16.py`](../gpt_oss/model_bf16.py)
 | FP8 KV cache               | N/A    | No KV cache in vision encoder                      |
 | Segmented prefill          | N/A    | Single-pass encoder                                |
 | On-device sampling         | N/A    | Vision encoder only                                |
-| torch.compile              | ✅     | Full-graph compilation with `backend="neuron_libtorch"` |
+| torch.compile              | ✅     | Full-graph compilation with `backend="neuron"` |
 | CPU mode                   | ✅     | All modules run on CPU with `VLLM_NEURON_CPU_MODE=1` |
 | Deepstack features         | ✅     | Intermediate layer features extracted and merged   |
 | Bounds masking             | ✅     | Per-image/frame attention isolation via bound_min/bound_max |

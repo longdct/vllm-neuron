@@ -61,7 +61,7 @@ _FP8_SCALE_COMPENSATION = _FP8_E4M3FN_MAX / _FP8_E4M3_MAX
 
 def _needs_downscale() -> bool:
     """Return True on trn2 where the STATIC kernel uses legacy 240-range fp8."""
-    from libtorch_neuronx_lite.compile.platform import get_platform_target
+    from torch_neuronx.utils import get_platform_target
 
     return get_platform_target() == "trn2"
 

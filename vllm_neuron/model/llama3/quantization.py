@@ -291,7 +291,7 @@ def resolve_attention_mlp_classes(
         # MX-specific module. Trn2 stays on the legacy STATIC fp8 module.
         import os
 
-        from libtorch_neuronx_lite.compile.platform import get_platform_target
+        from torch_neuronx.utils import get_platform_target
 
         if (
             get_platform_target() in ("trn3", "trn3pre")

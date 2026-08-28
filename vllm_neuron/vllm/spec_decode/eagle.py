@@ -11,8 +11,6 @@ from vllm.distributed.parallel_state import get_world_group
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_neuron import envs
-from libtorch_neuronx_lite import envs as libtorch_envs
-from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from vllm_neuron.metrics import (
     COMPILATION_TIME,
@@ -49,7 +47,7 @@ class EagleProposer:
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
 
         self.attn_layer_names: list[str] = []
-        self.capture_backend_model = None
+        self.compiled_warmup_model = None
 
         # We pass rank as a tensor input to avoid it becoming a constant
         # TODO: Update dist.get_rank() to avoid becoming a constant during lowering, and remove this
@@ -236,12 +234,7 @@ class EagleProposer:
         attn_metadata: AttentionMetadata,
         device: torch.device | None = None,
     ) -> None:
-        """
-        Extract the draft model's HLO graph using the
-        ``neuron_libtorch_graph_capture`` backend. Mirrors
-        ``NeuronModelRunner.extract_prefill_graphs`` and swallows the
-        ``CaptureComplete`` exception raised by the capture backend after
-        a successful trace.
+        """Materialize a draft-model bucket through Native compilation.
 
         Args:
             num_tokens: Total number of tokens
@@ -250,9 +243,9 @@ class EagleProposer:
             device: Override device for synthetic inputs. Defaults to
                 ``self.device``.
         """
-        if self.capture_backend_model is None:
+        if self.compiled_warmup_model is None:
             logger.debug(
-                "Draft graph extraction skipped (capture_backend_model is None)"
+                "Draft graph extraction skipped (compiled_warmup_model is None)"
             )
             return
 
@@ -262,19 +255,12 @@ class EagleProposer:
 
         kwargs = self._build_synthetic_inputs(num_tokens, num_reqs, device=device)
 
-        try:
-            _ = self.propose(
-                attn_metadata=attn_metadata,
-                is_warmup=True,
-                model_override=self.capture_backend_model,
-                **kwargs,
-            )
-        except CaptureComplete:
-            logger.debug(
-                "Graph capture for draft model completed: num_tokens=%d, num_reqs=%d",
-                num_tokens,
-                num_reqs,
-            )
+        _ = self.propose(
+            attn_metadata=attn_metadata,
+            is_warmup=True,
+            model_override=self.compiled_warmup_model,
+            **kwargs,
+        )
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -379,27 +365,14 @@ class EagleProposer:
         logger.info("Compiling draft model with vllm_neuron backend")
         compile_backend = envs.get_compile_backend_name()
 
-        cpu_mode = envs.VLLM_NEURON_CPU_MODE
-        eager_mode = self.vllm_config.model_config.enforce_eager
-        skip_graph_capture_backend = (
-            libtorch_envs.NEURON_LIBTORCH_DISABLE_GRAPH_CAPTURE_BACKEND
+        compiled = torch.compile(
+            self.model,
+            backend=compile_backend,
+            fullgraph=fullgraph_enabled,
+            options={"model_name": "eagle_draft"},
         )
-        if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
-            logger.debug(
-                "Draft model graph capture backend disabled "
-                "(eager/cpu/debug/skip_graph_capture_backend)."
-            )
-            self.capture_backend_model = None
-        else:
-            self.capture_backend_model = torch.compile(
-                self.model,
-                backend="neuron_libtorch_graph_capture",
-                fullgraph=fullgraph_enabled,
-            )
-
-        return torch.compile(
-            self.model, backend=compile_backend, fullgraph=fullgraph_enabled
-        )
+        self.compiled_warmup_model = compiled
+        return compiled
 
     def propose(
         self,

@@ -117,7 +117,7 @@ def run_distributed(
         inputs = [builder.shard_input(x) for x in inputs]
 
     # Compile model (now sees correctly sharded inputs during tracing)
-    model = torch.compile(model, backend="neuron_libtorch")
+    model = torch.compile(model, backend="neuron")
 
     # Execute and collect outputs
     outputs = []

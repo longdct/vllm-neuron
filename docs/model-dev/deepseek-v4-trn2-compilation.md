@@ -1,5 +1,15 @@
 # Compile DeepSeek-V4 on Trn2
 
+> **Q512/131K handoff (2026-08-26):** The current real-weight TP2/LNC2 cold
+> compile exhausts a 124 GiB host because the paged MLA kernels statically
+> expand the query axis and still materialize query-by-history latent and
+> probability tensors. See
+> [DeepSeek-V4 Q512 MLA compiler graph explosion](deepseek-v4-q512-mla-compile-explosion.md)
+> for the reproduction, artifact evidence, and implementation acceptance gate,
+> and the
+> [development environment handoff](deepseek-v4-development-environment-handoff.md)
+> for the exact Native/XLA stacks, paths, cache discipline, and test workflow.
+
 This guide compiles the repository's structurally faithful, tiny DeepSeek-V4
 configuration through the real vLLM Neuron path:
 

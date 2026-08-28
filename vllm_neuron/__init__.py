@@ -3,7 +3,6 @@
 
 import glob
 import os
-import sys
 import warnings
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -60,138 +59,41 @@ def _is_cpu_compile() -> bool:
 
 
 def _init_backend():
-    """Initialize the native route's Lite ownership, or the XLA backend."""
-    if envs.is_native_backend():
-        # Import Lite so it names the PrivateUse1 "neuron" device before vLLM
-        # builds DeviceConfig.
-        import libtorch_neuronx_lite  # noqa: F401
-        import torch._dynamo.backends.registry as registry
+    """Initialize and validate the TorchNeuron Native runtime."""
+    from vllm_neuron.backend import get_backend
+    from vllm_neuron.native import (
+        configure_cache_environment,
+        reject_retired_configuration,
+        require_native_capabilities,
+    )
 
-        # Lite skips its own backend registration during vllm_neuron import,
-        # so register the FX-to-HLO capture backend here.
-        from libtorch_neuronx_lite.compile.capture_backend import capture
-
-        if "neuron_libtorch_graph_capture" not in registry.list_backends():
-            registry.register_backend(
-                compiler_fn=capture, name="neuron_libtorch_graph_capture"
-            )
-
-        return
-
-    # Keep base vLLM on its V1 code paths. When `use_v2_model_runner` is on,
-    # vLLM flips its scheduler, async scheduler, input processor, and
-    # max_concurrent_batches onto V2 paths -- e.g. the scheduler stops
-    # populating `CachedRequestData.all_token_ids`. Neuron always runs its own
-    # v1-style NeuronModelRunner (never vLLM's V2 runner), so those V2 paths
-    # break us: `_update_states` reads `all_token_ids[req_id]` on resume and
-    # hits a KeyError that kills the engine. The flag also auto-enables for a
-    # fixed set of architectures (Llama/Qwen3/Mistral/Qwen2Moe/DeepseekV2/
-    # GraniteMoe), so we force it off here -- respecting an explicit user
-    # override, which platform._reject_v2_model_runner then rejects loudly.
-    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
-
-    # In CPU mode, the NKI CPU simulator is OFF by default.
-    # Users opt-in by setting NKI_SIMULATOR=1 for kernel development,
-    # integration and accuracy validation on small shapes and tiny models.
-    if envs.VLLM_NEURON_CPU_MODE:
-        if os.environ.get("NKI_SIMULATOR") == "1":
-            os.environ.setdefault("NKI_PRECISE_FP", "1")
-
+    get_backend()
+    reject_retired_configuration()
     if envs.VLLM_NEURON_CPU_MODE and _is_cpu_compile():
         raise RuntimeError(
-            "VLLM_NEURON_CPU_MODE and VLLM_NEURON_CPU_COMPILE are not compatible with each other"
+            "VLLM_NEURON_CPU_MODE and VLLM_NEURON_CPU_COMPILE are mutually exclusive"
         )
+    if envs.VLLM_NEURON_CPU_MODE and os.environ.get("NKI_SIMULATOR") == "1":
+        os.environ.setdefault("NKI_PRECISE_FP", "1")
 
-    os.environ["PJRT_DEVICE"] = "CPU"
+    # Native caches must be local and rank isolated. Set these before importing
+    # torch_neuronx because its HLO cache reads configuration at import time.
+    rank = os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))
+    configure_cache_environment(envs.get_neuron_compile_cache_dir(), int(rank))
+    if _is_cpu_compile():
+        os.environ.setdefault("TORCH_NEURONX_COMPILE_ONLY", "1")
 
-    import torch
-    import torch._dynamo.backends.registry as registry
+    require_native_capabilities()
 
-    _has_neuron_hw = _is_neuron_dev()
-
-    import libtorch_neuronx_lite
-
-    from libtorch_neuronx_lite.compile.backend import compile
-    from libtorch_neuronx_lite.compile.capture_backend import capture
-
-    if "neuron_libtorch" not in registry.list_backends():
-        registry.register_backend(compiler_fn=compile, name="neuron_libtorch")
-
-    if "neuron_libtorch_graph_capture" not in registry.list_backends():
-        registry.register_backend(
-            compiler_fn=capture, name="neuron_libtorch_graph_capture"
-        )
-
-    if not envs.VLLM_NEURON_CPU_MODE or _has_neuron_hw:
-        try:
-            from libtorch_neuronx_lite.overrides import neuron_collectives  # noqa: F401
-            from libtorch_neuronx_lite.overrides import xla_collectives  # noqa: F401
-        except RuntimeError:
-            pass
-
-        sys.modules["torch.neuron"] = libtorch_neuronx_lite
-        torch.neuron = libtorch_neuronx_lite
-        torch.neuron.is_available = lambda: True
-        torch.neuron.current_device = lambda: 0
-
-    else:
-        # CPU-only: register minimal privateuse1 backend so dynamo's
-        # SymbolicStreamState doesn't fall through to CUDA
-        import types
-
-        torch.utils.rename_privateuse1_backend("neuron")
-        neuron_module = types.ModuleType("torch.neuron")
-        neuron_module.is_available = lambda: False
-        neuron_module.current_device = lambda: 0
-        neuron_module.current_stream = lambda device=None: type(
-            "_S", (), {"device": torch.device("cpu")}
-        )()
-        neuron_module.set_stream = lambda stream: None
-        sys.modules["torch.neuron"] = neuron_module
-        torch.neuron = neuron_module
-
-        try:
-            torch.utils.generate_methods_for_privateuse1_backend(
-                for_tensor=True,
-                for_module=True,
-                for_storage=True,
-            )
-        except RuntimeError:
-            pass
-
-    _original_current_accelerator = torch.accelerator.current_accelerator
-
-    def _current_accelerator_wrapper(check_available: bool = False):
-        device = _original_current_accelerator(check_available)
-        if device is not None:
-            if envs.VLLM_NEURON_CPU_MODE:
-                return torch.device("cpu")
-            elif envs.VLLM_NEURON_CPU_COMPILE:
-                return torch.device("neuron", torch.neuron.current_device())
-            elif device.type == "neuron" and device.index is None:
-                return torch.device("neuron", torch.neuron.current_device())
-            else:
-                return device
-        return device
-
-    torch.accelerator.current_accelerator = _current_accelerator_wrapper
-
-    # Patch accelerator stream/device APIs for CPU mode to prevent CUDA fallthrough
-    if envs.VLLM_NEURON_CPU_MODE:
-        torch.accelerator.current_stream = lambda device=None: type(
-            "_S", (), {"device": torch.device("cpu")}
-        )()
-        torch.accelerator.current_device_index = lambda: 0
+    # Keep vLLM on its V1 scheduler; this plugin owns its model runner.
+    os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 
 def register():
     """Register the Neuron platform if Neuron devices are present, else return None.
 
-    The backend is selected based on the VLLM_NEURON_BACKEND environment variable:
-    - "neuron_libtorch": Use the vLLM Neuron backend (default)
-    - "neuron_native": Use the neuron native backend
-
-    If VLLM_NEURON_BACKEND is not set, defaults to vllm_neuron.
+    An unset backend selector is preferred; ``neuron_native`` is accepted as a
+    temporary alias. The former lite/XLA route is no longer available.
     """
     if not _is_cpu_mode() and not _is_cpu_compile() and not _is_neuron_dev():
         warnings.warn(

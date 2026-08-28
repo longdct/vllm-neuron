@@ -15,7 +15,7 @@ from nkilib.core.utils.kernel_helpers import (
 import torch
 import torch.distributed as dist
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 _TILE_H = 512

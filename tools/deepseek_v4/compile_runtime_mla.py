@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import resource
+import subprocess
 import time
 from pathlib import Path
 
@@ -14,6 +15,37 @@ import torch
 
 from vllm_neuron.model.deepseek_v4.attention import SharedLatentMLAInputs
 from vllm_neuron.model.deepseek_v4.nki_mla import paged_shared_latent_mla
+
+
+def _nki_artifacts() -> dict[Path, tuple[int, int]]:
+    return {
+        path: (path.stat().st_mtime_ns, path.stat().st_size)
+        for directory in Path("/tmp").glob("nki_*")
+        for path in directory.rglob("*.colz")
+    }
+
+
+def _allocation_records(path: Path) -> int | None:
+    try:
+        decoded = subprocess.run(
+            ["zstd", "-dc"],
+            input=path.read_bytes()[16:],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).stdout
+        document = json.loads(decoded)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+
+    def count(value) -> int:
+        if isinstance(value, dict):
+            return int("tensor_id" in value) + sum(count(item) for item in value.values())
+        if isinstance(value, list):
+            return sum(count(item) for item in value)
+        return 0
+
+    return count(document)
 
 
 class RuntimeMLA(torch.nn.Module):
@@ -48,7 +80,7 @@ class RuntimeMLA(torch.nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", type=int, choices=(512, 1024), default=512)
+    parser.add_argument("--query", type=int, choices=(1, 512, 1024), default=512)
     parser.add_argument("--compressed", type=int, choices=(0, 512, 1024), default=512)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -69,6 +101,7 @@ def main() -> None:
     )
     sinks = torch.zeros(64, dtype=torch.float32, device=device)
 
+    artifacts_before = _nki_artifacts()
     compiled = torch.compile(
         RuntimeMLA(args.compressed), backend="neuron", dynamic=False
     )
@@ -85,6 +118,12 @@ def main() -> None:
     )
     torch.neuron.synchronize()
     elapsed = time.monotonic() - started
+    artifacts_after = _nki_artifacts()
+    generated = [
+        path
+        for path, metadata in artifacts_after.items()
+        if artifacts_before.get(path) != metadata
+    ]
     record = {
         "query": args.query,
         "compressed_history": args.compressed,
@@ -92,6 +131,14 @@ def main() -> None:
         "wall_seconds": elapsed,
         "peak_rss_kbytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "output_shape": list(output.shape),
+        "nki_artifacts": [
+            {
+                "path": str(path),
+                "size_bytes": path.stat().st_size,
+                "tensor_allocation_records": _allocation_records(path),
+            }
+            for path in sorted(generated)
+        ],
     }
     text = json.dumps(record, indent=2) + "\n"
     if args.output is not None:

@@ -95,7 +95,7 @@ def main():
         sys.exit(1)
 
     model = Model().to("neuron:0")
-    model = torch.compile(model, backend="neuron_libtorch")
+    model = torch.compile(model, backend="neuron")
 
     inference = Inference(model, use_double_buffer)
 

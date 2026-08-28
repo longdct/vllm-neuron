@@ -25,7 +25,7 @@ def main():
 
     # Compiled
     compiled_func = torch.compile(
-        func, backend="neuron_libtorch", options={"debug_hlo": True}
+        func, backend="neuron", options={"debug_hlo": True}
     )
     input = input.to("neuron:0")
     result = compiled_func(input).to("cpu")

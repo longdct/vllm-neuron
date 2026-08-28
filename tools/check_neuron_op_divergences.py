@@ -15,7 +15,7 @@ retirable; an unexpected ``DIVERGES`` means a regression, or an inventory gap.
 
 **Every check runs in its own subprocess**, and that is not defensive
 programming. When the backend cannot lower an op it does not raise into Python:
-``libtorch_neuronx_lite/compile/cache.py`` logs "Compilation failed --
+The retired backend used to log "Compilation failed --
 terminating process for cleanup" and takes the interpreter down. In-process,
 one unlowerable op ends the run at that row.
 
@@ -284,13 +284,11 @@ def main() -> int:
     import vllm_neuron  # noqa: F401
     from vllm_neuron.envs import get_compile_backend_name
 
-    import torch_xla
-
-    versions = f"torch {torch.__version__} / torch-xla {torch_xla.__version__}"
+    versions = f"torch {torch.__version__}"
     try:
         import importlib.metadata as md
 
-        versions += f" / lite {md.version('libtorch-neuronx-lite')}"
+        versions += f" / torch-neuronx {md.version('torch-neuronx')}"
     except Exception:
         pass
     print(f"stack: {versions}")

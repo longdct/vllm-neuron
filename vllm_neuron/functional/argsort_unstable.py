@@ -7,7 +7,7 @@ import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 import torch
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 _ELEMS_PER_PASS = 8

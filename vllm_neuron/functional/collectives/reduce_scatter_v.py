@@ -42,7 +42,7 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm_neuron import envs
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 
 # Trailing packed-token-index columns in the MoE-combine input ([N, H+2]): 2 bf16 cols
 # holding a bitcast int32 token id. Not part of the reduced data (only H data cols are

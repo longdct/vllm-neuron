@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Sequence
 from vllm_neuron.snapshot.config import get_snapshot_config
 
 if TYPE_CHECKING:
-    from libtorch_neuronx_lite.compile.execute_context import ExecuteMetadata
+    ExecuteMetadata = Any
     from vllm_neuron.snapshot.config import CaptureSelector
 
 logger = logging.getLogger(__name__)

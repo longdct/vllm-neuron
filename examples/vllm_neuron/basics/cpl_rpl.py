@@ -44,7 +44,7 @@ def run_distributed(rank, world_size, checkpoint_path, inputs_path, backend="glo
     model.to("neuron:0")
 
     # compile model
-    model = torch.compile(model, backend="neuron_libtorch")
+    model = torch.compile(model, backend="neuron")
 
     # Load inputs
     inputs = torch.load(inputs_path)

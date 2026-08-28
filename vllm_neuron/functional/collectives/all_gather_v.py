@@ -10,7 +10,7 @@ import nki.language as nl
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm_neuron import envs
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch_neuronx.nki_hop import wrap_nki
 
 
 # TODO: Need to test and extend to max allowed RG size
