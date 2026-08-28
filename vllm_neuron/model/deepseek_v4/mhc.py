@@ -69,10 +69,25 @@ def hyperconnection_reference(
         raise ValueError("mHC parameters do not match the stream geometry")
     flat = hidden_streams.flatten(start_dim=-2).float()
     flat = flat * torch.rsqrt(flat.square().mean(-1, keepdim=True) + norm_eps)
-    pre_w, post_w, comb_w = F.linear(flat, fn.float()).split(
-        [hc, hc, hc * hc], dim=-1
-    )
-    pre_b, post_b, comb_b = base.float().split([hc, hc, hc * hc])
+    # Sliced, not `.split([...], dim=-1)`. `Tensor.split` with a *list* of
+    # sizes returns the wrong data on Neuron for any dim other than 0 -- every
+    # chunk, not just one, and silently: the un-split tensor is correct to
+    # 2.4e-4 while the chunks are off by 717. Measured on trn2 with
+    # `tools/deepseek_v4/check_mhc_device.py`; the FX graph is correct
+    # (`split` -> `getitem`), so the defect is below it in the torch-xla /
+    # neuronx-cc lowering. Basic slicing, `narrow`, `index_select`, `chunk`,
+    # and `split` with an *int* size are all correct. CPU is unaffected, which
+    # is why this cost a full real-weight device bring-up to find.
+    projected = F.linear(flat, fn.float())
+    pre_w = projected[..., :hc]
+    post_w = projected[..., hc : 2 * hc]
+    comb_w = projected[..., 2 * hc :]
+    # `base` splits on dim 0, which measures correct on device -- sliced anyway
+    # so the two adjacent decompositions cannot drift apart again.
+    flat_base = base.float()
+    pre_b = flat_base[:hc]
+    post_b = flat_base[hc : 2 * hc]
+    comb_b = flat_base[2 * hc :]
     pre = torch.sigmoid(pre_w * scale[0].float() + pre_b) + hc_eps
     post = 2 * torch.sigmoid(post_w * scale[1].float() + post_b)
     comb_logits = (

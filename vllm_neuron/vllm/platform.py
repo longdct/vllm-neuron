@@ -398,6 +398,7 @@ class NeuronPlatform(Platform):
         if model_config is None:
             return
 
+        cls._normalize_deepseek_v4_hf_config(model_config)
         cls._validate_deepseek_v4_unsupported_features(vllm_config)
         cls._configure_deepseek_v4_dense_csa_bound(model_config)
 
@@ -598,20 +599,90 @@ class NeuronPlatform(Platform):
             )
 
     @classmethod
+    def _normalize_deepseek_v4_hf_config(cls, model_config) -> None:
+        """Re-run ``DeepseekV4Config.__init__``'s derivations on a loaded config.
+
+        vLLM's ``get_config`` rebuilds the config in a way that skips the
+        normalization the transformers class does in ``__init__``. An official
+        checkpoint ships ``compress_ratios``, ``rope_theta``/``compress_rope_theta``
+        and ``rope_scaling``; the model needs the derived ``layer_types``,
+        ``mlp_layer_types`` and the ``main``/``compress`` split of
+        ``rope_parameters``. Without this the config looks superficially fine and
+        then fails deep in the model -- e.g. the rotary embedding has no
+        ``main_inv_freq`` because ``rope_parameters`` was still the flat
+        ``rope_scaling`` dict.
+
+        Round-tripping through the config class is idempotent: a config that
+        already carries the derived fields re-derives the same values.
+        """
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(hf_config, "model_type", None) != "deepseek_v4":
+            return
+        from transformers import DeepseekV4Config
+
+        try:
+            normalized = DeepseekV4Config(**hf_config.to_dict())
+        except Exception as error:  # pragma: no cover - config shape drift
+            logger.warning(
+                "Could not normalize the DeepSeek-V4 config (%s); using it as "
+                "loaded. Derived fields may be missing.",
+                error,
+            )
+            return
+        model_config.hf_config = normalized
+        text_config = getattr(model_config, "hf_text_config", None)
+        if text_config is hf_config:
+            model_config.hf_text_config = normalized
+
+    @classmethod
     def _configure_deepseek_v4_dense_csa_bound(cls, model_config) -> None:
+        """Install the dense-CSA admission ceiling, if it is still wanted.
+
+        It normally is not. The ceiling existed because this plugin attended
+        densely over every compressed entry, which is exact only while the
+        eligible set fits inside ``index_topk`` -- past that the logits were
+        quietly wrong, so requests that could cross the bound were refused. The
+        lightning indexer removes the premise: selection now happens, at any
+        length.
+
+        ``VLLM_NEURON_DEEPSEEK_V4_DENSE_CSA_BOUND=1`` puts the ceiling back. It
+        does not change the model -- the indexer still runs -- it just refuses
+        requests that could leave the range where the indexer and dense
+        attention provably agree. That makes it a bisection tool: if long
+        outputs look wrong, clamping to the regime the equivalence tests cover
+        says whether selection is implicated without rebuilding anything.
+        """
         hf_config = getattr(model_config, "hf_config", None)
         if getattr(hf_config, "model_type", None) != "deepseek_v4":
             cls._deepseek_dense_csa_bound = None
             return
+        if os.environ.get("VLLM_NEURON_DEEPSEEK_V4_DENSE_CSA_BOUND") != "1":
+            cls._deepseek_dense_csa_bound = None
+            return
+        from vllm_neuron.model.deepseek_v4.config import normalize_layer_specs
         from vllm_neuron.model.deepseek_v4.dense_csa import (
             CountingMode,
             geometry_from_config,
             model_bound,
         )
 
+        # Resolve per-layer structure through the normalizer rather than reading
+        # ``hf_config.layer_types`` directly: official checkpoints carry only
+        # ``compress_ratios``, and vLLM's config loader does not derive the
+        # ``layer_types`` spelling from it.
+        layer_type_names = {
+            0: "sliding_attention",
+            4: "compressed_sparse_attention",
+            128: "heavily_compressed_attention",
+        }
         geometries = {
-            index: geometry_from_config(hf_config, layer_type)
-            for index, layer_type in enumerate(hf_config.layer_types)
+            spec.index: geometry_from_config(
+                hf_config,
+                layer_type_names.get(
+                    spec.compress_ratio, f"ratio_{spec.compress_ratio}"
+                ),
+            )
+            for spec in normalize_layer_specs(hf_config)
         }
         cls._deepseek_dense_csa_bound = model_bound(
             geometries, hf_config.index_topk, mode=CountingMode.COMPLETE

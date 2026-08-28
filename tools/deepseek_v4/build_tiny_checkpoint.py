@@ -24,6 +24,12 @@ def build(output: Path) -> None:
         num_hidden_layers=3, num_attention_heads=1, num_key_value_heads=1,
         head_dim=16, q_lora_rank=16, sliding_window=16,
         max_position_embeddings=64,
+        # Stock is 64 heads x 128 dim with a budget of 512 -- absurd against
+        # hidden_size=32, and a budget that large would never prune at this
+        # scale, so the indexer would be exercised only in its no-op regime.
+        # At 16 tokens per window-of-4 the c4 layer reaches 16 entries, well
+        # past a budget of 2.
+        index_n_heads=2, index_head_dim=8, index_topk=2,
         layer_types=["heavily_compressed_attention", "sliding_attention",
                      "compressed_sparse_attention"],
         architectures=["DeepseekV4ForCausalLM"],

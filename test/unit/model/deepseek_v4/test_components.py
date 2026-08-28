@@ -8,8 +8,10 @@ from vllm_neuron.model.deepseek_v4.attention import (
     P2_REPRESENTATIVE_BUCKETS,
     apply_partial_rotary,
     compose_swa_and_compressed_history,
+    compressed_entry_slot_mapping,
     gather_paged_latent,
     mla_attention_reference,
+    visible_compressed_entries,
 )
 from vllm_neuron.model.deepseek_v4.compressor import compress_chunk
 from vllm_neuron.model.deepseek_v4.mhc import sinkhorn
@@ -132,3 +134,34 @@ def test_routed_topk_accepts_xla_list_result(monkeypatch):
 def test_hash_routing_is_exact_lookup():
     table = torch.tensor([[2, 1], [0, 3], [3, 2]])
     assert hash_experts(torch.tensor([2, 0]), table).tolist() == [[3, 2], [2, 1]]
+
+
+def test_compressed_entry_is_visible_to_the_query_that_completes_it():
+    """The read side must not lag the write side by one token.
+
+    ``compressed_entry_slot_mapping`` emits an entry when
+    ``(pos + 1) % ratio == 0`` and the compressor writes it *before* attention
+    reads the history, so that entry is already present for the completing
+    query. Counting ``pos // ratio`` instead hides it, which diverges from the
+    reference at exactly ``pos % ratio == ratio - 1`` and agrees everywhere
+    else -- a pattern sparse enough to survive a casual eyeball.
+    """
+    ratio = 4
+    positions = torch.arange(12)
+    visible = visible_compressed_entries(positions, ratio)
+    torch.testing.assert_close(visible, (positions + 1) // ratio)
+
+    # Every entry the write side has emitted up to and including `pos` is
+    # visible at `pos`, and nothing beyond it is.
+    raw_slots = torch.arange(12)
+    written = compressed_entry_slot_mapping(
+        raw_slots, ratio, raw_block_size=12, physical_page_stride=3
+    )
+    for pos in range(12):
+        emitted = int((written[: pos + 1] >= 0).sum())
+        assert int(visible[pos]) == emitted, f"position {pos}"
+
+
+def test_visible_compressed_entries_rejects_a_non_positive_ratio():
+    with pytest.raises(ValueError, match="compress_ratio must be positive"):
+        visible_compressed_entries(torch.arange(4), 0)

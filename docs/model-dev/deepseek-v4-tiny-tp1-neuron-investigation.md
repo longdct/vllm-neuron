@@ -33,6 +33,15 @@ with its maximum at logit index 18. Deployment therefore remains blocked on the
 prefill numerical discrepancy even though compilation, runtime stability, and
 greedy output are green.
 
+**Followed up 2026-08-23.** This question was undecidable on random weights --
+logits span only about +/-1.3 and top1/top2 gaps are 0.04-0.13, so the correct
+token survived by roughly a 1.1x margin over the error. Repeating the comparison
+on *real* DeepSeek-V4-Flash weights settles it: the device diverges from CPU by
+`max|diff| = 20.69` at realistic logit scale and generates different tokens, so
+the discrepancy is a real defect rather than benign reassociation. BF16
+precision and `expand` lowering have both been eliminated by experiment. See
+[`deepseek-v4-real-weight-validation.md`](deepseek-v4-real-weight-validation.md).
+
 ## Scope and environment
 
 The device runs used the repository virtual environment, the packaged runtime

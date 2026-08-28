@@ -256,6 +256,82 @@ def compressed_entry_slot_mapping(
     return torch.where(valid, entry_slot, torch.full_like(raw_slot_mapping, -1))
 
 
+def visible_compressed_entries(
+    position: torch.Tensor, compress_ratio: int
+) -> torch.Tensor:
+    """Compressed entries a query at *position* may attend to.
+
+    The read-side counterpart of :func:`compressed_entry_slot_mapping`, and
+    deliberately its neighbour: the two must agree on when an entry exists.
+    A token completes a window when ``(position + 1) % compress_ratio == 0``,
+    so once it has been compressed there are ``(position + 1) //
+    compress_ratio`` entries -- *including* the one this very token just
+    completed. The reference gates visibility identically
+    (``causal_threshold = (position_ids + 1) // compress_rate`` in
+    ``DeepseekV4CSACompressor``).
+
+    Counting ``position // compress_ratio`` instead hides each new entry from
+    the query that completes it. That is invisible at most positions and wrong
+    at exactly ``position % compress_ratio == compress_ratio - 1``.
+    """
+    if compress_ratio < 1:
+        raise ValueError("compress_ratio must be positive")
+    return torch.div(position + 1, compress_ratio, rounding_mode="floor")
+
+
+def read_compressed_history(
+    cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    position_ids: torch.Tensor,
+    *,
+    compress_ratio: int,
+    raw_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All compressed entries visible at *position_ids*, Dynamo-shape-static.
+
+    The cache stores one physical row per *compressed entry*, not per raw token
+    (``storage_block_size = block_size // compress_ratio`` --
+    ``kv_spec_conversion.py``), while positions are raw-token-scaled like every
+    other group (see :func:`compressed_entry_slot_mapping`). The two address
+    spaces differ by exactly ``compress_ratio``, matching the write side's
+    ``raw_slot // compress_ratio``.
+
+    Unlike the sliding-window readers, this group never evicts -- entries are
+    addressed from 0 and simply accumulate, so "the first ``num_entries``
+    columns" is a fixed, growing *prefix*, not a moving window. So rather than
+    branch on the live count, gather the entire block-table-addressable
+    capacity (``max_entries``, a plain Python int from real tensor shapes) and
+    mask off what is not yet real. Trades throughput for compilability, the
+    same tradeoff ``DeepseekV4MoE.forward``'s always-compute redesign
+    documents.
+
+    Returns ``(entries, valid)``: ``[max_entries, head_dim]`` with invalid rows
+    zeroed, and the ``[max_entries]`` mask saying which are real.
+
+    Shared by the dense attention path and the lightning indexer, which reads
+    its own parallel cache at ``index_head_dim``. Sharing it is deliberate:
+    the two must agree on which entries exist, and
+    :func:`visible_compressed_entries` is where that is decided.
+    """
+    logical_slots_per_block = raw_block_size // compress_ratio
+    max_entries = block_table_row.shape[0] * logical_slots_per_block
+    gathered = gather_paged_latent(
+        cache,
+        block_table_row,
+        max_entries,
+        logical_slots_per_block=logical_slots_per_block,
+    ).squeeze(1)
+    num_entries = visible_compressed_entries(
+        position_ids.view(()).long(), compress_ratio
+    )
+    valid = torch.arange(max_entries, device=gathered.device) < num_entries
+    # Invalid physical rows may hold allocator garbage or a non-finite candidate
+    # from a compressor call that did not complete a logical window. Masking
+    # logits alone is insufficient: the value path still evaluates ``0 * NaN``.
+    gathered = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
+    return gathered, valid
+
+
 def compose_swa_and_compressed_history(
     local: torch.Tensor,
     compressed: torch.Tensor,

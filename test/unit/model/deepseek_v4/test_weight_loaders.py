@@ -7,6 +7,7 @@ torch = pytest.importorskip("torch")
 from vllm_neuron.model.deepseek_v4.weight_loaders import (
     StackedShard,
     load_checkpoint_weights,
+    is_unsupported_checkpoint_name,
     map_checkpoint_name,
     require_weight_shape,
     resolve_stacked_shard,
@@ -19,28 +20,108 @@ from vllm_neuron.model.deepseek_v4.weight_loaders import (
         ("embed.weight", "model.embed_tokens.weight"),
         ("head.weight", "lm_head.weight"),
         ("norm.weight", "model.norm.weight"),
-        ("hc_head_fn", "model.hc_head_fn"),
-        ("layers.3.attn.wq_a.weight", "model.layers.3.attn.q_a_proj.weight"),
-        ("layers.3.attn.wkv.weight", "model.layers.3.attn.kv_proj.weight"),
-        ("layers.3.attn.wq_b.weight", "model.layers.3.attn.q_b_proj.weight"),
-        ("layers.3.attn.q_norm.weight", "model.layers.3.attn.q_a_norm.weight"),
-        ("layers.3.attn.kv_norm.weight", "model.layers.3.attn.kv_norm.weight"),
-        ("layers.3.attn.wo_a.weight", "model.layers.3.attn.o_a_proj.weight"),
-        ("layers.3.attn.wo_b.weight", "model.layers.3.attn.o_b_proj.weight"),
-        ("layers.3.attn.attn_sink", "model.layers.3.attn.sinks"),
+        # mHC parameters live on real submodules, so the checkpoint's flattened
+        # ``hc_<site>_<param>`` spelling becomes a dotted path. ``fn``/``base``
+        # drop the ``hc_`` prefix while ``hc_scale`` keeps it, matching the
+        # module definitions in model.py.
+        ("hc_head_fn", "model.hc_head.fn"),
+        ("hc_head_base", "model.hc_head.base"),
+        ("hc_head_scale", "model.hc_head.hc_scale"),
+        ("layers.3.hc_attn_fn", "model.layers.3.attn_hc.fn"),
+        ("layers.3.hc_attn_scale", "model.layers.3.attn_hc.hc_scale"),
+        ("layers.3.hc_ffn_base", "model.layers.3.ffn_hc.base"),
+        # The decoder layer holds ``attention``/``moe`` submodules and
+        # ``input_layernorm``/``post_attention_layernorm``.
+        ("layers.3.attn.wq_a.weight", "model.layers.3.attention.q_a_proj.weight"),
+        ("layers.3.attn.wkv.weight", "model.layers.3.attention.kv_proj.weight"),
+        ("layers.3.attn.wq_b.weight", "model.layers.3.attention.q_b_proj.weight"),
+        ("layers.3.attn.q_norm.weight", "model.layers.3.attention.q_a_norm.weight"),
+        ("layers.3.attn.kv_norm.weight", "model.layers.3.attention.kv_norm.weight"),
+        ("layers.3.attn.wo_a.weight", "model.layers.3.attention.o_a_proj.weight"),
+        ("layers.3.attn.wo_b.weight", "model.layers.3.attention.o_b_proj.weight"),
+        ("layers.3.attn.attn_sink", "model.layers.3.attention.sinks"),
+        ("layers.3.attn_norm.weight", "model.layers.3.input_layernorm.weight"),
+        ("layers.3.ffn_norm.weight", "model.layers.3.post_attention_layernorm.weight"),
         (
-            "layers.3.ffn.gate.bias",
-            "model.layers.3.ffn.gate.e_score_correction_bias",
+            "layers.3.attn.compressor.norm.weight",
+            "model.layers.3.attention.compressor.norm_weight",
         ),
+        ("layers.3.attn.compressor.ape", "model.layers.3.attention.compressor.ape"),
+        # Router state sits on the MoE block itself, not on the gate submodule.
+        ("layers.3.ffn.gate.bias", "model.layers.3.moe.correction_bias"),
+        ("layers.3.ffn.gate.weight", "model.layers.3.moe.gate.weight"),
+        # Hash-routing table: a registered buffer, and one that real checkpoints
+        # actually provide -- the config-derived fallback must not win.
+        ("layers.3.ffn.gate.tid2eid", "model.layers.3.moe.tid2eid"),
+        # Expert projections are bare parameters, so ``.weight`` is dropped.
         (
             "layers.3.ffn.shared_experts.w2.weight",
-            "model.layers.3.ffn.shared_experts.down_proj.weight",
+            "model.layers.3.moe.shared_experts.down_proj",
         ),
         ("mtp.layers.0.norm.weight", "model.mtp.layers.0.norm.weight"),
     ],
 )
-def test_checkpoint_names_match_vllm_026_mapper(source, expected):
+def test_checkpoint_names_map_onto_plugin_parameters(source, expected):
     assert map_checkpoint_name(source) == expected
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        (
+            "layers.2.attn.indexer.wq_b.weight",
+            "model.layers.2.attention.indexer.q_b_proj.weight",
+        ),
+        (
+            "layers.2.attn.indexer.weights_proj.weight",
+            "model.layers.2.attention.indexer.weights_proj.weight",
+        ),
+        (
+            "layers.2.attn.indexer.compressor.ape",
+            "model.layers.2.attention.indexer.compressor.ape",
+        ),
+        (
+            "layers.2.attn.indexer.compressor.norm.weight",
+            "model.layers.2.attention.indexer.compressor.norm_weight",
+        ),
+    ],
+)
+def test_indexer_tensors_map_onto_plugin_parameters(source, expected):
+    """Every name the real checkpoint ships for the indexer, verified against
+    ``ds-v4-flash-shards/model.safetensors.index.json``. These were skipped
+    outright until the indexer existed."""
+    assert map_checkpoint_name(source) == expected
+
+
+@pytest.mark.parametrize("leaf,shard", [("wkv", 0), ("wgate", 1)])
+def test_indexer_compressor_projections_fuse_separately_from_the_outer_one(
+    leaf, shard
+):
+    """The indexer's compressor and the layer's own must not collide.
+
+    Both are ``DeepseekV4Compressor``s with a ``fused_wkv_wgate``, distinguished
+    only by the ``indexer.`` segment. ``resolve_stacked_shard`` matches on a
+    bare substring, so this pins that the more specific name wins.
+    """
+    outer = resolve_stacked_shard(
+        map_checkpoint_name(f"layers.2.attn.compressor.{leaf}.weight")
+    )
+    inner = resolve_stacked_shard(
+        map_checkpoint_name(f"layers.2.attn.indexer.compressor.{leaf}.weight")
+    )
+    assert outer.shard_id == inner.shard_id == shard
+    assert outer.parameter_name == (
+        "model.layers.2.attention.compressor.fused_wkv_wgate.weight"
+    )
+    assert inner.parameter_name == (
+        "model.layers.2.attention.indexer.compressor.fused_wkv_wgate.weight"
+    )
+    assert outer.parameter_name != inner.parameter_name
+
+
+def test_no_subtree_is_skipped_now_that_the_indexer_is_modelled():
+    assert not is_unsupported_checkpoint_name("layers.2.attn.indexer.wq_b.weight")
+    assert not is_unsupported_checkpoint_name("layers.2.attn.compressor.ape")
 
 
 def test_quantized_scale_names_distinguish_fp4_experts():
@@ -56,11 +137,11 @@ def test_quantized_scale_names_distinguish_fp4_experts():
 @pytest.mark.parametrize(
     ("source", "target", "shard_id"),
     [
-        ("layers.1.ffn.w1.weight", "model.layers.1.ffn.gate_up_proj.weight", 0),
-        ("layers.1.ffn.w3.weight", "model.layers.1.ffn.gate_up_proj.weight", 1),
+        ("layers.1.ffn.w1.weight", "model.layers.1.moe.gate_up_proj.weight", 0),
+        ("layers.1.ffn.w3.weight", "model.layers.1.moe.gate_up_proj.weight", 1),
         (
             "layers.1.attn.compressor.wgate.weight",
-            "model.layers.1.attn.compressor.fused_wkv_wgate.weight",
+            "model.layers.1.attention.compressor.fused_wkv_wgate.weight",
             1,
         ),
     ],
@@ -91,8 +172,19 @@ def test_attention_weights_are_plain_renames_not_stacked_shards():
         assert resolve_stacked_shard(map_checkpoint_name(source)) is None
 
 
-def test_expert_weights_are_not_consumed_by_generic_stacking():
-    mapped = map_checkpoint_name("layers.1.ffn.experts.2.w1.weight")
+def test_routed_expert_weights_stack_per_expert():
+    """Each routed expert owns a ``gate_up_proj`` holding its own w1/w3 pair, so
+    expert tensors stack exactly like the shared expert's -- they are not a
+    grouped tensor addressed by expert id, and must not be skipped."""
+    assert resolve_stacked_shard(
+        map_checkpoint_name("layers.1.ffn.experts.2.w1.weight")
+    ) == StackedShard("model.layers.1.moe.experts.2.gate_up_proj", 0)
+    assert resolve_stacked_shard(
+        map_checkpoint_name("layers.1.ffn.experts.2.w3.weight")
+    ) == StackedShard("model.layers.1.moe.experts.2.gate_up_proj", 1)
+    # w2 is a plain rename onto its own parameter, not a shard.
+    mapped = map_checkpoint_name("layers.1.ffn.experts.2.w2.weight")
+    assert mapped == "model.layers.1.moe.experts.2.down_proj"
     assert resolve_stacked_shard(mapped) is None
 
 
@@ -129,7 +221,7 @@ class FakeAttention(torch.nn.Module):
 class FakeLayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.attn = FakeAttention()
+        self.attention = FakeAttention()
 
 
 class FakeInnerModel(torch.nn.Module):
@@ -162,16 +254,16 @@ def test_loader_copies_plain_and_dispatches_fused_shards():
     )
     assert loaded == {
         "model.embed_tokens.weight",
-        "model.layers.0.attn.q_a_proj.weight",
-        "model.layers.0.attn.compressor.fused_wkv_wgate.weight",
+        "model.layers.0.attention.q_a_proj.weight",
+        "model.layers.0.attention.compressor.fused_wkv_wgate.weight",
     }
     torch.testing.assert_close(model.model.embed_tokens.weight, embed)
-    torch.testing.assert_close(model.model.layers[0].attn.q_a_proj.weight, q_a)
+    torch.testing.assert_close(model.model.layers[0].attention.q_a_proj.weight, q_a)
     torch.testing.assert_close(
-        model.model.layers[0].attn.compressor.fused_wkv_wgate.weight[:2], kv[:2]
+        model.model.layers[0].attention.compressor.fused_wkv_wgate.weight[:2], kv[:2]
     )
     torch.testing.assert_close(
-        model.model.layers[0].attn.compressor.fused_wkv_wgate.weight[2:], kv[2:]
+        model.model.layers[0].attention.compressor.fused_wkv_wgate.weight[2:], kv[2:]
     )
 
 

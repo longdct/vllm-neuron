@@ -52,6 +52,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from ..kv_cache import CacheKind, KVSpec, LayerSpec
 from .attention import (
@@ -60,7 +61,14 @@ from .attention import (
     gather_paged_latent,
     gather_recent_window,
     mla_attention_reference,
+    read_compressed_history,
     scatter_paged_latent,
+    visible_compressed_entries,
+)
+from .indexer import (
+    lightning_index_scores,
+    select_compressed_entries,
+    selection_mask_from_indices,
 )
 from .compressor import (
     carry_gather_length_tensor,
@@ -78,6 +86,42 @@ def _decode_token_threshold(attn_metadata: dict, name: str) -> tuple[bool, dict]
     entry = attn_metadata[name]
     is_decode = entry["max_query_len"] <= entry["decode_token_threshold"]
     return is_decode, entry
+
+
+class DeepseekV4RMSNorm(nn.Module):
+    """RMSNorm that computes its variance in FP32, like the real architecture.
+
+    ``torch.nn.RMSNorm`` reduces in the input dtype. Under BF16 that is a
+    materially different computation from
+    ``transformers.models.deepseek_v4.DeepseekV4RMSNorm``, which upcasts to FP32
+    for the mean-square and rsqrt and only returns to the input dtype to apply
+    the weight.
+
+    The gap is not cosmetic. Driving both forms with the same real ``kv_proj``
+    output measures ``max|diff| = 1.56e-2`` on a 512-wide vector -- which is
+    essentially the entire divergence observed at ``kv_norm`` when comparing this
+    plugin against the reference on identical weights, and it then compounds
+    through attention into the logits.
+
+    Applying ``weight`` *after* the downcast (rather than in FP32) is also part of
+    the contract: it is what the reference does, and doing it in FP32 leaves a
+    residual difference.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        promoted = hidden_states.to(torch.float32)
+        variance = promoted.pow(2).mean(-1, keepdim=True)
+        promoted = promoted * torch.rsqrt(variance + self.eps)
+        return self.weight * promoted.to(input_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
 class DeepseekV4HyperConnection(nn.Module):
@@ -295,6 +339,144 @@ class DeepseekV4Compressor(nn.Module):
         )
 
 
+class DeepseekV4Indexer(nn.Module):
+    """Lightning indexer: picks which compressed entries CSA attends to.
+
+    Only ``compress_ratio == 4`` (CSA) layers have one -- c128/HCA layers
+    attend to their whole compressed history, and the real checkpoint ships
+    indexer tensors for the c4 layers alone.
+
+    The shape of this module is the surprising part: **the indexer runs a
+    second, complete compressor of its own**, at ``index_head_dim`` instead of
+    the model's ``head_dim``, over the same windows with the same overlap
+    layout and the same rope theta. It is not a projection of the outer
+    compressor's output -- it has its own ``wkv``/``wgate``/``ape``/``norm``
+    weights and its own cache state, and the reference keeps the two side by
+    side under the keys ``"compressor"`` and ``"indexer"``
+    (``DeepseekV4CSACache``). That is why this owns a ``DeepseekV4Compressor``
+    rather than sharing the attention layer's: same class, different width,
+    different weights, separate caches.
+
+    Its output is a boolean mask over compressed entries, ANDed into the
+    attention's ``key_valid``. The reference spells the same thing as an
+    additive ``-inf``/0 ``block_bias``; with one query token per call the two
+    are the same statement, and a mask is what this plugin's attention already
+    takes.
+
+    Replicated across tensor-parallel ranks. Upstream head-shards ``q_b_proj``
+    and ``weights_proj`` and all-reduces the scores so every rank picks the
+    same entries; that is a valid optimization, but the ranks must agree on the
+    selection exactly, and replication makes that true by construction rather
+    than by a collective.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        q_lora_rank: int,
+        index_n_heads: int,
+        index_head_dim: int,
+        index_topk: int,
+        ratio: int,
+        rms_norm_eps: float,
+        *,
+        rotary_emb,
+        qk_rope_head_dim: int,
+    ):
+        super().__init__()
+        if ratio != 4:
+            raise ValueError(
+                f"only compressed_sparse_attention (ratio 4) layers carry a "
+                f"lightning indexer, got ratio {ratio}"
+            )
+        self.ratio = ratio
+        self.n_heads = index_n_heads
+        self.head_dim = index_head_dim
+        self.index_topk = index_topk
+        self.qk_rope_head_dim = qk_rope_head_dim
+        # Same class as the outer compressor, at the indexer's own width. The
+        # rotary is shared (one per model, selected by layer_type="compress"),
+        # which is also what keeps query and key rotations on the same theta --
+        # without that, ``q · k`` would carry a position-dependent skew.
+        self.compressor = DeepseekV4Compressor(
+            hidden_size,
+            index_head_dim,
+            ratio,
+            rms_norm_eps,
+            rotary_emb=rotary_emb,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        self.rotary_emb = rotary_emb
+        self.q_b_proj = nn.Linear(
+            q_lora_rank, index_n_heads * index_head_dim, bias=False
+        )
+        self.weights_proj = nn.Linear(hidden_size, index_n_heads, bias=False)
+        # Bound by bind_kv_cache: this indexer's own compressed-entry pages.
+        self.mla_cache: torch.Tensor | None = None
+        self.mla_raw_block_size: int | None = None
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        q_residual: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        block_table_row: torch.Tensor,
+        state_block_table_row: torch.Tensor,
+        state_slot_mapping: torch.Tensor,
+        mla_slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Select entries for this one token; returns a ``[max_entries]`` mask.
+
+        ``hidden`` is ``[1, hidden_size]`` and ``q_residual`` is
+        ``[1, q_lora_rank]`` -- the post-``q_a_norm`` residual the attention
+        layer already computes for its own query projection, reused here rather
+        than recomputed, exactly as the reference reuses it.
+
+        Compress-then-read, in that order: the entry this token completes (if
+        it completes one) must be visible to this very token, which is what
+        ``visible_compressed_entries`` encodes.
+        """
+        self.compressor(
+            hidden,
+            position_ids=position_ids,
+            block_table_row=state_block_table_row,
+            state_slot_mapping=state_slot_mapping,
+            mla_cache=self.mla_cache,
+            mla_slot_mapping=mla_slot_mapping,
+        )
+        keys, valid = read_compressed_history(
+            self.mla_cache,
+            block_table_row,
+            position_ids,
+            compress_ratio=self.ratio,
+            raw_block_size=self.mla_raw_block_size,
+        )
+
+        cos, sin = self.rotary_emb(
+            hidden, position_ids=position_ids, layer_type="compress"
+        )
+        query = self.q_b_proj(q_residual).view(1, self.n_heads, self.head_dim)
+        # Rotated in the same rank-3 layout the KV path uses: Neuron's lowering
+        # of the rank-4 partial-RoPE concat zeroed the rotary channels (see
+        # DeepseekV4Attention._forward_one_token).
+        query = apply_partial_rotary(
+            query, cos, sin, rope_dim=self.qk_rope_head_dim
+        ).view(1, 1, self.n_heads, self.head_dim)
+
+        gate = self.weights_proj(hidden).view(1, 1, self.n_heads)
+        scores = lightning_index_scores(query, keys.unsqueeze(0), gate)
+        visible = visible_compressed_entries(
+            position_ids.view(()).long(), self.ratio
+        ).view(1, 1)
+        chosen = select_compressed_entries(scores, visible, self.index_topk)
+        selected = selection_mask_from_indices(chosen, keys.shape[0])[0, 0]
+        # ``valid`` is already implied by the causal mask inside the selection,
+        # but ANDing keeps the two statements of "this entry is real" joined at
+        # the point of use rather than relying on them having stayed equal.
+        return valid & selected
+
+
 class NeuronDeepseekV4RotaryEmbedding(
     __import__(
         "transformers.models.deepseek_v4.modeling_deepseek_v4",
@@ -321,8 +503,16 @@ class NeuronDeepseekV4RotaryEmbedding(
             rope_init_fn = self.compute_default_rope_parameters
             if self.rope_type[layer_type] != "default":
                 rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type[layer_type]]
+            # Always build on CPU, never on the buffer's own device. The
+            # fallback here is stock ``ROPE_INIT_FUNCTIONS`` (yarn, which the
+            # real DeepSeek-V4 configs select), and those do
+            # ``torch.arange(...).to(device=device, dtype=torch.float)`` --
+            # a device move and a dtype cast in one step, which Neuron
+            # rejects. Only ``compute_default_rope_parameters`` above is
+            # device-safe, so a config using default RoPE never exposed this.
+            # ``copy_`` does the transfer, dtypes already matching.
             inv_freq, attention_scaling = rope_init_fn(
-                self.config, inv_freq_buffer.device, layer_type=layer_type
+                self.config, torch.device("cpu"), layer_type=layer_type
             )
             inv_freq_buffer.copy_(inv_freq)
             getattr(self, f"{layer_type}_original_inv_freq").copy_(inv_freq)
@@ -467,7 +657,7 @@ class DeepseekV4Attention(nn.Module):
         self.heads_per_rank = num_heads // self.world_size
 
         self.q_a_proj = nn.Linear(config.hidden_size, q_lora_rank, bias=False)
-        self.q_a_norm = nn.RMSNorm(q_lora_rank, eps=rms_norm_eps)
+        self.q_a_norm = DeepseekV4RMSNorm(q_lora_rank, eps=rms_norm_eps)
         self.q_b_proj = nn.Linear(
             q_lora_rank, self.heads_per_rank * self.head_dim, bias=False
         )
@@ -475,7 +665,7 @@ class DeepseekV4Attention(nn.Module):
         # variance normalization, no learned scale) and applied inline in
         # _forward_one_token; no parameters to own here.
         self.kv_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = nn.RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         o_groups = int(getattr(hf_config, "o_groups", 8))
         o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
@@ -574,6 +764,25 @@ class DeepseekV4Attention(nn.Module):
             else None
         )
 
+        # Only CSA (ratio 4) layers select; c128/HCA attends to all of its
+        # compressed history, and the checkpoint ships indexer tensors for the
+        # c4 layers alone.
+        self.indexer = (
+            DeepseekV4Indexer(
+                config.hidden_size,
+                q_lora_rank,
+                config.index_n_heads,
+                config.index_head_dim,
+                config.index_topk,
+                ratio,
+                rms_norm_eps,
+                rotary_emb=rotary_emb,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+            if ratio == 4
+            else None
+        )
+
         # Bound by bind_kv_cache: raw [blocks, 1, slots, latent] tensors.
         self.swa_cache: torch.Tensor | None = None
         self.mla_cache: torch.Tensor | None = None
@@ -581,13 +790,17 @@ class DeepseekV4Attention(nn.Module):
     @torch.no_grad()
     def reinitialize_deterministic_buffers(self) -> None:
         """Restore the identity K/V projection after meta materialization."""
-        identity = torch.eye(
-            self.head_dim,
-            device=self.identity_kv_weight.device,
-            dtype=self.identity_kv_weight.dtype,
-        )
+        # Built on CPU and copied across, rather than assembled on the
+        # parameter's own device. Neuron rejects a non-contiguous source in
+        # ``copy_`` *and* cannot run the ``.contiguous()`` that would fix it,
+        # so the broadcast has to be materialized somewhere it works. CPU
+        # accepts the ``expand`` view either way, which is why this was
+        # invisible until the first real device load. ``copy_`` moves it
+        # across devices exactly as weight loading does, once per layer at
+        # initialization.
+        identity = torch.eye(self.head_dim, dtype=self.identity_kv_weight.dtype)
         self.identity_kv_weight.copy_(
-            identity.unsqueeze(0).expand(self.heads_per_rank, -1, -1)
+            identity.unsqueeze(0).expand(self.heads_per_rank, -1, -1).contiguous()
         )
 
     def _swa_history(
@@ -668,21 +881,24 @@ class DeepseekV4Attention(nn.Module):
         always-compute redesign documents; not a concern for this pass's
         synthetic validation config, a real cost at production scale.
         """
-        max_entries = block_table_row.shape[0] * (self.mla_raw_block_size // self.ratio)
-        gathered = gather_paged_latent(
-            self.mla_cache, block_table_row, max_entries,
-            logical_slots_per_block=self.mla_raw_block_size // self.ratio,
-        ).squeeze(1)
-        cached_seq_len = position_ids.view(()).long()
-        num_entries = torch.div(cached_seq_len, self.ratio, rounding_mode="floor")
-        valid = torch.arange(max_entries, device=gathered.device) < num_entries
-        # Invalid physical rows may contain allocator garbage or a non-finite
-        # candidate from a compressor call that did not complete a logical
-        # window. Masking attention logits alone is insufficient because the
-        # value path still evaluates ``0 * NaN``. Neutralize invalid storage
-        # before it reaches either the key or value projection.
-        gathered = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
-        return gathered, valid
+        # ``(pos + 1) // ratio``, not ``pos // ratio``: a token completes a
+        # window when ``(pos + 1) % ratio == 0`` (the write side's own rule, in
+        # ``compressed_entry_slot_mapping``), and the compressor above has
+        # already written that entry before this read. The reference gates
+        # visibility the same way -- ``causal_threshold = (position_ids + 1) //
+        # compress_rate`` in ``DeepseekV4CSACompressor``. Counting with
+        # ``pos // ratio`` hides each new entry from the very query that
+        # completes it, so outputs diverge at exactly the positions
+        # ``pos % ratio == ratio - 1`` and agree everywhere else. That rule
+        # lives in ``read_compressed_history`` so the indexer's own read of its
+        # parallel cache cannot drift from this one.
+        return read_compressed_history(
+            self.mla_cache,
+            block_table_row,
+            position_ids,
+            compress_ratio=self.ratio,
+            raw_block_size=self.mla_raw_block_size,
+        )
 
     def _forward_one_token(
         self,
@@ -731,7 +947,11 @@ class DeepseekV4Attention(nn.Module):
         # symbolic-int-friendly end to end.
         cos, sin = self.rotary_emb(hidden, position_ids=position_ids, layer_type=self.rope_layer_type)
 
-        q = self.q_b_proj(self.q_a_norm(self.q_a_proj(hidden)))
+        # Bound rather than inlined: the lightning indexer projects its own
+        # queries from this same residual (reference: DeepseekV4Attention hands
+        # `q_residual` to the compressor's indexer).
+        q_residual = self.q_a_norm(self.q_a_proj(hidden))
+        q = self.q_b_proj(q_residual)
         # Rotate the query in the same rank-3 layout as KV.  Neuron's
         # lowering of the rank-4 partial-RoPE concat zeroed the two rotary
         # channels while the otherwise identical rank-3 KV path was correct.
@@ -780,6 +1000,35 @@ class DeepseekV4Attention(nn.Module):
             compressed_history, compressed_valid = self._compressed_history(
                 mla_entry["block_table_tensor"][request], position_ids
             )
+            if self.indexer is not None:
+                indexer_entry = attn_metadata[f"{self_attn_name}.indexer"]
+                indexer_state = attn_metadata[
+                    f"{self_attn_name}.indexer.compressor.state_cache"
+                ]
+                # The indexer's pages are addressed exactly like the outer
+                # compressor's -- same ratio, same block size -- so the same
+                # slot arithmetic applies; only the stored width differs.
+                indexer_slot = compressed_entry_slot_mapping(
+                    indexer_entry["slot_mapping"][local_index : local_index + 1],
+                    self.ratio,
+                    self.indexer.mla_raw_block_size,
+                    self.indexer.mla_cache.shape[2],
+                )
+                selected = self.indexer(
+                    hidden,
+                    q_residual,
+                    position_ids=position_ids,
+                    block_table_row=indexer_entry["block_table_tensor"][request],
+                    state_block_table_row=indexer_state["block_table_tensor"][request],
+                    state_slot_mapping=indexer_state["slot_mapping"][
+                        local_index : local_index + 1
+                    ],
+                    mla_slot_mapping=indexer_slot,
+                )
+                # The whole point: entries the indexer did not pick are not
+                # attended to. Below the dense bound this is a no-op, because
+                # selecting the top-k is selecting everything.
+                compressed_valid = compressed_valid & selected
             history = torch.cat((compressed_history, history), dim=0)
             # compressed_history is now a fixed-size (max_entries) buffer,
             # not just the real entries so far -- compressed_valid marks
@@ -880,6 +1129,11 @@ class DeepseekV4Expert(nn.Module):
         self.down_proj = nn.Parameter(torch.randn(hidden_size, intermediate_size) * 0.02)
         self.intermediate_size = intermediate_size
         self.swiglu_limit = swiglu_limit
+        # Checkpoints ship gate and up as separate ``w1``/``w3`` tensors while
+        # this parameter is their concatenation on the output dim (``forward``
+        # chunks it back apart). ``weight_loaders.load_checkpoint_weights``
+        # places each half; no per-parameter shard loader is attached here
+        # because ``to_empty()`` would drop it before loading runs.
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         gate_up = F.linear(hidden, self.gate_up_proj)
@@ -955,15 +1209,21 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def reinitialize_deterministic_buffers(self) -> None:
-        """Recompute ``tid2eid`` in place, e.g. after ``to_empty()``.
+        """Recompute the fallback ``tid2eid`` in place, e.g. after ``to_empty()``.
 
-        ``tid2eid`` is derived purely from config (no checkpoint provides
-        it), but vLLM constructs models on the meta device -- the
-        ``arange``/``remainder`` that built it in ``__init__`` never actually
-        ran, it only recorded shape/dtype. ``to_empty()`` gives it real,
-        uninitialized storage; ``load_weights`` calls this afterward to fill
-        it with the real values (see the class docstring's EP note -- this
-        buffer must be identical across ranks).
+        vLLM constructs models on the meta device, so the ``arange``/
+        ``remainder`` that built this buffer in ``__init__`` never actually ran
+        -- it only recorded shape/dtype. ``to_empty()`` gives it real but
+        uninitialized storage, and ``load_weights`` calls this to fill it (see
+        the class docstring's EP note -- this buffer must be identical across
+        ranks).
+
+        This value is a **fallback only**. Real DeepSeek-V4 checkpoints ship a
+        frozen ``ffn.gate.tid2eid`` table for every hash-routed layer, and the
+        arange pattern here agrees with it at only about chance rate, so a
+        checkpoint's table must win. ``load_weights`` runs this *before*
+        ``load_checkpoint_weights``, which now also resolves buffers, so a
+        provided table overwrites this. Keep that ordering.
         """
         device = self.tid2eid.device
         self.tid2eid.copy_(
@@ -1056,8 +1316,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.moe = DeepseekV4MoE(config, layer.mlp.value)
         self.attn_hc = DeepseekV4HyperConnection(config)
         self.ffn_hc = DeepseekV4HyperConnection(config)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1108,7 +1368,7 @@ class DeepseekV4Model(nn.Module):
         # weight_loaders.py's existing "hc_head" checkpoint-prefix rule in
         # map_checkpoint_name.
         self.hc_head = DeepseekV4HyperHead(config)
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -1153,7 +1413,28 @@ class DeepseekV4ForCausalLM(nn.Module):
     def __init__(self, config: DeepseekV4ModelConfig, hf_config):
         super().__init__()
         self.config = config
-        self.model = DeepseekV4Model(config, hf_config)
+        # Every parameter below `DeepseekV4Model` is created by a bare
+        # `nn.Linear` / `nn.Embedding` / `nn.Parameter(torch.randn(...))`,
+        # none of which take a dtype, so they were all built at
+        # `torch.get_default_dtype()` -- FP32 -- regardless of the configured
+        # BF16. `load_weights` then upcast the BF16 checkpoint into them via
+        # `copy_`, so the model silently occupied ~2x its intended footprint
+        # (measured on the real Flash slice: 12.5 GiB of FP32 parameters
+        # against a 7.3 GiB BF16 checkpoint) and `dtype` was inert.
+        #
+        # `lm_head` below already passes `dtype=` explicitly, which is why it
+        # was the single BF16 tensor in that measurement; it is unaffected by
+        # this context. Scoped to the module construction rather than fixed at
+        # each site so a newly added layer cannot silently reintroduce it --
+        # `llama3/model.py` threads `dtype=` by hand and is the other valid
+        # pattern here.
+        #
+        # RoPE is unaffected: `inv_freq` is built through an explicit
+        # `.float()` in the Transformers rope-init functions, and
+        # `NeuronDeepseekV4RotaryEmbedding.forward` upcasts to FP32 again
+        # before the matmul.
+        with set_default_torch_dtype(config.torch_dtype):
+            self.model = DeepseekV4Model(config, hf_config)
         from vllm_neuron import nn as neuron_nn
 
         self.on_device_sampling_config = (
@@ -1254,6 +1535,37 @@ class DeepseekV4ForCausalLM(nn.Module):
                     alignment=512,
                 )
             )
+            if ratio != 4:
+                continue
+            # The lightning indexer's own compressor: the same two layouts
+            # again at index_head_dim instead of latent_size. Separate groups
+            # rather than a wider shared one -- the reference keeps the two
+            # compressors' states side by side and they are read at different
+            # widths by different consumers.
+            specs.append(
+                LayerSpec(
+                    name=f"{prefix}.indexer",
+                    num_kv_heads=1,
+                    head_size=self.config.index_head_dim,
+                    dtype=torch.bfloat16,
+                    cache_kind=CacheKind.MLA,
+                    compress_ratio=ratio,
+                    block_size=128,
+                    alignment=128,
+                )
+            )
+            specs.append(
+                LayerSpec(
+                    name=f"{prefix}.indexer.compressor.state_cache",
+                    num_kv_heads=1,
+                    head_size=4 * self.config.index_head_dim,
+                    dtype=torch.float32,
+                    block_size=4,
+                    cache_kind=CacheKind.COMPRESSOR_STATE,
+                    sliding_window_size=2 * ratio,
+                    alignment=512,
+                )
+            )
         return KVSpec(specs)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
@@ -1291,6 +1603,24 @@ class DeepseekV4ForCausalLM(nn.Module):
                     raise ValueError(f"{prefix} physical stride is smaller than logical compressed width")
                 layer.attention.compressor.state_cache = kv_caches[
                     f"{prefix}.compressor.state_cache"
+                ][0]
+            if layer.attention.indexer is not None:
+                indexer = layer.attention.indexer
+                indexer.mla_cache = kv_caches[f"{prefix}.indexer"][0]
+                indexer.mla_raw_block_size = next(
+                    s.block_size
+                    for s in self.get_kv_spec().layers
+                    if s.name == f"{prefix}.indexer"
+                )
+                if indexer.mla_cache.shape[2] < (
+                    indexer.mla_raw_block_size // indexer.ratio
+                ):
+                    raise ValueError(
+                        f"{prefix}.indexer physical stride is smaller than "
+                        f"logical compressed width"
+                    )
+                indexer.compressor.state_cache = kv_caches[
+                    f"{prefix}.indexer.compressor.state_cache"
                 ][0]
 
     @torch.no_grad()

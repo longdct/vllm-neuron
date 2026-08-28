@@ -20,7 +20,44 @@ export VLLM_NEURON_VALIDATE_CACHE_METADATA=1
 export VLLM_CACHE_ROOT="$cache_path"
 export NEURON_VISIBLE_DEVICES="$logical_core"
 export NEURON_SKIP_EFA_AFFINITY=${NEURON_SKIP_EFA_AFFINITY:-1}
+# The prefill-64 graph takes 689-835s in neuronx-cc, longer than the 600s
+# default a lock waiter will poll for another process's compile. That does not
+# bite the single-rank in-process path, but it does for TP>1, concurrent runs,
+# and the warmup path -- so raise it rather than leaving a latent timeout.
+export NEURON_LIBTORCH_COMPILATION_TIMEOUT=${NEURON_LIBTORCH_COMPILATION_TIMEOUT:-1800}
 unset VLLM_NEURON_CPU_MODE VLLM_NEURON_CPU_COMPILE
+
+# Fast-iteration profile. Off by default: the gate's accepted-run signature
+# (three NEFFs cold, three hits / zero submitted HLOs warm) is defined against
+# the values below it, so this must never change what a plain invocation runs.
+#
+# Compile cost is dominated by a single graph -- prefill at the longest bucket
+# -- because DeepseekV4Attention.forward unrolls one full attention body per
+# token at trace time (55179 FX nodes at length 64 versus 8475 at length 8).
+# Both overrides attack that directly:
+#
+#   max-model-len 16       fewer unrolled token bodies. Measured 16min -> ~3min
+#                          in docs/model-dev/deepseek-v4-tiny-tp1-neuron-investigation.md,
+#                          which also records that length 16 still reproduced
+#                          the original fourth-token mismatch exactly.
+#   num-gpu-blocks 32      scatter_paged_latent builds a torch.where over the
+#                          whole cache once per token; capacity is
+#                          num_blocks * storage_block_size, so 256 blocks means
+#                          a [32768, latent] intermediate per token for the MLA
+#                          group. 32 is the smallest safe value: the runner logs
+#                          max_num_blocks_per_req=[1, 2, 2, 2, 8, 16], so the
+#                          override must clear 16 plus a null block. Re-read
+#                          that log line before lowering it further.
+if [[ ${VLLM_NEURON_TINY_FAST:-0} == 1 ]]; then
+  max_model_len=16
+  num_gpu_blocks=32
+  batched_tokens_buckets='[8,16]'
+else
+  max_model_len=64
+  num_gpu_blocks=256
+  batched_tokens_buckets='[8,64]'
+fi
+
 mkdir -p "$cache_path"
 "$python_bin" "$script_dir/write_device_preflight.py" \
   "$cache_path/device-preflight.json" --cache-root "$cache_path"
@@ -28,12 +65,12 @@ mkdir -p "$cache_path"
 exec "$vllm_bin" serve "$model_path" \
   --tensor-parallel-size 1 \
   --dtype bfloat16 \
-  --max-model-len 64 \
+  --max-model-len "$max_model_len" \
   --max-num-seqs 1 \
   --block-size 32 \
   --no-enable-prefix-caching \
   --no-async-scheduling \
-  --num-gpu-blocks-override 256 \
+  --num-gpu-blocks-override "$num_gpu_blocks" \
   --load-format dummy \
   --port "$port" \
-  --additional-config '{"neuron_config":{"num_batched_tokens_buckets":[8,64],"on_device_sampling_config":null}}'
+  --additional-config "{\"neuron_config\":{\"num_batched_tokens_buckets\":$batched_tokens_buckets,\"on_device_sampling_config\":null}}"

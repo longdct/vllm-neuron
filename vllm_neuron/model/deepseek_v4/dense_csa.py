@@ -1,6 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """The dense-CSA equivalence bound and its admission guard.
 
+**The lightning indexer now exists** (``indexer.py``), so the guard this module
+computes is no longer installed by default -- see
+``platform.py::_configure_deepseek_v4_dense_csa_bound`` and the
+``VLLM_NEURON_DEEPSEEK_V4_DENSE_CSA_BOUND=1`` opt-in. What follows described why
+the bound was needed while CSA attended densely; it is kept because the
+equivalence it derives is still the thing that makes the indexer *testable*.
+Below the bound, an indexer that selects everything and a correct one are
+indistinguishable, which is why the indexer's own tests deliberately run past
+it (``test_deepseek_v4_component_oracles.py``,
+``test_deepseek_v4_model_assembly.py``).
+
 Plan P5. DeepSeek-V4's lightning indexer **only selects; it never weights**. So
 wherever the eligible compressed set is no larger than ``index_topk``, selecting
 the top-k *is* selecting everything, and running dense attention over the whole
@@ -22,7 +33,12 @@ exact failure this guard exists to prevent.
 sequence has begun, complete or not, which upper-bounds the true eligible count
 and therefore lower-bounds the safe length. Switching to
 :attr:`CountingMode.COMPLETE` is only correct once the pinned implementation is
-known to exclude in-flight partial windows from indexer candidacy.
+known to exclude in-flight partial windows from indexer candidacy. **It does**:
+implementing the indexer settled this. Candidates are exactly the emitted
+entries, ``(position + 1) // ratio`` of them
+(:func:`~vllm_neuron.model.deepseek_v4.attention.visible_compressed_entries`),
+and a window still filling has emitted nothing to select. ``COMPLETE`` is the
+correct mode, not merely the optimistic one.
 
 The admission rule is the other half. Checking the *current* sequence length is
 not enough: a request admitted inside the bound can generate its way across it
@@ -62,8 +78,9 @@ class CountingMode(str, Enum):
     #: Upper-bounds the true count, so the resulting bound is safe under
     #: uncertainty about how partial carry state is treated.
     STARTED = "started"
-    #: Only fully-populated windows. Correct *only* where the pinned
-    #: implementation is known to exclude in-flight partial state.
+    #: Only fully-populated windows -- the correct mode. A window still filling
+    #: has emitted no entry, so there is nothing for the indexer to select;
+    #: confirmed by the indexer's own candidate set, ``(position + 1) // ratio``.
     COMPLETE = "complete"
 
 
@@ -110,6 +127,14 @@ class CompressorGeometry:
         return self.compress_ratio == 0
 
 
+#: Compression rate each compressed layer type denotes, used when a config
+#: carries ``compress_ratios`` but not the ``compress_rates`` dict.
+_RATE_BY_LAYER_TYPE = {
+    "compressed_sparse_attention": 4,
+    "heavily_compressed_attention": 128,
+}
+
+
 def geometry_from_config(config, layer_type: str) -> CompressorGeometry:
     """Derive entry-emission geometry from a pinned DeepSeek-V4 config.
 
@@ -121,11 +146,17 @@ def geometry_from_config(config, layer_type: str) -> CompressorGeometry:
     if layer_type == "sliding_attention":
         return CompressorGeometry(0, 0, 0, 0, 0)
     rates = getattr(config, "compress_rates", None)
-    if not isinstance(rates, dict) or layer_type not in rates:
-        raise DenseCsaUnsupportedError(
-            f"no pinned compressor rate for layer type {layer_type!r}"
-        )
-    rate = rates[layer_type]
+    if isinstance(rates, dict) and layer_type in rates:
+        rate = rates[layer_type]
+    else:
+        # Official checkpoints carry only the per-layer ``compress_ratios`` list
+        # and no ``compress_rates`` dict, so recover the rate from the layer type
+        # rather than rejecting the config.
+        rate = _RATE_BY_LAYER_TYPE.get(layer_type)
+        if rate is None:
+            raise DenseCsaUnsupportedError(
+                f"no pinned compressor rate for layer type {layer_type!r}"
+            )
     if not isinstance(rate, int) or isinstance(rate, bool) or rate < 1:
         raise DenseCsaUnsupportedError(
             f"invalid compressor rate {rate!r} for layer type {layer_type!r}"

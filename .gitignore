@@ -3,9 +3,24 @@ __pycache__/
 .pytest_cache/
 .coverage
 *.egg-info/
- build/
+build/
 dist/
 .venv/
 .venv-neuron/
 artifacts/
 global_metric_store.json
+
+# Neuron compile artifacts.
+# NKI kernel caches are written to $CWD, as 17-hex-char directories of *.colz,
+# so any tool run from the repo root drops them here. The rest land under
+# VLLM_CACHE_ROOT, which is only an issue when that points inside the repo.
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+*.colz
+*.neff
+*.hlo
+neuron/compile_cache/
+log-neuron-cc.txt
+device-preflight.json
+
+# neuronx-cc scratch dumped into the working directory during compilation
+neuronxcc-*/

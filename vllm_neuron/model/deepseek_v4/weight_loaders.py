@@ -22,6 +22,14 @@ class StackedShard:
 _STACKED_COMPONENTS = (
     (".w1", ".gate_up_proj", 0),
     (".w3", ".gate_up_proj", 1),
+    # The indexer's own compressor, listed before the outer one. Both rules
+    # produce the same destination -- ``resolve_stacked_shard`` matches on a
+    # bare substring, so ``.compressor.wkv`` already catches
+    # ``.indexer.compressor.wkv`` -- but only by accident. Naming the indexer
+    # explicitly, and first, means narrowing the outer rule later cannot
+    # silently strand the indexer's weights.
+    (".indexer.compressor.wkv", ".indexer.compressor.fused_wkv_wgate", 0),
+    (".indexer.compressor.wgate", ".indexer.compressor.fused_wkv_wgate", 1),
     (".compressor.wkv", ".compressor.fused_wkv_wgate", 0),
     (".compressor.wgate", ".compressor.fused_wkv_wgate", 1),
 )
@@ -47,15 +55,96 @@ _ATTENTION_RENAMES = (
     (".attn.wo_a", ".attn.o_a_proj"),
     (".attn.wo_b", ".attn.o_b_proj"),
     (".attn.attn_sink", ".attn.sinks"),
+    # The lightning indexer's query projection. It needs its own rule because
+    # the ``.attn.wq_b`` rule above does not match ``.attn.indexer.wq_b`` --
+    # deliberately, since the two are different weights on different modules.
+    # ``weights_proj`` needs no rule: the checkpoint's name already matches.
+    (".attn.indexer.wq_b", ".attn.indexer.q_b_proj"),
+    # The compressor keeps its norm as a bare parameter rather than a submodule.
+    # Matches the indexer's compressor as well as the outer one, which is what
+    # is wanted -- they are the same class.
+    (".compressor.norm.weight", ".compressor.norm_weight"),
+)
+
+def _stack_width(parameter_name: str) -> int:
+    """How many checkpoint tensors fuse into *parameter_name*."""
+    width = 0
+    for _, target, shard_id in _STACKED_COMPONENTS:
+        if target in parameter_name:
+            width = max(width, shard_id + 1)
+    if width == 0:
+        raise ValueError(f"{parameter_name!r} is not a fused DeepSeek-V4 parameter")
+    return width
+
+
+#: Checkpoint subtrees this plugin deliberately has no parameters for.
+#:
+#: Empty since the lightning indexer landed. It used to hold
+#: ``".attn.indexer."``: below the dense-CSA bound the indexer only *selects*
+#: and never weights, so skipping it was exact, and its checkpoint tensors had
+#: nowhere to go. They have somewhere to go now.
+#:
+#: Kept rather than deleted because "expected in a real checkpoint, expected to
+#: have no destination" is a distinct state from a mapping failure, and the next
+#: unmodelled subtree (MTP, say) will need to say so again.
+_UNSUPPORTED_SUBTREES: tuple[str, ...] = ()
+
+#: Container renames from the checkpoint's layout to this plugin's module tree.
+#:
+#: Applied *after* the leaf renames above, which still match on ``.attn.``/
+#: ``.ffn.``. Note these are this plugin's names, not vLLM's: the decoder layer
+#: holds ``attention``/``moe`` submodules and ``input_layernorm``/
+#: ``post_attention_layernorm``, so mapping to vLLM's ``attn``/``ffn`` spelling
+#: names parameters that do not exist here.
+_CONTAINER_RENAMES = (
+    (".attn_norm.weight", ".input_layernorm.weight"),
+    (".ffn_norm.weight", ".post_attention_layernorm.weight"),
+    (".attn.", ".attention."),
+    (".ffn.", ".moe."),
+)
+
+#: MoE parameters that are bare ``nn.Parameter`` tensors rather than ``Linear``
+#: submodules, so the checkpoint's trailing ``.weight`` has to be dropped.
+_BARE_MOE_PARAMS = re.compile(
+    r"\.moe\.(experts\.\d+|shared_experts)\.(gate_up_proj|down_proj|w[123])\.weight$"
+)
+
+#: mHC (manifold-constrained hyper-connection) parameter renames.
+#:
+#: The checkpoint flattens these into ``hc_<site>_<param>`` names, while the model
+#: holds them on real submodules -- ``attn_hc``/``ffn_hc`` per layer and
+#: ``hc_head`` on the model -- whose parameters are ``fn``, ``base`` and
+#: ``hc_scale``. Note the deliberate asymmetry: ``fn``/``base`` drop the ``hc_``
+#: prefix but ``hc_scale`` keeps it, matching the module definitions in
+#: ``model.py``.
+#:
+#: Without these rules every mHC tensor maps to a non-existent parameter. That
+#: went unnoticed because the tiny gate runs ``--load-format dummy``, so no real
+#: checkpoint weights were ever mapped.
+_MHC_RENAMES = (
+    (".hc_attn_scale", ".attn_hc.hc_scale"),
+    (".hc_attn_base", ".attn_hc.base"),
+    (".hc_attn_fn", ".attn_hc.fn"),
+    (".hc_ffn_scale", ".ffn_hc.hc_scale"),
+    (".hc_ffn_base", ".ffn_hc.base"),
+    (".hc_ffn_fn", ".ffn_hc.fn"),
+    ("hc_head_scale", "hc_head.hc_scale"),
+    ("hc_head_base", "hc_head.base"),
+    ("hc_head_fn", "hc_head.fn"),
 )
 
 
 def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
-    """Map an official V4 checkpoint key into the vLLM model namespace.
+    """Map an official V4 checkpoint key onto this plugin's parameter names.
 
-    The contract mirrors vLLM 0.26's DeepSeek-V4 ``WeightsMapper``. Keeping the
-    pure string transformation here makes checkpoint compatibility testable
-    without importing CUDA/ROCm model implementations.
+    The target is ``vllm_neuron.model.deepseek_v4.model``'s module tree, which is
+    what ``load_checkpoint_weights`` resolves against. That tree is not vLLM's:
+    the decoder layer holds ``attention``/``moe`` submodules, the mHC parameters
+    live on ``attn_hc``/``ffn_hc``/``hc_head``, and the expert projections are
+    bare parameters without a ``.weight`` suffix.
+
+    Keeping the pure string transformation here makes checkpoint compatibility
+    testable without constructing a model.
     """
     if not name or name.startswith(".") or name.endswith("."):
         raise ValueError(f"invalid DeepSeek-V4 checkpoint name: {name!r}")
@@ -80,23 +169,72 @@ def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
     elif mapped.endswith("embed.weight"):
         mapped = mapped[: -len("embed.weight")] + "embed_tokens.weight"
     elif mapped.endswith(".ffn.gate.bias"):
-        mapped = mapped[: -len(".ffn.gate.bias")] + ".ffn.gate.e_score_correction_bias"
+        # The router's score correction lives directly on the MoE block here,
+        # not on the gate submodule.
+        mapped = mapped[: -len(".ffn.gate.bias")] + ".ffn.correction_bias"
+    elif mapped.endswith(".ffn.gate.tid2eid"):
+        # Hash-routing table: a registered buffer on the MoE block.
+        mapped = mapped[: -len(".ffn.gate.tid2eid")] + ".ffn.tid2eid"
 
-    mapped = mapped.replace(".shared_experts.w2", ".shared_experts.down_proj")
+    # ``w2`` is the down projection for both the shared expert and each routed
+    # one; ``w1``/``w3`` are stacked later by resolve_stacked_shard.
+    mapped = re.sub(r"(\.(?:shared_experts|experts\.\d+))\.w2", r"\1.down_proj", mapped)
     for source, target in _ATTENTION_RENAMES:
+        mapped = mapped.replace(source, target)
+    for source, target in _MHC_RENAMES:
+        mapped = mapped.replace(source, target)
+    for source, target in _CONTAINER_RENAMES:
         mapped = mapped.replace(source, target)
     if mapped.endswith(".scale"):
         if expert_dtype == "fp4" and re.search(r"\.experts\.\d+\.w[123]\.scale$", mapped):
             mapped = mapped[: -len(".scale")] + ".weight_scale"
         else:
             mapped = mapped[: -len(".scale")] + ".weight_scale_inv"
+    elif _BARE_MOE_PARAMS.search(mapped):
+        mapped = mapped[: -len(".weight")]
     return mapped
 
 
+#: Model tensors that no checkpoint is expected to fill, so ``strict`` loading
+#: must not treat their absence as an incomplete checkpoint.
+#:
+#: * ``identity_kv_weight`` -- the derived identity K/V projection, reconstructed
+#:   by ``reinitialize_deterministic_buffers``.
+#: * ``correction_bias`` -- only routed (``noaux_tc``) layers ship
+#:   ``ffn.gate.bias``; hash-routed layers keep the zero default.
+#: * ``tid2eid`` -- only hash-routed layers ship a table; routed layers keep the
+#:   config-derived fallback, which their routing never reads.
+#: * ``rotary_emb.*_inv_freq`` -- RoPE frequency tables, non-persistent buffers
+#:   in Transformers by design, recomputed from config after ``to_empty()``.
+_DETERMINISTIC_SUFFIXES = (
+    ".attention.identity_kv_weight",
+    ".moe.correction_bias",
+    ".moe.tid2eid",
+    "_inv_freq",
+)
+
+
+def is_deterministically_initialized(parameter_name: str) -> bool:
+    """True for tensors the model derives rather than loads."""
+    return parameter_name.endswith(_DETERMINISTIC_SUFFIXES)
+
+
+def is_unsupported_checkpoint_name(name: str) -> bool:
+    """True for checkpoint subtrees this plugin intentionally does not model.
+
+    Distinct from a mapping failure: these tensors are expected to be present in
+    a real checkpoint and expected to have nowhere to go.
+    """
+    return any(subtree in name for subtree in _UNSUPPORTED_SUBTREES)
+
+
 def resolve_stacked_shard(mapped_name: str) -> StackedShard | None:
-    """Resolve fused attention/compressor/MLP shards after namespace mapping."""
-    if ".experts." in mapped_name:
-        return None
+    """Resolve fused attention/compressor/MLP shards after namespace mapping.
+
+    Routed experts stack exactly like the shared expert: this plugin gives each
+    expert its own ``gate_up_proj`` parameter holding the ``w1``/``w3``
+    concatenation, rather than a single grouped tensor addressed by expert id.
+    """
     for source, target, shard_id in _STACKED_COMPONENTS:
         if source in mapped_name:
             return StackedShard(mapped_name.replace(source, target), shard_id)
@@ -115,6 +253,21 @@ def require_weight_shape(
         )
 
 
+def _copy_into(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """``destination.copy_(source)``, casting on the host side first.
+
+    Neuron rejects a copy that changes device *and* dtype in one step
+    ("Expected self.dtype() == dst.dtype() to be true"), which CPU performs
+    silently. Checkpoints are BF16 while these parameters are FP32, so every
+    real device load hits exactly that combination -- and only on device, which
+    is why the CPU oracle never surfaced it.
+
+    Casting while the source is still on the host leaves a pure transfer for the
+    device, and is numerically identical to the upcast CPU was doing implicitly.
+    """
+    destination.copy_(source.to(destination.dtype))
+
+
 def load_checkpoint_weights(
     module,
     weights,
@@ -124,7 +277,10 @@ def load_checkpoint_weights(
 ) -> set[str]:
     """Load a checkpoint iterator through the mapped/fused parameter contract."""
     torch = __import__("torch")
-    params = dict(module.named_parameters())
+    # Buffers as well as parameters: the hash-routing table ``tid2eid`` is a
+    # registered buffer, and a checkpoint that provides one must be able to
+    # override the config-derived default rather than silently keeping it.
+    params = {**dict(module.named_parameters()), **dict(module.named_buffers())}
     loaded_params: set[str] = set()
     loaded_destinations: set[tuple[str, int | None]] = set()
     source_names: set[str] = set()
@@ -133,6 +289,8 @@ def load_checkpoint_weights(
         if source_name in source_names:
             raise ValueError(f"duplicate DeepSeek-V4 checkpoint weight {source_name!r}")
         source_names.add(source_name)
+        if is_unsupported_checkpoint_name(source_name):
+            continue
         mapped_name = map_checkpoint_name(source_name, expert_dtype)
         stacked = resolve_stacked_shard(mapped_name)
         target_name = stacked.parameter_name if stacked else mapped_name
@@ -152,11 +310,34 @@ def load_checkpoint_weights(
         weight_loader = getattr(parameter, "weight_loader", None)
         with torch.no_grad():
             if stacked is not None:
-                if weight_loader is None:
-                    raise ValueError(
-                        f"fused DeepSeek-V4 parameter {target_name!r} has no shard loader"
+                if weight_loader is not None:
+                    weight_loader(parameter, loaded_weight, shard_id)
+                else:
+                    # No shard loader: place the shard directly. A fused
+                    # parameter is its shards concatenated on dim 0 in shard-id
+                    # order, so shard i owns an equal slice of the rows.
+                    #
+                    # This cannot rely on a ``weight_loader`` attribute set in
+                    # __init__: ``load_weights`` calls ``to_empty()`` first,
+                    # which rebuilds every parameter and drops attributes hung
+                    # on the old objects.
+                    width = _stack_width(target_name)
+                    chunk, remainder = divmod(parameter.shape[0], width)
+                    if remainder:
+                        raise ValueError(
+                            f"fused DeepSeek-V4 parameter {target_name!r} has "
+                            f"{parameter.shape[0]} rows, not divisible into "
+                            f"{width} shards"
+                        )
+                    require_weight_shape(
+                        source_name,
+                        tuple(loaded_weight.shape),
+                        (chunk, *tuple(parameter.shape[1:])),
                     )
-                weight_loader(parameter, loaded_weight, shard_id)
+                    _copy_into(
+                        parameter[shard_id * chunk : (shard_id + 1) * chunk],
+                        loaded_weight,
+                    )
             elif weight_loader is not None:
                 if hasattr(weight_loader, "load"):
                     class _TensorSlice:
@@ -178,7 +359,7 @@ def load_checkpoint_weights(
                     require_weight_shape(
                         source_name, tuple(transformed.shape), tuple(parameter.shape)
                     )
-                    parameter.copy_(transformed)
+                    _copy_into(parameter, transformed)
                 else:
                     weight_loader(parameter, loaded_weight)
             else:
@@ -187,11 +368,15 @@ def load_checkpoint_weights(
                     tuple(loaded_weight.shape),
                     tuple(parameter.shape),
                 )
-                parameter.copy_(loaded_weight)
+                _copy_into(parameter, loaded_weight)
         loaded_destinations.add(destination)
         loaded_params.add(target_name)
     if strict:
-        missing = sorted(set(params) - loaded_params)
+        missing = sorted(
+            name
+            for name in set(params) - loaded_params
+            if not is_deterministically_initialized(name)
+        )
         if missing:
             raise ValueError(
                 "DeepSeek-V4 checkpoint did not load parameter(s): "

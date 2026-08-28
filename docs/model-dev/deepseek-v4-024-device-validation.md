@@ -19,12 +19,17 @@ or the NIXL connector, this document is current and that one is not.
 
 ## Read this before booking instance time
 
-**DeepSeek-V4 cannot be served, and this is not a testing gap.** The
-scheduler-integrated inference path does not exist yet: the model's `forward`
-takes no `attn_metadata`, `bind_kv_cache` validates without binding, the forward
-pass is a Python loop over single tokens, and there is no parallelism anywhere in
-the package. Registering it in `vllm_neuron/model/registry.py` would advertise
-support that isn't there. See
+**DeepSeek-V4 serves at tiny scale only; do not read that as support.**
+Superseded in part as of 2026-08-23: the scheduler-integrated path now exists.
+`forward` takes `attn_metadata`, the tiny three-layer slice serves over the
+OpenAI-compatible endpoint at TP1 (`tools/deepseek_v4/run_tiny_tp1.sh`), and it
+loads real DeepSeek-V4-Flash weights. What remains true is the rest of the gap:
+the forward pass is still a Python loop over single tokens, there is still no
+parallelism anywhere in the package, and device output on real weights still
+diverges from CPU -- see
+[`deepseek-v4-real-weight-validation.md`](deepseek-v4-real-weight-validation.md).
+Registering it in `vllm_neuron/model/registry.py` would still advertise support
+that isn't there. See
 [`deepseek-v4-serving-roadmap.md`](deepseek-v4-serving-roadmap.md) for the full
 gap analysis and what has to be built.
 

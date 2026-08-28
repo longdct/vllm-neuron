@@ -12,6 +12,7 @@ from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
     DeepseekV4HCACompressor,
     DeepseekV4HashRouter,
     DeepseekV4HyperConnection,
+    DeepseekV4IndexerScorer,
     DeepseekV4TopKRouter,
 )
 
@@ -19,6 +20,11 @@ from vllm_neuron.model.deepseek_v4.compressor import (
     compress_csa_chunk,
     compress_hca_chunk,
     finalize_compressed_entries,
+)
+from vllm_neuron.model.deepseek_v4.indexer import (
+    lightning_index_scores,
+    select_compressed_entries,
+    selection_mask_from_indices,
 )
 from vllm_neuron.model.deepseek_v4.mhc import (
     apply_hyperconnection,
@@ -361,3 +367,181 @@ def test_csa_full_compressed_cache_matches_actual_transformers_module():
     )
     torch.testing.assert_close(actual.unsqueeze(1), expected)
     assert state.kv_carry.shape[1] == 1
+
+
+def indexer_config(index_topk=3, index_n_heads=4, index_head_dim=8):
+    """A CSA-only config small enough that top-k actually excludes entries."""
+    return DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=32,
+        num_hidden_layers=1,
+        layer_types=["compressed_sparse_attention"],
+        mlp_layer_types=["moe"],
+        num_attention_heads=1,
+        head_dim=16,
+        q_lora_rank=8,
+        index_topk=index_topk,
+        index_n_heads=index_n_heads,
+        index_head_dim=index_head_dim,
+    )
+
+
+def _seeded_scorer(config, seed=7):
+    scorer = DeepseekV4IndexerScorer(config).eval()
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for parameter in scorer.parameters():
+            parameter.uniform_(-0.5, 0.5)
+    return scorer
+
+
+def _reference_selection(scores, position_ids, compress_rate, index_topk):
+    """The reference's own selection, extracted from DeepseekV4Indexer.forward.
+
+    Transformers 5.15 ``modeling_deepseek_v4.py``: mask entries at or past the
+    causal threshold, take the top-k, then replace any pick that still points
+    past the threshold with the ``-1`` sentinel.
+    """
+    entries = scores.shape[-1]
+    threshold = (position_ids + 1) // compress_rate
+    future = torch.arange(entries).view(1, 1, -1) >= threshold.unsqueeze(-1)
+    masked = scores.masked_fill(future, float("-inf"))
+    chosen = masked.topk(min(index_topk, entries), dim=-1).indices
+    invalid = chosen >= threshold.unsqueeze(-1)
+    return torch.where(invalid, torch.full_like(chosen, -1), chosen), threshold
+
+
+def test_index_scores_match_actual_transformers_scorer():
+    """``∑_h w_h · ReLU(q_h · k_s)``, bit-exact against the real module."""
+    config = indexer_config()
+    scorer = _seeded_scorer(config)
+    torch.manual_seed(21)
+    query = torch.randn(2, 5, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(2, 9, config.index_head_dim)
+    hidden = torch.randn(2, 5, config.hidden_size)
+    with torch.no_grad():
+        expected = scorer(query, keys, hidden)
+        actual = lightning_index_scores(query, keys, scorer.weights_proj(hidden))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_selection_matches_extracted_transformers_math_in_the_sparse_regime():
+    """40 tokens at ratio 4 gives 10 candidates for a budget of 3.
+
+    Below the dense bound the comparison is vacuous -- selecting the top-k is
+    selecting everything -- so this deliberately runs past it and asserts that
+    entries really were dropped.
+    """
+    config = indexer_config()
+    compress_rate = config.compress_rates["compressed_sparse_attention"]
+    scorer = _seeded_scorer(config, seed=11)
+    torch.manual_seed(11)
+    entries = 10
+    query = torch.randn(2, 40, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(2, entries, config.index_head_dim)
+    hidden = torch.randn(2, 40, config.hidden_size)
+    position_ids = torch.arange(40).expand(2, -1)
+    with torch.no_grad():
+        scores = scorer(query, keys, hidden)
+
+    expected, threshold = _reference_selection(
+        scores, position_ids, compress_rate, config.index_topk
+    )
+    actual = select_compressed_entries(scores, threshold, config.index_topk)
+    torch.testing.assert_close(actual, expected)
+
+    kept = selection_mask_from_indices(actual, entries).sum(-1)
+    assert torch.equal(kept, torch.minimum(threshold, torch.tensor(config.index_topk)))
+    assert int((threshold - kept).clamp(min=0).max()) > 0, "nothing was pruned"
+
+
+def test_selection_mask_matches_the_reference_block_bias():
+    """The reference's ``-inf``/0 bias and this plugin's bool mask agree.
+
+    Different spelling, same statement: the reference scatters into a buffer one
+    column wider than the entry axis so ``-1`` sentinels have somewhere to land.
+    """
+    config = indexer_config()
+    compress_rate = config.compress_rates["compressed_sparse_attention"]
+    scorer = _seeded_scorer(config, seed=5)
+    torch.manual_seed(5)
+    batch, tokens, entries = 2, 24, 6
+    query = torch.randn(batch, tokens, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(batch, entries, config.index_head_dim)
+    hidden = torch.randn(batch, tokens, config.hidden_size)
+    position_ids = torch.arange(tokens).expand(batch, -1)
+    with torch.no_grad():
+        scores = scorer(query, keys, hidden)
+    chosen, _ = _reference_selection(
+        scores, position_ids, compress_rate, config.index_topk
+    )
+
+    safe = torch.where(chosen >= 0, chosen, torch.full_like(chosen, entries))
+    bias = torch.full((batch, 1, tokens, entries + 1), float("-inf"))
+    bias.scatter_(-1, safe.unsqueeze(1), 0.0)
+    expected = bias[..., :entries].squeeze(1) == 0.0
+
+    assert torch.equal(selection_mask_from_indices(chosen, entries), expected)
+
+
+def test_tied_scores_keep_the_right_number_of_entries():
+    """Identical keys make every score identical.
+
+    Which entries win is then a tie-break, and tie-breaks are not guaranteed to
+    agree between torch CPU and the Torch-XLA bridge. What must hold either way
+    is that the scores agree and the budget is spent exactly.
+    """
+    config = indexer_config()
+    compress_rate = config.compress_rates["compressed_sparse_attention"]
+    scorer = _seeded_scorer(config, seed=3)
+    torch.manual_seed(3)
+    batch, tokens, entries = 2, 32, 8
+    query = torch.randn(batch, tokens, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(batch, 1, config.index_head_dim).expand(
+        batch, entries, config.index_head_dim
+    ).contiguous()
+    hidden = torch.randn(batch, tokens, config.hidden_size)
+    position_ids = torch.arange(tokens).expand(batch, -1)
+    with torch.no_grad():
+        expected_scores = scorer(query, keys, hidden)
+        actual_scores = lightning_index_scores(
+            query, keys, scorer.weights_proj(hidden)
+        )
+    torch.testing.assert_close(actual_scores, expected_scores)
+
+    threshold = (position_ids + 1) // compress_rate
+    kept = selection_mask_from_indices(
+        select_compressed_entries(actual_scores, threshold, config.index_topk), entries
+    ).sum(-1)
+    assert torch.equal(kept, torch.minimum(threshold, torch.tensor(config.index_topk)))
+
+
+def test_indexer_is_exact_dense_attention_below_the_bound():
+    """The equivalence ``dense_csa``'s admission bound is derived from.
+
+    Where the eligible set fits inside ``index_topk``, the indexer selects every
+    visible entry and nothing else -- so omitting it is not an approximation.
+    """
+    config = indexer_config(index_topk=16)
+    compress_rate = config.compress_rates["compressed_sparse_attention"]
+    scorer = _seeded_scorer(config, seed=9)
+    torch.manual_seed(9)
+    batch, tokens, entries = 2, 28, 7
+    query = torch.randn(batch, tokens, config.index_n_heads, config.index_head_dim)
+    keys = torch.randn(batch, entries, config.index_head_dim)
+    hidden = torch.randn(batch, tokens, config.hidden_size)
+    position_ids = torch.arange(tokens).expand(batch, -1)
+    with torch.no_grad():
+        scores = scorer(query, keys, hidden)
+
+    threshold = (position_ids + 1) // compress_rate
+    assert int(threshold.max()) <= config.index_topk, "not below the bound"
+    mask = selection_mask_from_indices(
+        select_compressed_entries(scores, threshold, config.index_topk), entries
+    )
+    dense = torch.arange(entries).view(1, 1, -1) < threshold.unsqueeze(-1)
+    assert torch.equal(mask, dense)

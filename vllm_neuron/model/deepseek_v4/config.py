@@ -173,6 +173,8 @@ class NormalizedDeepseekV4Config:
     num_experts_per_tok: int
     n_shared_experts: int
     index_topk: int
+    index_n_heads: int
+    index_head_dim: int
     hc_mult: int
     hc_sinkhorn_iters: int
     num_nextn_predict_layers: int
@@ -211,6 +213,12 @@ class DeepseekV4ModelConfig:
     rms_norm_eps: float
     hc_eps: float
     swiglu_limit: float
+    #: Lightning-indexer geometry. Only ``compress_ratio == 4`` (CSA) layers
+    #: build an indexer, but the values are model-wide, so they are carried
+    #: here rather than per-layer.
+    index_topk: int
+    index_n_heads: int
+    index_head_dim: int
     layers: tuple[LayerSpec, ...]
     torch_dtype: Any
     tie_word_embeddings: bool
@@ -251,6 +259,9 @@ class DeepseekV4ModelConfig:
             rms_norm_eps=float(_get(hf_config, "rms_norm_eps", 1e-6)),
             hc_eps=float(_get(hf_config, "hc_eps", 1e-6)),
             swiglu_limit=float(_get(hf_config, "swiglu_limit", 10.0)),
+            index_topk=normalized.index_topk,
+            index_n_heads=normalized.index_n_heads,
+            index_head_dim=normalized.index_head_dim,
             layers=normalized.layers,
             torch_dtype=dtype,
             tie_word_embeddings=bool(_get(hf_config, "tie_word_embeddings", False)),
@@ -633,6 +644,8 @@ def normalize_config(config: Any) -> NormalizedDeepseekV4Config:
         num_experts_per_tok=num_experts_per_tok,
         n_shared_experts=n_shared_experts,
         index_topk=_require_positive_int(config, "index_topk"),
+        index_n_heads=_require_positive_int(config, "index_n_heads"),
+        index_head_dim=_require_positive_int(config, "index_head_dim"),
         hc_mult=_require_positive_int(config, "hc_mult"),
         hc_sinkhorn_iters=_require_positive_int(config, "hc_sinkhorn_iters"),
         num_nextn_predict_layers=num_nextn_predict_layers,

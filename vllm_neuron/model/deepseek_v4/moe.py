@@ -26,8 +26,15 @@ def routed_topk(
 
 
 def hash_experts(input_ids: torch.Tensor, tid2eid: torch.Tensor) -> torch.Tensor:
-    if input_ids.min() < 0 or input_ids.max() >= tid2eid.shape[0]:
-        raise ValueError("token id is outside tid2eid")
+    # Reading a tensor's *values* to decide control flow is untraceable:
+    # Dynamo raises "Data-dependent branching" rather than graph-breaking, so
+    # this bound check has to be eager-only. It stays in eager because that is
+    # where a bad `tid2eid` is diagnosable at all -- on device the same input
+    # would silently gather garbage. Shape checks are safe either way and are
+    # deliberately left outside this guard.
+    if not torch.compiler.is_compiling():
+        if input_ids.min() < 0 or input_ids.max() >= tid2eid.shape[0]:
+            raise ValueError("token id is outside tid2eid")
     return tid2eid[input_ids]
 
 
@@ -44,8 +51,10 @@ def hash_topk(
     if ids.ndim != 2 or ids.shape[0] != input_ids.numel():
         raise ValueError("tid2eid must provide a fixed top-k row for every token")
     flat_logits = logits.reshape(-1, logits.shape[-1])
-    if ids.numel() and ids.max() >= flat_logits.shape[-1]:
-        raise ValueError("tid2eid selects an expert outside the gate logits")
+    # Eager-only for the same reason as hash_experts' bound check.
+    if not torch.compiler.is_compiling():
+        if ids.numel() and ids.max() >= flat_logits.shape[-1]:
+            raise ValueError("tid2eid selects an expert outside the gate logits")
     scores = F.softplus(flat_logits.float()).sqrt()
     weights = scores.gather(1, ids)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)

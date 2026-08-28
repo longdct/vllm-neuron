@@ -54,6 +54,8 @@ def base_fields(**overrides):
         "num_experts_per_tok": 6,
         "n_shared_experts": 1,
         "index_topk": 512,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
         "hc_mult": 4,
         "hc_sinkhorn_iters": 20,
         "num_nextn_predict_layers": 1,
@@ -320,6 +322,26 @@ class TestValidation:
             deepseek_v4_config.DeepseekV4ConfigError, match="index_topk"
         ):
             deepseek_v4_config.normalize_config(config)
+
+    @pytest.mark.parametrize("field", ["index_n_heads", "index_head_dim"])
+    def test_missing_indexer_geometry_raises(self, deepseek_v4_config, field):
+        """The lightning indexer's shape is read, never guessed.
+
+        ``index_topk`` has always been required; the two dimensions that go
+        with it are required on the same terms. A default here would be a
+        fabricated constant of exactly the kind ``dense_csa`` refuses.
+        """
+        config = raw_form()
+        del config[field]
+        with pytest.raises(deepseek_v4_config.DeepseekV4ConfigError, match=field):
+            deepseek_v4_config.normalize_config(config)
+
+    @pytest.mark.parametrize("field", ["index_n_heads", "index_head_dim"])
+    def test_non_positive_indexer_geometry_raises(self, deepseek_v4_config, field):
+        with pytest.raises(
+            deepseek_v4_config.DeepseekV4ConfigError, match="positive integer"
+        ):
+            deepseek_v4_config.normalize_config(raw_form(**{field: 0}))
 
     def test_multi_head_kv_is_rejected(self, deepseek_v4_config):
         """MLA keeps one latent KV per token; anything else is another model."""

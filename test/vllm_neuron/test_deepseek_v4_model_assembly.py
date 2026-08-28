@@ -94,12 +94,14 @@ def build_attn_metadata(specs, cached_seq_len_by_group, new_tokens, max_blocks=8
     return metadata
 
 
-def run_chunked(model, specs, tokens_list):
+def run_chunked(model, specs, tokens_list, max_blocks=8):
     cached = {spec.name: 0 for spec in specs}
     outputs = []
     for chunk in tokens_list:
         n = len(chunk)
-        attn_metadata = build_attn_metadata(specs, cached, n)
+        attn_metadata = build_attn_metadata(
+            specs, cached, n, max_blocks=max_blocks
+        )
         input_ids = torch.tensor(chunk)
         positions = torch.arange(cached[specs[0].name], cached[specs[0].name] + n)
         sampling_positions = torch.arange(n)
@@ -180,27 +182,60 @@ def test_load_weights_restores_nonpersistent_buffers_after_meta_materialization(
 
 
 def test_device_model_declares_exact_heterogeneous_cache_inventory():
-    """get_kv_spec is untouched by the Step 1-3 rewrite -- still 10 groups."""
-    model = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    """Four SWA + four compressed + four carry caches.
+
+    Ten before the lightning indexer; the single c4 layer now adds two more --
+    the indexer runs a whole second compressor at ``index_head_dim``, so it
+    needs its own compressed-entry pages and its own carry pages. c128 layers
+    have no indexer and are unchanged.
+    """
+    config = hf_config()
+    model = DeepseekV4ForCausalLM.from_configs(config).eval()
     specs = model.get_kv_spec().layers
-    assert len(specs) == 10  # four SWA + three compressed + three carry caches
+    assert len(specs) == 12
     assert [spec.cache_kind for spec in specs].count(
         CacheKind.SLIDING_WINDOW_MLA
     ) == 4
     mla_specs = [spec for spec in specs if spec.cache_kind is CacheKind.MLA]
-    assert [spec.compress_ratio for spec in mla_specs] == [128, 4, 128]
+    # The second ratio-4 group is the c4 layer's indexer, alongside its own.
+    assert [spec.compress_ratio for spec in mla_specs] == [128, 4, 4, 128]
+    assert [spec.name.endswith(".indexer") for spec in mla_specs] == [
+        False,
+        False,
+        True,
+        False,
+    ]
+    # The indexer's entries are index_head_dim wide, not latent_size.
+    assert [spec.head_size for spec in mla_specs] == [
+        config.head_dim,
+        config.head_dim,
+        config.index_head_dim,
+        config.head_dim,
+    ]
     # Explicit block_size=128 on every compressed group -- see the comment in
     # get_kv_spec: the platform default of 32 does not divide 128.
-    assert [spec.block_size for spec in mla_specs] == [128, 128, 128]
+    assert [spec.block_size for spec in mla_specs] == [128, 128, 128, 128]
     carry = [spec for spec in specs if spec.cache_kind is CacheKind.COMPRESSOR_STATE]
-    # head_size = 2*(1+overlap)*latent_size; latent_size == head_dim == 16 here.
+    # head_size = 2*(1+overlap)*width; width is latent_size (16) for the outer
+    # compressors and index_head_dim (128) for the indexer's.
     assert [
         (spec.block_size, spec.sliding_window_size, spec.head_size) for spec in carry
     ] == [
         (8, 128, 32),
         (4, 8, 64),
+        (4, 8, 4 * config.index_head_dim),
         (8, 128, 32),
     ]
+
+
+def test_only_c4_layers_declare_an_indexer():
+    """c128/HCA attends to all of its compressed history and has no indexer."""
+    model = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    kinds = [
+        (layer.attention.ratio, layer.attention.indexer is not None)
+        for layer in model.model.layers
+    ]
+    assert kinds == [(128, False), (0, False), (4, True), (128, False)]
 
 
 def test_bind_kv_cache_attaches_tensors_to_attention_and_compressor_modules():
@@ -279,3 +314,198 @@ def test_batched_forward_is_chunk_invariant_against_single_shot():
     model.bind_kv_cache(fresh_caches(model))
     arbitrary_chunks = run_chunked(model, specs, [tokens[:3], tokens[3:5], tokens[5:]])
     torch.testing.assert_close(whole, arbitrary_chunks, rtol=1e-3, atol=1e-4)
+
+
+def indexer_hf_config(index_topk):
+    """One CSA layer, with an indexer budget small enough to actually bite.
+
+    ``sliding_window`` is kept short so the compressed entries carry real
+    signal rather than being shadowed by a local window covering everything.
+    """
+    return DeepseekV4Config(
+        hidden_size=32,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_local_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=16,
+        q_lora_rank=16,
+        sliding_window=8,
+        layer_types=["compressed_sparse_attention"],
+        mlp_layer_types=["moe"],
+        index_topk=index_topk,
+        index_n_heads=2,
+        index_head_dim=8,
+    )
+
+
+def _indexer_model(index_topk, seed=17):
+    torch.manual_seed(seed)
+    model = DeepseekV4ForCausalLM.from_configs(indexer_hf_config(index_topk)).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.uniform_(-0.1, 0.1)
+    return model
+
+
+#: 40 tokens at ratio 4 gives 10 compressed entries -- comfortably past a
+#: budget of 2, so selection has to discard real content.
+_INDEXER_TOKENS = [t % 64 for t in range(40)]
+
+#: The carry-state group pages at block_size 4, so 40 tokens needs 10 blocks.
+_INDEXER_BLOCKS = 16
+
+
+def test_a_small_indexer_budget_changes_the_output():
+    """Guards against the indexer being wired in as a silent no-op.
+
+    With the stock ``index_topk`` nothing is ever pruned at test scale, so an
+    indexer that selected everything -- or was never called -- would look
+    exactly like a correct one. Shrinking the budget is what makes the
+    difference observable.
+    """
+    unbounded = _indexer_model(999)
+    bounded = _indexer_model(2)
+    specs = unbounded.get_kv_spec().layers
+
+    unbounded.bind_kv_cache(fresh_caches(unbounded))
+    dense = run_chunked(unbounded, specs, [_INDEXER_TOKENS], max_blocks=_INDEXER_BLOCKS)
+    bounded.bind_kv_cache(fresh_caches(bounded))
+    sparse = run_chunked(
+        bounded,
+        bounded.get_kv_spec().layers,
+        [_INDEXER_TOKENS],
+        max_blocks=_INDEXER_BLOCKS,
+    )
+
+    assert torch.isfinite(dense).all() and torch.isfinite(sparse).all()
+    assert not torch.allclose(dense, sparse), "indexer pruned nothing"
+
+
+def test_indexer_selection_is_chunk_invariant():
+    """Selection must depend on the token, not on how tokens were batched.
+
+    The indexer runs inside the per-token loop and reads a cache that is
+    written by that same loop, so a chunk-boundary bug here would show up as
+    prefill and decode disagreeing -- which is exactly how this model is
+    served.
+    """
+    model = _indexer_model(2)
+    specs = model.get_kv_spec().layers
+
+    model.bind_kv_cache(fresh_caches(model))
+    whole = run_chunked(model, specs, [_INDEXER_TOKENS], max_blocks=_INDEXER_BLOCKS)
+
+    model.bind_kv_cache(fresh_caches(model))
+    per_token = run_chunked(
+        model, specs, [[t] for t in _INDEXER_TOKENS], max_blocks=_INDEXER_BLOCKS
+    )
+    torch.testing.assert_close(whole, per_token, rtol=1e-3, atol=1e-4)
+
+    model.bind_kv_cache(fresh_caches(model))
+    chunks = run_chunked(
+        model,
+        specs,
+        [_INDEXER_TOKENS[:9], _INDEXER_TOKENS[9:23], _INDEXER_TOKENS[23:]],
+        max_blocks=_INDEXER_BLOCKS,
+    )
+    torch.testing.assert_close(whole, chunks, rtol=1e-3, atol=1e-4)
+
+
+def test_indexer_budget_above_the_entry_count_is_dense_attention():
+    """The equivalence the admission bound rests on, end to end.
+
+    40 tokens at ratio 4 is 10 entries; any budget at or above that must
+    select all of them, so the model output must match a budget of 10 exactly.
+    """
+    at_bound = _indexer_model(10)
+    over_bound = _indexer_model(4096)
+
+    at_bound.bind_kv_cache(fresh_caches(at_bound))
+    tight = run_chunked(
+        at_bound,
+        at_bound.get_kv_spec().layers,
+        [_INDEXER_TOKENS],
+        max_blocks=_INDEXER_BLOCKS,
+    )
+    over_bound.bind_kv_cache(fresh_caches(over_bound))
+    loose = run_chunked(
+        over_bound,
+        over_bound.get_kv_spec().layers,
+        [_INDEXER_TOKENS],
+        max_blocks=_INDEXER_BLOCKS,
+    )
+
+    torch.testing.assert_close(tight, loose)
+
+
+def test_indexer_checkpoint_tensors_load_onto_the_indexer_module():
+    """The names the real checkpoint ships for the indexer, end to end.
+
+    Spelled exactly as the official index JSON spells them. Until the indexer
+    existed these were skipped outright; the risk now is the opposite one --
+    that they land on the *layer's* compressor instead of the indexer's, since
+    both are ``DeepseekV4Compressor``s with identically-named parameters.
+    """
+    model = DeepseekV4ForCausalLM.from_configs(hf_config()).eval()
+    indexer = model.model.layers[2].attention.indexer
+    assert indexer is not None
+    outer = model.model.layers[2].attention.compressor
+
+    before = outer.fused_wkv_wgate.weight.detach().clone()
+    fused = indexer.compressor.fused_wkv_wgate.weight
+    rows, columns = fused.shape[0] // 2, fused.shape[1]
+    values = {
+        "layers.2.attn.indexer.wq_b.weight": torch.randn_like(indexer.q_b_proj.weight),
+        "layers.2.attn.indexer.weights_proj.weight": torch.randn_like(
+            indexer.weights_proj.weight
+        ),
+        "layers.2.attn.indexer.compressor.wkv.weight": torch.randn(
+            rows, columns, dtype=fused.dtype
+        ),
+        "layers.2.attn.indexer.compressor.wgate.weight": torch.randn(
+            rows, columns, dtype=fused.dtype
+        ),
+        "layers.2.attn.indexer.compressor.ape": torch.randn_like(
+            indexer.compressor.ape
+        ),
+        "layers.2.attn.indexer.compressor.norm.weight": torch.randn_like(
+            indexer.compressor.norm_weight
+        ),
+    }
+    loaded = load_checkpoint_weights(model, list(values.items()))
+
+    assert loaded == {
+        "model.layers.2.attention.indexer.q_b_proj.weight",
+        "model.layers.2.attention.indexer.weights_proj.weight",
+        "model.layers.2.attention.indexer.compressor.fused_wkv_wgate.weight",
+        "model.layers.2.attention.indexer.compressor.ape",
+        "model.layers.2.attention.indexer.compressor.norm_weight",
+    }
+    torch.testing.assert_close(
+        indexer.q_b_proj.weight, values["layers.2.attn.indexer.wq_b.weight"]
+    )
+    torch.testing.assert_close(
+        indexer.weights_proj.weight,
+        values["layers.2.attn.indexer.weights_proj.weight"],
+    )
+    torch.testing.assert_close(
+        indexer.compressor.ape, values["layers.2.attn.indexer.compressor.ape"]
+    )
+    torch.testing.assert_close(
+        indexer.compressor.norm_weight,
+        values["layers.2.attn.indexer.compressor.norm.weight"],
+    )
+    # wkv is shard 0, wgate shard 1, concatenated on dim 0.
+    torch.testing.assert_close(
+        fused[:rows], values["layers.2.attn.indexer.compressor.wkv.weight"]
+    )
+    torch.testing.assert_close(
+        fused[rows:], values["layers.2.attn.indexer.compressor.wgate.weight"]
+    )
+    # And the layer's own compressor is untouched by any of it.
+    torch.testing.assert_close(outer.fused_wkv_wgate.weight, before)

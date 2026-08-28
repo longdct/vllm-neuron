@@ -247,6 +247,106 @@ There should be three NEFFs and three completion markers. On the verified
 These are diagnostic observations, not performance guarantees. Compiler time
 varies with SDK version, host contention, and compiler worker settings.
 
+## 5a. Where the time actually goes, and how to cut it
+
+The three graphs compile in parallel, so the wall clock is the longest single
+compile, not the sum. A second cold run measured:
+
+| Stage | Time |
+| --- | ---: |
+| Weight loading | 0.01 seconds |
+| Parallel trace, three graphs, three lanes | 132 seconds |
+| Decode `(1,64)` compilation | 24 seconds |
+| Prefill-8 compilation | 72 seconds |
+| Prefill-64 compilation | 689 seconds |
+| Warmup and device load | 47 seconds |
+| Total | about 870 seconds |
+
+Prefill-64 alone is roughly 80 percent of a cold start. Everything else,
+including the compiler flags and the worker-pool settings, is noise against it.
+
+`neuronx-cc` is not slow here in general: a 22-layer TinyLlama compiles in about
+80 seconds on the same host. The prefill-64 graph is slow because it is large,
+and it grows linearly with sequence length:
+
+| Captured FX graph | Decode, 1 token | Prefill-8 | Prefill-64 |
+| --- | ---: | ---: | ---: |
+| Total nodes | 2,637 | 8,475 | 55,179 |
+| `torch.arange` | 35 | 280 | 2,240 |
+| `einsum` | 12 | 96 | 768 |
+| `index_copy` | 11 | 88 | 704 |
+
+That is exactly 35 aranges, 12 einsums, and 11 index_copies per token.
+`DeepseekV4Attention.forward` loops over tokens in Python
+(`vllm_neuron/model/deepseek_v4/model.py`), and because the bucket size is
+static the loop fully unrolls into one complete attention body per token per
+layer: 64 by 3 equals 192 bodies in the prefill-64 graph. The module docstring
+records this as a deliberate correctness-first choice, and it is genuinely
+required only for the compressed layers, where compression boundaries are
+positional.
+
+Two levers follow directly, and the launcher exposes both behind
+`VLLM_NEURON_TINY_FAST=1`:
+
+```bash
+VLLM_NEURON_TINY_FAST=1 tools/deepseek_v4/run_tiny_tp1.sh \
+  /tmp/deepseek-v4-tiny /tmp/deepseek-v4-fast-cache 8001
+```
+
+* `--max-model-len 16` instead of 64, with buckets `[8,16]`. Fewer unrolled
+  token bodies. `deepseek-v4-tiny-tp1-neuron-investigation.md` measures graph
+  extraction dropping from about 218 seconds to about 29, and the whole
+  compile-and-run cycle from roughly 16 minutes to about 3, and records that
+  length 16 still reproduced the original fourth-token mismatch exactly.
+* `--num-gpu-blocks-override 32` instead of 256. `scatter_paged_latent` builds
+  a `torch.where` over the entire cache once per token, and capacity is
+  `num_blocks * storage_block_size`, so 256 blocks means a `[32768, latent]`
+  intermediate per token for the MLA group while serving 64 tokens. The floor is
+  the largest value in the runner's logged
+  `max_num_blocks_per_req=[1, 2, 2, 2, 8, 16]` plus a null block; re-read that
+  log line before lowering it further.
+
+`tools/deepseek_v4/generate_tiny_tp1.py` takes `--max-model-len` and
+`--num-gpu-blocks-override` directly, with the gate values as defaults.
+
+Measured on `trn2.3xlarge`, cold, with an empty isolated cache root:
+
+| Stage | Gate profile | Fast profile |
+| --- | ---: | ---: |
+| Parallel trace, three graphs | 132 seconds | 29 seconds |
+| Decode compilation | 24 seconds | 27 seconds |
+| Prefill-8 compilation | 72 seconds | 71 seconds |
+| Longest prefill compilation | 689 seconds | 126 seconds |
+| Total, launch to warmup complete | about 870 seconds | 196 seconds |
+
+Both profiles emit three NEFFs and generate four valid tokens. Captured graph
+sizes track the compile times: 2,591 nodes for decode, 8,429 for prefill-8, and
+15,101 for prefill-16, against 55,179 for prefill-64.
+
+Note which lever does what. The length reduction is what shrinks the node count
+and therefore the compile time; the block-count reduction leaves the node count
+almost unchanged (8,429 versus 8,475 for prefill-8) because it shrinks the
+*volume* of each scatter intermediate, not the number of operations. Keep both,
+but do not expect the block override alone to move the wall clock much.
+
+The fast profile is opt-in on purpose. The accepted-run signature in Step 5
+is defined against the default values, so a plain invocation must keep
+producing exactly three NEFFs at length 64.
+
+Two further points worth knowing before spending device time:
+
+* Most model-code questions never need `neuronx-cc` at all. Shape and Dynamo
+  blockers reproduce on CPU through the tracing-proxy pattern in
+  `tools/deepseek_v4/check_carry_rows_dynamo_trace.py`; numerics reproduce under
+  `VLLM_NEURON_CPU_MODE=1 ... --enforce-eager`, which skips warmup and NEFF
+  generation outright. When only decode matters,
+  `VLLM_NEURON_SKIP_PREFILL_WARMUP=1` drops the expensive graph entirely.
+* Do not reach for compiler flags. `-O1` is already the Neuron default and is
+  the fastest level, the trace and compile pools already exceed the three
+  available jobs, and any change to the compiler arguments, including
+  `--verbose`, is part of the cache key and invalidates every existing entry.
+  Enabling tensor capture changes the FX graph and voids the cache the same way.
+
 ## 6. Validate cache reuse with a second launch
 
 Run the command from Step 4 again without changing the model configuration,
