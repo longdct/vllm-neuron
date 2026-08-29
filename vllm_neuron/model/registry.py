@@ -49,4 +49,19 @@ def get_models() -> list[tuple[str, type]]:
 
         models.append(("DeepseekV4ForCausalLM", DeepseekV4ForCausalLM))
 
+    # The Qwen3.5-family text decoder (Qwen3.5 / Qwen3.6 / Qwen3.8 all declare
+    # Qwen3_5ForConditionalGeneration and share one architecture) is gated for
+    # the same reason as DeepSeek-V4: the hybrid Gated-DeltaNet stack is
+    # validated against tiny configs only. Real-checkpoint accuracy and the
+    # 27B cold compile are not done, and head_dim=256 still forces single-shot
+    # prefill. This lets our own tests drive the real vllm.LLM() path without
+    # advertising support that does not exist yet.
+    if os.environ.get("VLLM_NEURON_ENABLE_QWEN3_5") == "1":
+        from .qwen3_5.factory import Qwen3_5ForCausalLM
+
+        models.append(("Qwen3_5ForCausalLM", Qwen3_5ForCausalLM))
+        # Released checkpoints are multimodal wrappers; we serve the text
+        # decoder and skip the model.visual.* subtree at load time.
+        models.append(("Qwen3_5ForConditionalGeneration", Qwen3_5ForCausalLM))
+
     return models
