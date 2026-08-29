@@ -180,8 +180,11 @@ def _inputs(batch, heads, chunks, chunk, k_dim, v_dim, seed=0):
     )
 
 
-def _simulate_scan(prep, state_in):
-    out, state_out = nki.simulate(nki_gdn._gdn_chunk_scan_kernel[1])(
+def _simulate_scan(prep, state_in, lnc=None):
+    rows = prep["batch"] * prep["heads"]
+    if lnc is None:
+        lnc = nki_gdn.scan_lnc(rows)
+    out, state_out = nki.simulate(nki_gdn._gdn_chunk_scan_kernel[lnc])(
         prep["q_g_T"],
         prep["k_cumdecay_T"],
         prep["attn_T"],
@@ -193,7 +196,7 @@ def _simulate_scan(prep, state_in):
     return torch.as_tensor(out), torch.as_tensor(state_out)
 
 
-def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None):
+def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None, lnc=None):
     """Mirror chunk_gated_delta_rule_nki, routing the kernel through simulate()."""
     prep = nki_gdn._prepare_chunk_scan(q, k, v, g, beta, chunk, True)
     rows = prep["batch"] * prep["heads"]
@@ -204,7 +207,7 @@ def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None):
     else:
         state_in = initial_state.reshape(rows, k_dim, v_dim).float().contiguous()
 
-    out, state_out = _simulate_scan(prep, state_in)
+    out, state_out = _simulate_scan(prep, state_in, lnc=lnc)
     batch, heads, seq_len = prep["batch"], prep["heads"], prep["seq_len"]
     out = out.reshape(batch, heads, -1, v_dim)[:, :, :seq_len].transpose(1, 2)
     return out.contiguous(), state_out.reshape(batch, heads, k_dim, v_dim)
@@ -300,3 +303,58 @@ def test_scan_kernel_allocates_nothing_shaped_by_the_sequence():
         if "buffer=nl.sbuf" in line or "buffer=nl.psum" in line:
             assert "chunks" not in line, line
             assert "rows" not in line, line
+
+
+def test_lnc_degree_defaults_to_two_and_falls_back_on_odd_rows():
+    """Both physical cores by default; a row that cannot be split halves alone."""
+    assert nki_gdn.scan_lnc(6) == 2
+    assert nki_gdn.scan_lnc(96) == 2      # batch 2 x 48 heads
+    assert nki_gdn.scan_lnc(1) == 1
+    assert nki_gdn.scan_lnc(3) == 1
+
+
+def test_lnc_two_and_lnc_one_agree():
+    """Row sharding must not change the answer, only who computes it.
+
+    Rows are independent -- each carries its own recurrent state -- so splitting
+    them across the two programs needs no communication. If a program ever read
+    another's state this is where it would show.
+    """
+    _requires_scan_kernel()
+    chunks, chunk, dim = 3, 16, 16
+    q, k, v, g, beta = _inputs(2, 3, chunks, chunk, dim, dim, seed=11)
+
+    one, one_state = _scan_via_simulator(q, k, v, g, beta, chunk, lnc=1)
+    two, two_state = _scan_via_simulator(q, k, v, g, beta, chunk, lnc=2)
+
+    torch.testing.assert_close(two, one, **TOL)
+    torch.testing.assert_close(two_state, one_state, **TOL)
+
+
+def test_lnc_two_covers_every_row():
+    """A dropped or double-counted row would leave a slot at its initial value."""
+    _requires_scan_kernel()
+    chunks, chunk, dim = 2, 16, 16
+    q, k, v, g, beta = _inputs(2, 4, chunks, chunk, dim, dim, seed=12)
+
+    out, state = _scan_via_simulator(q, k, v, g, beta, chunk, lnc=2)
+
+    # Every (batch, head) row must have been written by some program.
+    assert out.shape[0] == 2 and out.shape[2] == 4
+    for b in range(2):
+        for h in range(4):
+            assert torch.any(state[b, h] != 0), (b, h)
+
+
+def test_scan_kernel_shards_rows_across_lnc_programs():
+    """Structural: the loop bounds must carry the program base.
+
+    ``row_start + r`` inside the body would be ``int + VirtualRegister``, which
+    the tracer rejects; folding the base into the bounds is the documented fix.
+    """
+    _requires_scan_kernel()
+    source = code_of(nki_gdn._gdn_chunk_scan_kernel)
+
+    assert "num_programs" in source
+    assert "program_id" in source
+    assert "fori_loop(row_start, row_start + rows_per_program" in source

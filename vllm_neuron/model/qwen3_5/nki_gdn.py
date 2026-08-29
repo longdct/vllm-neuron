@@ -235,6 +235,22 @@ try:  # pragma: no cover - depends on the installed nki
         assert v_dim in (16, 32, 64, 128)
         assert chunk in (16, 32, 64, 128)
 
+        # Split (batch, head) rows across the LNC programs. Rows are fully
+        # independent -- each carries its own recurrent state and never reads
+        # another's -- so this needs no cross-program communication.
+        #
+        # The kernel is traced once per program with a distinct program_id
+        # ("kernel is traced LNC times with different program_id_value",
+        # nki/_backends/mlir_tracer), so program_id and the derived bounds are
+        # trace-time Python ints, not registers. Folding the base into the loop
+        # bounds is what keeps it that way: `row_start + r` inside the body
+        # would be `int + VirtualRegister`, which the tracer rejects.
+        n_programs = nl.num_programs(0)
+        program_id = nl.program_id(0)
+        assert rows % n_programs == 0
+        rows_per_program = rows // n_programs
+        row_start = program_id * rows_per_program
+
         out = nl.ndarray(
             (rows, chunks, chunk, v_dim), dtype=nl.float32, buffer=nl.shared_hbm
         )
@@ -417,7 +433,7 @@ try:  # pragma: no cover - depends on the installed nki
                 src=state,
             )
 
-        nl.fori_loop(0, rows, per_row)
+        nl.fori_loop(row_start, row_start + rows_per_program, per_row)
         return out, state_out
 
     _wrapped_gdn_chunk_scan = wrap_nki(_gdn_chunk_scan_kernel)
@@ -526,6 +542,19 @@ def _prepare_chunk_scan(query, key, value, g, beta, chunk_size, use_qk_l2norm):
     }
 
 
+def scan_lnc(rows: int) -> int:
+    """LNC degree for a scan launch of ``rows`` (batch x head) rows.
+
+    LNC=2 is the default because it puts both physical NeuronCores of the
+    logical core to work: two SBUF partition sets rather than one, and half the
+    rows -- so half the working set -- per program. An odd row count cannot be
+    split evenly, so it falls back to a single program rather than dropping or
+    double-counting a row. Mirrors ``nki_compressor``'s
+    ``1 if candidate_count == 1 else 2``.
+    """
+    return 2 if rows % 2 == 0 else 1
+
+
 def can_use_chunk_scan_kernel(query: torch.Tensor, chunk_size: int) -> bool:
     """Whether the scan kernel can serve this call."""
     if _wrapped_gdn_chunk_scan is None:
@@ -566,7 +595,7 @@ def chunk_gated_delta_rule_nki(
             initial_state.reshape(rows, k_dim, v_dim).to(torch.float32).contiguous()
         )
 
-    out, state_out = _wrapped_gdn_chunk_scan[1](
+    out, state_out = _wrapped_gdn_chunk_scan[scan_lnc(rows)](
         prep["q_g_T"],
         prep["k_cumdecay_T"],
         prep["attn_T"],
