@@ -38,6 +38,35 @@ from .config import Qwen3_5TextConfig
 
 
 @dataclass(frozen=True)
+class TPContext:
+    """The tensor-parallel group, degrading to a single CPU rank.
+
+    Mirrors ``deepseek_v4/parallel.py::resolve_parallel_topology``: outside a
+    vLLM engine there is no initialized process group, and a model that cannot
+    be constructed without one cannot be diffed against HuggingFace on CPU --
+    which is where every accuracy bug should be found first.
+    """
+
+    group: object | None
+    world_size: int
+    rank: int
+
+    @property
+    def device_group(self):
+        return self.group.device_group if self.group is not None else None
+
+
+def resolve_tp_context() -> TPContext:
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        group = get_tp_group()
+        return TPContext(group, group.world_size, group.rank_in_group)
+    except (AssertionError, RuntimeError, AttributeError, ValueError):
+        return TPContext(None, 1, 0)
+
+
+@dataclass(frozen=True)
 class Qwen3_5ShardingPolicy:
     """Resolved per-rank geometry for one tensor-parallel degree."""
 

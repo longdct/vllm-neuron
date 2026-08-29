@@ -34,7 +34,6 @@ import logging
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
 import vllm_neuron.nn as neuron_nn
@@ -55,7 +54,7 @@ from .attention import (
 )
 from .config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5TextConfig
 from .gated_deltanet import Qwen3_5GatedDeltaNet
-from .parallel import resolve_sharding
+from .parallel import resolve_sharding, resolve_tp_context
 from .weight_loaders import (
     gated_o_proj_weight_loader,
     gated_qkv_weight_loader,
@@ -89,8 +88,9 @@ class Qwen3_5MLP(nn.Module):
 
     def __init__(self, config: Qwen3_5TextConfig, policy):
         super().__init__()
-        self.tp_group = get_tp_group()
-        self.world_size = self.tp_group.world_size
+        tp = resolve_tp_context()
+        self.tp_group = tp.group
+        self.world_size = tp.world_size
         self.hidden_size = config.hidden_size
         self.intermediate_per_rank = policy.intermediate_per_rank
 
@@ -162,8 +162,9 @@ class Qwen3_5Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.scaling = config.head_dim**-0.5
 
-        self.tp_group = get_tp_group()
-        self.world_size = self.tp_group.world_size
+        tp = resolve_tp_context()
+        self.tp_group = tp.group
+        self.world_size = tp.world_size
 
         self.q_heads_per_rank = policy.q_heads_per_rank
         self.kv_heads_per_rank = policy.kv_heads_per_rank
@@ -299,7 +300,15 @@ class Qwen3_5Attention(nn.Module):
             tp_out=True,
         )
 
-        attn_output = attn_output.reshape(hidden_states.shape[0], -1)
+        # <-- MODEL-SPECIFIC: with tp_out=True the kernel returns head-major
+        # [Nh, D, T]. qwen3 hands that straight to NF.o_proj, which accepts it
+        # as the [B, N, D, S] form -- but the output gate has to be applied
+        # *before* o_proj and is token-major [T, Nh * D], so the layout has to
+        # be converted here rather than deferred. A plain reshape would
+        # silently interleave heads with positions.
+        attn_output = attn_output.permute(2, 0, 1).reshape(
+            hidden_states.shape[0], -1
+        )
         attn_output = apply_output_gate(attn_output, gate)
         attn_output = NF.o_proj(
             attn_output.unsqueeze(0), self.o_proj_weight, None
@@ -422,15 +431,16 @@ class Qwen3_5TextModel(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig, policy):
         super().__init__()
         self.config = config
-        self.tp_group = get_tp_group()
-        self.world_size = self.tp_group.world_size
-        self.rank = self.tp_group.rank_in_group
+        tp = resolve_tp_context()
+        self.tp_group = tp.group
+        self.world_size = tp.world_size
+        self.rank = tp.rank
 
         self.embed_tokens = VocabDimShardedEmbedding(
             vocab_size=config.vocab_size,
             embed_dim=config.hidden_size,
             dtype=config.torch_dtype,
-            tp_group=self.tp_group.device_group,
+            tp_group=tp.device_group,
         )
         set_weight_loader(
             self.embed_tokens.weight,
@@ -528,9 +538,10 @@ class Qwen3_5TextForCausalLM(nn.Module):
     def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
         self.config = config
-        self.tp_group = get_tp_group()
-        self.world_size = self.tp_group.world_size
-        self.rank = self.tp_group.rank_in_group
+        tp = resolve_tp_context()
+        self.tp_group = tp.group
+        self.world_size = tp.world_size
+        self.rank = tp.rank
 
         self.policy = resolve_sharding(config, self.world_size)
 
@@ -567,7 +578,7 @@ class Qwen3_5TextForCausalLM(nn.Module):
             bias=False,
             dtype=config.torch_dtype,
             gather_output=not self.on_device_sampling_config,
-            tp_group=self.tp_group.device_group,
+            tp_group=tp.device_group,
         )
         set_weight_loader(
             self.lm_head.weight,
