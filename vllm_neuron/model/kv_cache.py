@@ -12,6 +12,13 @@ class CacheKind(str, Enum):
     SLIDING_WINDOW_MLA = "sliding_window_mla"
     COMPRESSOR_STATE = "compressor_state"
     RSWA = "rswa"
+    #: Per-request recurrent state for a linear-attention layer (Gated
+    #: DeltaNet). Unlike every other kind here this is not paged per token: one
+    #: page holds one request's whole state, because the state is an unbounded
+    #: accumulator rather than a windowed function of recent tokens. Declared
+    #: with ``state_shapes`` / ``state_dtypes`` instead of
+    #: ``num_kv_heads`` / ``head_size``, and mapped onto vLLM's ``MambaSpec``.
+    MAMBA = "mamba"
 
 
 @dataclass
@@ -34,6 +41,13 @@ class LayerSpec:
     compress_ratio: int = 1
     alignment: int | None = None
     rswa_window: int | None = None
+    #: For :attr:`CacheKind.MAMBA` only. One entry per state tensor the layer
+    #: carries -- Gated DeltaNet has two, a conv window and a recurrent state --
+    #: with a matching dtype each. The recurrent state is an fp32 accumulator
+    #: regardless of ``--kv-cache-dtype``, which is why the dtypes travel with
+    #: the shapes rather than being inherited from the cache config.
+    state_shapes: tuple[tuple[int, ...], ...] | None = None
+    state_dtypes: tuple[torch.dtype, ...] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.cache_kind, str):
@@ -64,6 +78,27 @@ class LayerSpec:
             raise ValueError("compressor carry state requires a lifecycle window")
         if self.cache_kind is CacheKind.RSWA and self.rswa_window is None:
             raise ValueError("R-SWA cache requires rswa_window")
+        if self.cache_kind is CacheKind.MAMBA:
+            if not self.state_shapes or not self.state_dtypes:
+                raise ValueError(
+                    "mamba cache requires state_shapes and state_dtypes; its "
+                    "geometry is per-request state tensors, not num_kv_heads x "
+                    "head_size pages"
+                )
+            if len(self.state_shapes) != len(self.state_dtypes):
+                raise ValueError(
+                    f"mamba cache has {len(self.state_shapes)} state shapes but "
+                    f"{len(self.state_dtypes)} dtypes; one dtype per state tensor"
+                )
+            if self.sliding_window_size is not None:
+                raise ValueError(
+                    "mamba state has no sliding window: it is an unbounded "
+                    "accumulator, allocated one page per request"
+                )
+        elif self.state_shapes is not None or self.state_dtypes is not None:
+            raise ValueError(
+                "state_shapes/state_dtypes are only valid for mamba caches"
+            )
 
 
 @dataclass

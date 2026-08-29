@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
@@ -8541,6 +8542,50 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # contains one tensor rather than a dummy unused V tensor.
                     kv_caches[layer_name] = [latent]
                     self._kv_cache_full_tensors[layer_name] = latent
+
+            # Linear-attention (Gated DeltaNet) state. Not a paged KV cache:
+            # one page holds one request's whole state, because the state is an
+            # unbounded accumulator rather than a windowed function of recent
+            # tokens. A page carries several state tensors of different shapes
+            # and dtypes back to back -- for GDN a conv window and a recurrent
+            # state, the latter fp32 -- so each is a strided view whose leading
+            # stride is the page size. Mirrors vLLM's own carving in
+            # gpu_model_runner.py so the layouts cannot drift apart.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                from vllm.utils.torch_utils import get_dtype_size
+
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                    state_tensors = []
+                    storage_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes
+                    ):
+                        dtype_size = get_dtype_size(dtype)
+                        num_element_per_page = (
+                            kv_cache_spec.page_size_bytes // dtype_size
+                        )
+                        target_shape = (num_blocks, *shape)
+                        stride = torch.empty(target_shape, device="meta").stride()
+                        assert storage_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                _shared_dtype_view(raw_tensor, dtype),
+                                size=target_shape,
+                                stride=(num_element_per_page, *stride[1:]),
+                                storage_offset=storage_offset_bytes // dtype_size,
+                            )
+                        )
+                        storage_offset_bytes += stride[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    # The raw page is the backing store. Recurrent state is not
+                    # prefix-shareable or transferable the way a KV page is, so
+                    # this exists for accounting rather than for a connector.
+                    self._kv_cache_full_tensors[layer_name] = raw_tensor
 
             # This is the case that all layers have the same kv_hidden_size.
             elif isinstance(kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)):
