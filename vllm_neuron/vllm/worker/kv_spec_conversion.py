@@ -7,8 +7,13 @@ Targets vLLM 0.24, which already carries the DeepSeek-V4 fields on
 0.26 -- see :func:`layer_spec_to_vllm_spec`.
 """
 
+import logging
+import math
+from dataclasses import replace
+
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
+    KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
@@ -16,6 +21,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_neuron.model.kv_cache import CacheKind, LayerSpec
+
+logger = logging.getLogger(__name__)
 
 
 def layer_spec_to_vllm_spec(layer: LayerSpec, block_size: int, dtype):
@@ -92,3 +99,76 @@ def layer_spec_to_vllm_spec(layer: LayerSpec, block_size: int, dtype):
         sliding_window=layer.sliding_window_size,
         attention_chunk_size=layer.chunk_size,
     )
+
+
+def align_mamba_pages(specs: dict[str, KVCacheSpec]) -> dict[str, KVCacheSpec]:
+    """Pad each Mamba page up to a common multiple of the attention pages.
+
+    A hybrid model declares two cache groups with unrelated page sizes, and
+    vLLM unifies them only one of two ways (``kv_cache_utils.py:1069-1095``):
+    the largest page is an exact multiple of every smaller page, in which case
+    it grows the smaller group's block size by the ratio; or the smaller layer
+    is an ``AttentionSpec`` whose backend sets ``indexes_kv_by_block_stride``,
+    in which case it pads. This backend sets neither, so a real Qwen3.5
+    checkpoint dies before any layer is built::
+
+        NotImplementedError: Layer layers.3.self_attn: page size is not
+        divisible by the maximum page size and cannot be padded.
+
+    The recurrent state's size has nothing to do with the attention page --
+    it is ``conv_dim`` and ``head_v_dim`` against ``num_kv_heads`` and
+    ``block_size`` -- so the two agree only by accident. The tiny bring-up
+    fixture had to be built around that accident, and the real 27B misses it
+    at every block size (remainder 7680).
+
+    ``MambaSpec`` already carries ``page_size_padded`` for exactly this, so
+    round the Mamba page up to a multiple of every attention page. The largest
+    page is then the Mamba one and divides all the others, which is the first
+    branch above -- no change to vLLM and no new backend capability.
+
+    The padding is unused tail space in each page. Because the runner carves
+    the states with the page size as the leading stride
+    (``neuron_model_runner.py:8546``, mirroring vLLM's own carving), the tail
+    is simply never addressed.
+    """
+    mamba = {n: s for n, s in specs.items() if isinstance(s, MambaSpec)}
+    others = {n: s for n, s in specs.items() if not isinstance(s, MambaSpec)}
+    if not mamba or not others:
+        return specs
+
+    # A common multiple of every attention page, so the padded Mamba page
+    # divides cleanly however heterogeneous the attention group is.
+    target = 1
+    for spec in others.values():
+        target = math.lcm(target, spec.page_size_bytes)
+
+    aligned = dict(specs)
+    for name, spec in mamba.items():
+        page = spec.page_size_bytes
+        if page % target == 0:
+            continue
+        padded = math.ceil(page / target) * target
+        aligned[name] = replace(spec, page_size_padded=padded)
+        logger.debug(
+            "%s: padding Mamba page %d -> %d bytes to align with the %d-byte "
+            "attention page",
+            name,
+            page,
+            padded,
+            target,
+        )
+
+    changed = [n for n in mamba if aligned[n] is not specs[n]]
+    if changed:
+        example = aligned[changed[0]]
+        waste = example.page_size_bytes - specs[changed[0]].page_size_bytes
+        logger.warning(
+            "Padded %d Mamba page(s) to %d bytes to satisfy vLLM's hybrid "
+            "page unification, costing %d bytes (%.1f%%) of unused tail per "
+            "page per request.",
+            len(changed),
+            example.page_size_bytes,
+            waste,
+            100.0 * waste / example.page_size_bytes,
+        )
+    return aligned

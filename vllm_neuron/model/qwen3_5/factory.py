@@ -9,11 +9,15 @@ satisfy vLLM's ``ModelRegistry``, but hand back the real implementation from the
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+if TYPE_CHECKING:
+    from vllm_neuron.model.neuron_config import VisionNeuronConfig
 
 from .config import Qwen3_5TextConfig
 from .parallel import resolve_sharding
@@ -22,29 +26,71 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3_5ForCausalLM(nn.Module):
-    """Factory that validates config and selects the Qwen3.5 implementation."""
+    """Factory that validates config and selects the Qwen3.5 implementation.
+
+    The second parameter is named ``text_neuron_config`` rather than
+    ``neuron_config`` to match what the runner actually calls. Every released
+    Qwen3.5-family checkpoint carries a ``vision_config``, which makes
+    ``platform.py::_resolve_vision_auto_config`` synthesize a
+    ``vision_neuron_config``; ``neuron_model_runner.load_model`` then takes its
+    multimodal branch and calls
+    ``from_configs(hf_config=..., text_neuron_config=..., vision_neuron_config=...)``
+    by keyword. A ``(hf_config, neuron_config)`` signature raises
+    ``TypeError: got an unexpected keyword argument 'text_neuron_config'`` on
+    every rank, at every TP degree including 1 -- so no released checkpoint
+    could load at all. The positional two-argument call used by the text-only
+    branch still works unchanged.
+
+    Mirrors ``qwen3_vl/factory.py``, which already carries this signature.
+    """
 
     def __init__(
-        self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        self,
+        hf_config: PretrainedConfig,
+        text_neuron_config: NeuronConfig | None = None,
+        vision_neuron_config: "VisionNeuronConfig | None" = None,
     ) -> None:
         super().__init__()
-        self._model = self._select_implementation(hf_config, neuron_config)
+        self._model = self._select_implementation(
+            hf_config, text_neuron_config, vision_neuron_config
+        )
 
     def forward(self, *args, **kwargs):
         return self._model(*args, **kwargs)
 
     @classmethod
     def from_configs(
-        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        cls,
+        hf_config: PretrainedConfig,
+        text_neuron_config: NeuronConfig | None = None,
+        vision_neuron_config: "VisionNeuronConfig | None" = None,
     ) -> nn.Module:
-        return cls._select_implementation(hf_config, neuron_config)
+        return cls._select_implementation(
+            hf_config, text_neuron_config, vision_neuron_config
+        )
 
     @classmethod
     def _select_implementation(
-        cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None
+        cls,
+        hf_config: PretrainedConfig,
+        neuron_config: NeuronConfig | None,
+        vision_neuron_config: "VisionNeuronConfig | None" = None,
     ) -> nn.Module:
         config = Qwen3_5TextConfig.from_configs(hf_config, neuron_config)
         cls._validate_config(config, neuron_config)
+
+        if vision_neuron_config is not None:
+            # Accepted so the checkpoint loads, then dropped: this module is the
+            # text decoder only, and no vision tower is built. Multimodal input
+            # is therefore not served -- the weights under ``model.visual.*``
+            # are skipped by prefix at load time. Warn rather than raise,
+            # because the runner supplies this config from the mere presence of
+            # hf_config.vision_config, not because the caller asked for images.
+            logger.warning(
+                "Qwen3.5: a vision_neuron_config was supplied but the vision "
+                "tower is not implemented; serving the text decoder only. "
+                "Image and video inputs will not work."
+            )
 
         from .model import Qwen3_5TextForCausalLM as Model
 
@@ -61,14 +107,24 @@ class Qwen3_5ForCausalLM(nn.Module):
                 "Qwen3.5 family. Only BF16 (None or 'bf16') is implemented."
             )
 
-        # The config advertises an MTP layer but no released checkpoint ships
-        # MTP weights, so honouring it would build a subtree nothing can fill.
+        # Multi-token prediction is out of scope. This used to raise, on the
+        # premise that no released checkpoint ships MTP weights so honouring
+        # the config would build a subtree nothing could fill. That premise is
+        # wrong: Qwen3.5-0.8B and Qwen3.8-27B both ship 15 `mtp.*` tensors, and
+        # both declare mtp_num_hidden_layers=1. Raising therefore made every
+        # real checkpoint unservable at every TP degree.
+        #
+        # Warn instead. Nothing here builds an MTP subtree -- this field is read
+        # nowhere else in the model -- so the `mtp.*` weights are simply skipped
+        # by prefix at load time, exactly as `model.visual.*` is, and the
+        # decoder serves normally without speculative decoding.
         if config.mtp_num_hidden_layers:
-            raise ValueError(
-                "mtp_num_hidden_layers="
-                f"{config.mtp_num_hidden_layers} but multi-token prediction is "
-                "not implemented, and the released Qwen3.5-family checkpoints "
-                "contain no MTP weights. Set it to 0."
+            logger.warning(
+                "Qwen3.5: config declares mtp_num_hidden_layers=%d, but "
+                "multi-token prediction is not implemented. The mtp.* weights "
+                "are skipped and the model serves as a plain decoder; "
+                "speculative decoding is unavailable.",
+                config.mtp_num_hidden_layers,
             )
 
         # Resolve the sharding policy now so an unsupported TP degree is a

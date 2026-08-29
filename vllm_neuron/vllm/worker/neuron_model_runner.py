@@ -56,7 +56,10 @@ from vllm_neuron.vllm.worker.input_batch_params import (
     build_input_batch_group_params,
     mla_cache_shape,
 )
-from vllm_neuron.vllm.worker.kv_spec_conversion import layer_spec_to_vllm_spec
+from vllm_neuron.vllm.worker.kv_spec_conversion import (
+    align_mamba_pages,
+    layer_spec_to_vllm_spec,
+)
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin,
     KVConnectorOutput,
@@ -8740,7 +8743,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     attention_chunk_size=layer.chunk_size,
                 )
 
-        return all_kv_cache_specs
+        # Hybrid models declare two groups whose page sizes are unrelated by
+        # construction; vLLM refuses to unify them unless the largest is an
+        # exact multiple of the rest. Pad the Mamba pages so it is.
+        return align_mamba_pages(all_kv_cache_specs)
 
     def _bookkeeping_sync(
         self,

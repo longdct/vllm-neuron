@@ -271,10 +271,23 @@ def text_weight_mappings(config: Qwen3_5TextConfig) -> dict:
     ``model.visual.*`` is never referenced, so the vision tower is skipped by
     omission rather than by a filter that could drift.
     """
+    # A tied checkpoint ships no lm_head tensor: the output projection *is* the
+    # embedding. Qwen3.5-0.8B is tied (tie_word_embeddings=true, no lm_head.*
+    # key); Qwen3.8-27B is not (tie_word_embeddings=false, lm_head.weight
+    # present). Reading the embedding key into lm_head loads the same values
+    # rather than aliasing the parameter, which keeps the two tensors
+    # independent for the alias-output rewrite -- the sharing that caused
+    # DeepSeek-V4's state clobbering is exactly what this avoids. Both shard
+    # the vocabulary on dim 0, so the per-rank slice is identical.
+    lm_head_key = (
+        f"{TEXT_PREFIX}.embed_tokens.weight"
+        if config.tie_word_embeddings
+        else "lm_head.weight"
+    )
     mappings = {
         "model.embed_tokens.weight": f"{TEXT_PREFIX}.embed_tokens.weight",
         "model.norm.weight": f"{TEXT_PREFIX}.norm.weight",
-        "lm_head.weight": "lm_head.weight",
+        "lm_head.weight": lm_head_key,
     }
 
     for i, layer_type in enumerate(config.layer_types):

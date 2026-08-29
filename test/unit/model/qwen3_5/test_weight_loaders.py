@@ -486,3 +486,21 @@ def test_gdn_gated_norm_loader_slices_to_this_rank_width(tp):
 
     # No +1 fold here: this is HF's gated norm, already in the ordinary form.
     assert needs_plus_one_fold("model.layers.0.linear_attn.norm.weight") is False
+
+
+def test_lm_head_reads_the_embedding_when_the_checkpoint_is_tied():
+    """A tied checkpoint ships no lm_head tensor.
+
+    Qwen3.5-0.8B sets tie_word_embeddings=true and has no ``lm_head.*`` key, so
+    loading it against an untied mapping fails every rank with "Checkpoint
+    key(s) not found for parameter 'lm_head.weight'". Qwen3.8-27B is untied and
+    does ship the tensor, so the mapping has to follow the config rather than
+    assume either shape.
+    """
+    tied = text_weight_mappings(Qwen3_5TextConfig(tie_word_embeddings=True))
+    untied = text_weight_mappings(Qwen3_5TextConfig(tie_word_embeddings=False))
+
+    assert tied["lm_head.weight"] == tied["model.embed_tokens.weight"]
+    assert untied["lm_head.weight"] == "lm_head.weight"
+    # The embedding itself must be unaffected either way.
+    assert tied["model.embed_tokens.weight"] == untied["model.embed_tokens.weight"]

@@ -70,10 +70,19 @@ def test_rejects_quantized_configs(quantization):
         )
 
 
-def test_rejects_mtp_because_no_checkpoint_ships_those_weights():
+def test_warns_about_mtp_rather_than_refusing_to_load(caplog):
+    """An advertised MTP layer must not block a real checkpoint.
+
+    This previously raised, on the premise that no released checkpoint ships
+    MTP weights. That premise was wrong -- Qwen3.5-0.8B and Qwen3.8-27B both
+    ship 15 ``mtp.*`` tensors and both declare ``mtp_num_hidden_layers=1`` --
+    so raising made every real checkpoint unservable at every TP degree.
+    Nothing builds an MTP subtree, so the weights are simply skipped.
+    """
     config = Qwen3_5TextConfig(mtp_num_hidden_layers=1)
-    with pytest.raises(ValueError, match="multi-token prediction is not implemented"):
+    with caplog.at_level("WARNING"):
         Qwen3_5ForCausalLM._validate_config(config, _NeuronConfigStub())
+    assert "multi-token prediction is not implemented" in caplog.text
 
 
 def test_rejects_unsupported_tp_degree_at_startup():

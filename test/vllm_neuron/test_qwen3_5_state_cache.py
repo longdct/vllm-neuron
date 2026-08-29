@@ -256,3 +256,84 @@ def test_an_unsupported_state_dtype_is_rejected_at_config_time():
     """Fail where the name is written, not at the first device compile."""
     with pytest.raises(ValueError, match="mamba_state_dtype"):
         _small_config(mamba_state_dtype="float16")
+
+
+# ---------------------------------------------------------------------------
+# Hybrid page alignment
+# ---------------------------------------------------------------------------
+#
+# vLLM unifies two cache groups only when the largest page is an exact multiple
+# of every smaller one, or when the smaller layer's backend indexes KV by block
+# stride. This backend does neither, and a Mamba page has no reason to be a
+# multiple of an attention page -- so a real Qwen3.5 checkpoint raised
+# NotImplementedError before any layer was built. align_mamba_pages pads the
+# Mamba page up via MambaSpec.page_size_padded so the first branch applies.
+
+
+def _attention_spec(page_bytes, block_size=8):
+    """A FullAttentionSpec whose page is exactly `page_bytes`."""
+    # page = block_size * num_kv_heads * head_size * 2 (K and V) * dtype size
+    head_size = page_bytes // (block_size * 2 * 2)
+    return layer_spec_to_vllm_spec(
+        LayerSpec(name="a", num_kv_heads=1, head_size=head_size, dtype=torch.bfloat16),
+        block_size=block_size,
+        dtype=torch.bfloat16,
+    )
+
+
+def test_align_pads_a_misaligned_mamba_page_to_a_multiple():
+    from vllm_neuron.vllm.worker.kv_spec_conversion import align_mamba_pages
+
+    attn = _attention_spec(8192)
+    mamba = layer_spec_to_vllm_spec(gdn_layer(), block_size=32, dtype=torch.bfloat16)
+    assert mamba.page_size_bytes % attn.page_size_bytes != 0, "fixture must misalign"
+
+    aligned = align_mamba_pages({"a": attn, "m": mamba})
+
+    assert aligned["a"] is attn, "attention specs must not be rewritten"
+    padded = aligned["m"].page_size_bytes
+    assert padded % attn.page_size_bytes == 0
+    assert padded >= mamba.page_size_bytes
+    # Smallest such multiple: padding must not over-allocate.
+    assert padded - mamba.page_size_bytes < attn.page_size_bytes
+
+
+def test_align_leaves_an_already_aligned_page_untouched():
+    from vllm_neuron.vllm.worker.kv_spec_conversion import align_mamba_pages
+
+    mamba = layer_spec_to_vllm_spec(gdn_layer(), block_size=32, dtype=torch.bfloat16)
+    # An attention page that already divides the Mamba page exactly.
+    attn = _attention_spec(mamba.page_size_bytes // 4)
+
+    aligned = align_mamba_pages({"a": attn, "m": mamba})
+    assert aligned["m"] is mamba
+
+
+def test_align_is_a_no_op_without_both_groups():
+    from vllm_neuron.vllm.worker.kv_spec_conversion import align_mamba_pages
+
+    mamba = layer_spec_to_vllm_spec(gdn_layer(), block_size=32, dtype=torch.bfloat16)
+    only_mamba = {"m": mamba}
+    assert align_mamba_pages(only_mamba) is only_mamba
+
+    attn = _attention_spec(8192)
+    only_attn = {"a": attn}
+    assert align_mamba_pages(only_attn) is only_attn
+
+
+def test_align_satisfies_vllms_own_unification_rule():
+    """The real check: vLLM's condition must hold after padding.
+
+    Asserting the arithmetic is not enough -- what matters is that the branch
+    which used to raise now takes the divisible path instead.
+    """
+    from vllm_neuron.vllm.worker.kv_spec_conversion import align_mamba_pages
+
+    attn = _attention_spec(8192)
+    mamba = layer_spec_to_vllm_spec(gdn_layer(), block_size=32, dtype=torch.bfloat16)
+    aligned = align_mamba_pages({"a": attn, "m": mamba})
+
+    pages = {s.page_size_bytes for s in aligned.values()}
+    largest = max(pages)
+    for page in pages:
+        assert largest % page == 0, (largest, page)
