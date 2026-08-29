@@ -346,11 +346,28 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.value_dim = self.policy.value_dim_per_rank
         self.conv_dim = self.policy.conv_dim_per_rank
 
-        self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
-        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
-        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+        # Every projection is built at config.torch_dtype, like Qwen3_5MLP and
+        # Qwen3_5Attention. Omitting it leaves them at torch's fp32 default,
+        # which on device makes the depthwise conv fail to compile with
+        # "nc_matmul: if one input is tfloat32/float32, both must be. Got
+        # stationary=bfloat16, moving=float32" -- the loaded bf16 filter
+        # against an fp32 activation. dt_bias and A_log stay fp32 on purpose:
+        # they feed an exp/softplus the layer evaluates in fp32.
+        self.in_proj_qkv = nn.Linear(
+            self.hidden_size, self.conv_dim, bias=False, dtype=self.dtype
+        )
+        self.in_proj_z = nn.Linear(
+            self.hidden_size, self.value_dim, bias=False, dtype=self.dtype
+        )
+        self.in_proj_b = nn.Linear(
+            self.hidden_size, self.num_v_heads, bias=False, dtype=self.dtype
+        )
+        self.in_proj_a = nn.Linear(
+            self.hidden_size, self.num_v_heads, bias=False, dtype=self.dtype
+        )
+        self.out_proj = nn.Linear(
+            self.value_dim, self.hidden_size, bias=False, dtype=self.dtype
+        )
 
         self.conv1d = nn.Conv1d(
             in_channels=self.conv_dim,
@@ -359,6 +376,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             groups=self.conv_dim,
             bias=False,
             padding=self.conv_kernel_size - 1,
+            dtype=self.dtype,
         )
 
         self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
@@ -611,10 +629,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         cached = meta.get("cached_seq_len")
         if cached is not None:
-            keep = (cached.reshape(-1).to(torch.int64) > 0).to(recurrent_state.dtype)
+            fresh = cached.reshape(-1).to(torch.int64) > 0
+            # Cast the mask to *each* state's own dtype. The two states have
+            # different dtypes on purpose -- the conv state is bf16 and the
+            # recurrent state is an fp32 accumulator -- so a single fp32 mask
+            # silently promotes the conv state to fp32. That survives CPU
+            # (torch just promotes) but on device the promoted state reaches
+            # the depthwise conv through torch.cat and the kernel rejects it:
+            # "nc_matmul: if one input is tfloat32/float32, both must be. Got
+            # stationary=bfloat16, moving=float32".
+            conv_keep = fresh.to(conv_state.dtype)
+            recurrent_keep = fresh.to(recurrent_state.dtype)
             # Broadcast the mask over each state's trailing dims.
-            conv_state = conv_state * keep.reshape(-1, *([1] * (conv_state.dim() - 1)))
-            recurrent_state = recurrent_state * keep.reshape(
+            conv_state = conv_state * conv_keep.reshape(
+                -1, *([1] * (conv_state.dim() - 1))
+            )
+            recurrent_state = recurrent_state * recurrent_keep.reshape(
                 -1, *([1] * (recurrent_state.dim() - 1))
             )
 

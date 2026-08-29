@@ -119,7 +119,16 @@ def causal_conv1d_with_state(
     seq_len = hidden_states.shape[-1]
     channels = hidden_states.shape[1]
 
-    extended = torch.cat([conv_state, hidden_states], dim=-1)
+    # The conv runs at the activation dtype, so the state joins it there. The
+    # cached state may be stored wider -- it shares a page with the fp32
+    # recurrent accumulator, and both must carry the same dtype for the
+    # backend to allow writing them back in place (see model.py::get_kv_spec).
+    # Concatenating without this cast promotes the whole window to fp32 and the
+    # kernel then rejects the pair: "nc_matmul: if one input is
+    # tfloat32/float32, both must be. Got stationary=bfloat16, moving=float32".
+    # This function already treats hidden_states.dtype as authoritative -- it
+    # casts the result back to it on return.
+    extended = torch.cat([conv_state.to(hidden_states.dtype), hidden_states], dim=-1)
 
     if _can_use_conv_kernel(hidden_states, channels):
         # nkilib wants [N, C, 1, W] and [C, 1, 1, S]; the state supplies the

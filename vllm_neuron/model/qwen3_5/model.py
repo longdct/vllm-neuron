@@ -712,9 +712,22 @@ class Qwen3_5TextForCausalLM(nn.Module):
                         dtype=config.ssm_dtype,
                         cache_kind=CacheKind.MAMBA,
                         state_shapes=(conv_shape, recurrent_shape),
-                        # The recurrent state is an accumulator: fp32 whatever
-                        # --kv-cache-dtype says.
-                        state_dtypes=(config.torch_dtype, config.ssm_dtype),
+                        # Both states are fp32. The recurrent one has to be --
+                        # it is an accumulator, whatever --kv-cache-dtype says.
+                        # The conv window would happily be bf16, but the runner
+                        # carves both states from one raw page
+                        # (neuron_model_runner.py:8554, mirroring vLLM's GPU
+                        # carving), and the model writes both back in place. Two
+                        # views over one storage with *different* dtypes, each
+                        # mutated, is rejected by this backend:
+                        # "aot_autograd() does not yet handle input mutations on
+                        # views with different dtypes". Matching the dtypes is
+                        # the cheap way out -- the conv window is ~2% of the
+                        # page, so the real 27B pays 1.9% more state memory.
+                        # The better fix is to give each state its own
+                        # allocation instead of sharing a page; that changes
+                        # cache accounting and is left as a deliberate choice.
+                        state_dtypes=(config.ssm_dtype, config.ssm_dtype),
                     )
                 )
         return KVSpec(layers=layers)
