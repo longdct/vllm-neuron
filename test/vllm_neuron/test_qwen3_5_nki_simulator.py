@@ -181,10 +181,17 @@ def _inputs(batch, heads, chunks, chunk, k_dim, v_dim, seed=0):
 
 
 def _simulate_scan(prep, state_in, lnc=None):
+    """Mirror the production launch: fixed grid, rows padded to fit it.
+
+    An explicit ``lnc`` overrides the grid so a test can still compare the two
+    row-shardings against each other. That comparison stays meaningful here
+    because the simulator does not go through neuronx-cc, and so is not subject
+    to the grid=1 codegen failure that rules the option out on device.
+    """
     rows = prep["batch"] * prep["heads"]
     if lnc is None:
-        lnc = nki_gdn.scan_lnc(rows)
-    out, state_out = nki.simulate(nki_gdn._gdn_chunk_scan_kernel[lnc])(
+        lnc = nki_gdn._SCAN_LNC
+    inputs = [
         prep["q_g_T"],
         prep["k_cumdecay_T"],
         prep["attn_T"],
@@ -192,8 +199,12 @@ def _simulate_scan(prep, state_in, lnc=None):
         prep["v_base"],
         prep["g_last_rep"],
         state_in,
-    )
-    return torch.as_tensor(out), torch.as_tensor(state_out)
+    ]
+    # A grid of 1 divides any row count, so only the fixed grid needs padding.
+    if lnc != 1:
+        inputs, _ = nki_gdn.pad_rows_for_lnc(inputs, rows)
+    out, state_out = nki.simulate(nki_gdn._gdn_chunk_scan_kernel[lnc])(*inputs)
+    return torch.as_tensor(out)[:rows], torch.as_tensor(state_out)[:rows]
 
 
 def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None, lnc=None):
@@ -305,12 +316,57 @@ def test_scan_kernel_allocates_nothing_shaped_by_the_sequence():
             assert "rows" not in line, line
 
 
-def test_lnc_degree_defaults_to_two_and_falls_back_on_odd_rows():
-    """Both physical cores by default; a row that cannot be split halves alone."""
-    assert nki_gdn.scan_lnc(6) == 2
-    assert nki_gdn.scan_lnc(96) == 2      # batch 2 x 48 heads
-    assert nki_gdn.scan_lnc(1) == 1
-    assert nki_gdn.scan_lnc(3) == 1
+def test_the_scan_grid_is_a_constant_never_derived_from_rows():
+    """A grid of 1 must be unreachable, whatever the geometry.
+
+    Under LNC=2 a logical core is two physical cores and codegen is checked per
+    core, so a one-program launch leaves core 1 a stub and neuronx-cc rejects
+    the module with NCC_IXGM002. The grid was previously ``2 if rows % 2 == 0
+    else 1``, which made it a function of the per-rank head count -- odd counts
+    (3 at TP=8, 1 at TP=32) silently produced an uncompilable kernel. Pinning
+    the constant is what keeps that from coming back.
+    """
+    assert nki_gdn._SCAN_LNC == 2
+
+    source = code_of(nki_gdn.chunk_gated_delta_rule_nki)
+    assert "_wrapped_gdn_chunk_scan[_SCAN_LNC]" in source, source
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 6, 96])
+def test_odd_rows_are_padded_to_the_grid_with_an_inert_row(rows):
+    """Padding, not a smaller grid, is how an odd row count is absorbed."""
+    tensors = [torch.randn(rows, 4, 4) for _ in range(3)]
+    padded, padded_rows = nki_gdn.pad_rows_for_lnc(tensors, rows)
+
+    assert padded_rows % nki_gdn._SCAN_LNC == 0
+    assert padded_rows == rows + (rows % 2)
+    for original, out in zip(tensors, padded):
+        assert out.shape[0] == padded_rows
+        # The real rows must survive untouched...
+        torch.testing.assert_close(out[:rows], original)
+        # ...and anything appended must be inert.
+        assert out[rows:].abs().sum() == 0
+
+
+def test_padding_does_not_change_the_scan_result():
+    """The inert row must not perturb the rows that carry real work.
+
+    Rows are independent, so this should hold by construction -- which is
+    exactly why it is worth asserting: a kernel that ever let one row read
+    another would show up here and nowhere else in this file. 3 rows is the
+    TP=8 geometry (1 batch x 3 value heads per rank), and is odd, so this is
+    the case that used to drop to a grid of 1.
+    """
+    _requires_scan_kernel()
+    q, k, v, g, beta = _inputs(1, 3, 3, 16, 16, 16)
+
+    expected, expected_state = chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, chunk_size=16, initial_state=None
+    )
+    actual, actual_state = _scan_via_simulator(q, k, v, g, beta, 16)
+
+    torch.testing.assert_close(actual, expected, **TOL)
+    torch.testing.assert_close(actual_state, expected_state, **TOL)
 
 
 def test_lnc_two_and_lnc_one_agree():

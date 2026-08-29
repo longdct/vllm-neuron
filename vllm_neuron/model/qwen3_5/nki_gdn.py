@@ -551,33 +551,51 @@ def _prepare_chunk_scan(query, key, value, g, beta, chunk_size, use_qk_l2norm):
     }
 
 
-def scan_lnc(rows: int) -> int:
-    """LNC degree for a scan launch of ``rows`` (batch x head) rows.
+#: LNC grid for the scan. Fixed at 2, never data-dependent.
+#:
+#: A grid=1 launch does not compile on an LNC=2 host. Under LNC=2 a logical
+#: NeuronCore is two physical cores sharing an address space, and codegen is
+#: emitted and checked per physical core, so a single program puts the kernel
+#: body on core 0 and leaves core 1 a stub -- which neuronx-cc rejects:
+#:
+#:     [NCC_IXGM002] Expected function sg0000 in subgraph 0 to have 49 basic
+#:     blocks, but on core 1 it has 1 basic blocks
+#:
+#: Isolated on device at fixed TP=4 by varying only the grid: 2 generates
+#: tokens, 1 reproduces that error. This used to be ``2 if rows % 2 == 0 else
+#: 1``, which made the grid a function of the per-rank head count and so made
+#: the kernel silently uncompilable at TP=8 (3 value heads per rank). Rows are
+#: padded to an even count instead -- see :func:`pad_rows_for_lnc`. Mirrors the
+#: conv's ``_LNC``, which was never affected because it is already a constant.
+_SCAN_LNC = 2
 
-    LNC=2 is the default because it puts both physical NeuronCores of the
-    logical core to work: two SBUF partition sets rather than one, and half the
-    rows -- so half the working set -- per program. An odd row count cannot be
-    split evenly, so it falls back to a single program rather than dropping or
-    double-counting a row. Mirrors ``nki_compressor``'s
-    ``1 if candidate_count == 1 else 2``.
 
-    **The grid=1 fallback does not compile on an LNC=2 host.** Under LNC=2 a
-    logical core is two physical NeuronCores and codegen is checked per
-    physical core; a single program puts the kernel body on core 0 and leaves
-    core 1 empty, which neuronx-cc rejects::
+def pad_rows_for_lnc(
+    tensors: list[torch.Tensor], rows: int
+) -> tuple[list[torch.Tensor], int]:
+    """Pad row-leading scan inputs so the row count divides ``_SCAN_LNC``.
 
-        [NCC_IXGM002] Expected function sg0000 in subgraph 0 to have 49 basic
-        blocks, but on core 1 it has 1 basic blocks
+    The scan folds ``(batch, head)`` into independent rows -- each carries its
+    own recurrent state and never reads another's, which is why the split needs
+    no cross-program communication -- so an appended zero row is inert. It
+    computes its own zero output and is sliced away afterwards.
 
-    Isolated on device at fixed TP=4 by varying only this return value: grid 2
-    generates tokens, grid 1 fails with that error. It is why the kernel is
-    unusable at TP=8, where 3 value heads per rank make ``rows`` odd. The fix
-    is to pad ``rows`` to even and launch at a fixed grid of 2 the way
-    ``_wrapped_depthwise_conv1d[_LNC]`` does; it changes kernel input shapes
-    and has not been made yet. See
-    docs/model-dev/qwen3-5-tp8-device-bringup.md.
+    That is what lets the grid stay fixed for every geometry, including the odd
+    per-rank head counts the real model reaches (3 at TP=8, 1 at TP=32) which
+    would otherwise drop to a grid of 1 and fail to compile.
+
+    Mirrors ``deepseek_v4/nki_compressor.py``, which pads one inert candidate
+    for odd shapes so both LNC2 programs get the same runtime-loop bound.
+
+    Returns the (possibly unchanged) tensors and the padded row count.
     """
-    return 2 if rows % 2 == 0 else 1
+    pad = (-rows) % _SCAN_LNC
+    if not pad:
+        return list(tensors), rows
+    return (
+        [torch.cat((t, torch.zeros_like(t[:pad])), dim=0) for t in tensors],
+        rows + pad,
+    )
 
 
 def can_use_chunk_scan_kernel(query: torch.Tensor, chunk_size: int) -> bool:
@@ -620,15 +638,25 @@ def chunk_gated_delta_rule_nki(
             initial_state.reshape(rows, k_dim, v_dim).to(torch.float32).contiguous()
         )
 
-    out, state_out = _wrapped_gdn_chunk_scan[scan_lnc(rows)](
-        prep["q_g_T"],
-        prep["k_cumdecay_T"],
-        prep["attn_T"],
-        prep["k_decay"],
-        prep["v_base"],
-        prep["g_last_rep"],
-        state_in,
+    kernel_inputs, _ = pad_rows_for_lnc(
+        [
+            prep["q_g_T"],
+            prep["k_cumdecay_T"],
+            prep["attn_T"],
+            prep["k_decay"],
+            prep["v_base"],
+            prep["g_last_rep"],
+            state_in,
+        ],
+        rows,
     )
+
+    out, state_out = _wrapped_gdn_chunk_scan[_SCAN_LNC](*kernel_inputs)
+
+    # Drop the inert padding row, if any, before restoring (batch, head).
+    # rows is a trace-time Python int, so this stays a static slice.
+    out = out[:rows]
+    state_out = state_out[:rows]
 
     batch, heads, seq_len = prep["batch"], prep["heads"], prep["seq_len"]
     out = out.reshape(batch, heads, -1, v_dim)[:, :, :seq_len]

@@ -108,20 +108,59 @@ failed in an instructive way.
    path and never calls the scan. The "decode fails even though decode does
    not use the scan" paradox was an artifact of async reporting.
 
-### Fix
+### Fix (applied)
 
-Launch the scan at a fixed grid of 2, as the conv kernel already does, and pad
-`rows` to even so the grid is never data-dependent. That removes the failure
-mode by construction rather than avoiding it, and makes the kernel usable at
-TP=8 instead of permanently on its torch fallback. Not yet implemented -- it
-changes kernel input shapes and wants review.
+`scan_lnc` is gone. The grid is now the constant `_SCAN_LNC = 2`, mirroring the
+conv's `_LNC`, and `pad_rows_for_lnc` appends one inert zero row when the row
+count is odd; the padding is sliced off after the call. Rows are independent --
+each carries its own recurrent state and never reads another's, which is why
+the split needs no cross-program communication -- so the appended row computes
+its own zero output and perturbs nothing.
 
-Until then, `can_use_chunk_scan_kernel` returning False keeps the scan on its
-torch fallback; that is the conv-on/scan-off configuration both TP=8 device
-runs used.
+This mirrors `deepseek_v4/nki_compressor.py:439`, which pads one inert
+candidate for odd shapes so both LNC2 programs get the same runtime-loop bound.
+One deliberate difference: DeepSeek keeps `lnc = 1` when the count is exactly
+1, while this pads 1 up to 2 so a grid of 1 is unreachable at any geometry.
+That matters here because the TP=32 value-split policy gives one value head per
+rank, making `rows == 1` a real configuration. *(By the same reasoning
+DeepSeek's `candidate_count == 1` path, and `nki_indexer.py:379,446` at
+`stop - start == 1`, look exposed to this bug. Not investigated -- flagged
+only.)*
 
-Reproduce either side: `tools/qwen3_5/generate_tiny.py` at TP=8 (fails) or
-TP=4 (passes), same fixture, scan kernel enabled.
+**TP=8 now compiles and runs with the scan kernel enabled**, which had never
+been possible:
+
+```
+RESULT {"tensor_parallel_size": 8, "visible_cores": "32-39",
+        "prompt_length": 32, "token_ids": [938, 585, 909, 32, 845, 335, 733, 958]}
+```
+
+Those tokens differ from the scan-off runs, and that is expected rather than a
+regression: this is the first TP=8 run in which the NKI scan replaces the torch
+chunk rule in prefill. The padding is *not* what moved them -- in the simulator
+at exactly this geometry (rows=3, chunk 64, k=64, v=128) the padded launch is
+**bitwise identical** to the unpadded one on the real rows, and the pad row's
+output is exactly zero:
+
+```
+pad row abs max:                0.0
+max |padded - unpadded| out:    0.0
+max |padded - unpadded| state:  0.0
+```
+
+Token identity is not an oracle at this scale anyway -- enabling the *conv*
+kernel alone already shifts the sequence from token 2 (`tp8_nonki` vs
+`tp8_convonly`), and the tiny fixture's top1/top2 logit gap is ~0.04. What is
+established is that the scan agrees with the torch oracle within the simulator
+tolerance, including the odd-row case, and that the grid failure is gone.
+
+Guarded by tests: the grid is asserted to be a constant and the launch site to
+use it (so a data-dependent grid cannot come back), padding is asserted inert
+across `rows` in {1, 2, 3, 6, 96}, and a 3-row scan -- the TP=8 geometry -- is
+diffed against the torch oracle.
+
+Reproduce: `tools/qwen3_5/generate_tiny.py` at TP=8 with the scan enabled. To
+see the original failure, make `scan_lnc`-style grid selection return 1.
 
 ## Bugs found and fixed
 
