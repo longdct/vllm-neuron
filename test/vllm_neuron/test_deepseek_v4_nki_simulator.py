@@ -24,6 +24,7 @@ from vllm_neuron.model.deepseek_v4.nki_compressor import (
     _paged_gated_compressor_kernel,
 )
 from vllm_neuron.model.deepseek_v4.nki_indexer import (
+    _decode_indexer_kernel,
     _projected_bf16_indexer_kernel,
     _visible_page_counts,
 )
@@ -693,6 +694,122 @@ def test_projected_indexer_q16_tile_handles_runtime_visible_page_counts():
     for q_idx, count in enumerate(visible.tolist()):
         if count:
             assert set(indices[q_idx, :count].tolist()) == set(range(count))
+
+
+def _decode_batch_of_one(visible_row, q_count=8):
+    """Shape a batch-1 decode launch the way ``_pad_single_query_bucket`` does."""
+    visible = torch.zeros(q_count, dtype=torch.int32)
+    visible[0] = visible_row
+    return visible
+
+
+def test_decode_indexer_static_page_unroll_matches_dense_top512():
+    """The unrolled decode kernel selects exactly the dense top-512.
+
+    Capacity is four score pages but only 901 entries are visible, so the last
+    two pages are scanned and must contribute nothing.  This is the property
+    that makes a trace-time page bound safe: work changes, selection does not.
+    """
+    torch.manual_seed(113)
+    query = torch.randn(8, 1, 64, 128, dtype=torch.bfloat16)
+    keys = torch.randn(2048, 128, dtype=torch.bfloat16)
+    gate = torch.randn(8, 1, 64, dtype=torch.bfloat16)
+    visible = _decode_batch_of_one(901)
+
+    indices, used = nki.simulate(_decode_indexer_kernel[2])(
+        query, keys, gate, visible, 512, 2048 // 512
+    )
+
+    scores = lightning_index_scores(query[:1], keys.unsqueeze(0), gate[:1])[0, 0]
+    dense = torch.topk(scores[:901], 512).indices
+    assert int(used[0]) == 512
+
+    # The property the static page bound has to preserve: the two pages past
+    # ``visible`` were scanned, so nothing they contain may be selected.
+    assert int(indices[0].max()) < 901
+
+    # Selection agrees with the dense reference up to BF16 noise at the cut.
+    # Scoring runs in BF16, so entries straddling the 512th-ranked score can
+    # swap with the 513th; the kept score profile is the invariant claim.
+    kept = scores[indices[0].long()].float().sort(descending=True).values
+    want = scores[dense.long()].float().sort(descending=True).values
+    torch.testing.assert_close(kept, want, rtol=1e-3, atol=1e-3)
+
+    # The seven padded rows are inert.
+    assert used[1:].tolist() == [0] * 7
+
+
+def test_decode_indexer_agrees_with_the_runtime_loop_kernel():
+    """Static decode and the runtime-loop prefill kernel select identically.
+
+    The two kernels scan a different number of pages -- decode unrolls the full
+    four-page capacity while the prefill path stops at the batch-max visible
+    page count -- so agreeing here is the equivalence the fix rests on.
+    """
+    torch.manual_seed(127)
+    query = torch.randn(8, 1, 64, 128, dtype=torch.bfloat16)
+    keys = torch.randn(2048, 128, dtype=torch.bfloat16)
+    gate = torch.randn(8, 1, 64, dtype=torch.bfloat16)
+    visible = _decode_batch_of_one(901)
+
+    static_indices, static_used = nki.simulate(_decode_indexer_kernel[2])(
+        query, keys, gate, visible, 512, 2048 // 512
+    )
+    visible_pages = _visible_page_counts(visible, 2048)
+    loop_indices, loop_used = nki.simulate(_projected_bf16_indexer_kernel[2])(
+        query, keys, gate, visible, visible_pages, 512
+    )
+
+    assert torch.equal(static_used, loop_used)
+    assert set(static_indices[0].tolist()) == set(loop_indices[0].tolist())
+
+
+def test_decode_indexer_paged_indirection_and_null_block():
+    """Static page unroll survives block indirection and an invalid block."""
+    torch.manual_seed(131)
+    blocks, stride, logical = 16, 128, 32
+    query = torch.randn(8, 1, 64, 128, dtype=torch.bfloat16)
+    gate = torch.randn(8, 1, 64, dtype=torch.bfloat16)
+    cache = torch.randn(blocks, stride, 128, dtype=torch.bfloat16)
+    table = torch.arange(blocks - 1, -1, -1, dtype=torch.int32)
+    block_valid = torch.ones(blocks, dtype=torch.int32)
+    block_valid[3] = 0
+    safe_table = table.clone()
+    safe_table[3] = 0
+    visible = _decode_batch_of_one(377)
+
+    indices, used = nki.simulate(_decode_indexer_kernel[2])(
+        query,
+        cache.reshape(-1, 128),
+        gate,
+        visible,
+        512,
+        (blocks * logical) // 512,
+        safe_table,
+        block_valid,
+        stride,
+        logical,
+    )
+
+    eligible = torch.arange(377)
+    eligible = eligible[(eligible // logical) != 3]
+    assert int(used[0]) == eligible.numel()
+    assert set(indices[0, : int(used[0])].tolist()) == set(eligible.tolist())
+    assert used[1:].tolist() == [0] * 7
+
+
+def test_decode_indexer_zero_visible_row_selects_nothing():
+    """A fully masked decode row needs no minimum-one-page workaround."""
+    torch.manual_seed(137)
+    query = torch.randn(8, 1, 64, 128, dtype=torch.bfloat16)
+    keys = torch.randn(2048, 128, dtype=torch.bfloat16)
+    gate = torch.randn(8, 1, 64, dtype=torch.bfloat16)
+    visible = torch.zeros(8, dtype=torch.int32)
+
+    _, used = nki.simulate(_decode_indexer_kernel[2])(
+        query, keys, gate, visible, 512, 2048 // 512
+    )
+    assert used.tolist() == [0] * 8
 
 
 @pytest.mark.parametrize(

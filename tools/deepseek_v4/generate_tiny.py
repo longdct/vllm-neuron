@@ -75,6 +75,18 @@ def main() -> None:
         help="Comma-separated decode history buckets, e.g. 4096,32768,131072.",
     )
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help=(
+            "Fraction of device memory vLLM may use (default: 0.9). Raise this "
+            "when engine start fails its KV-cache memory check: the admission "
+            "check runs on the profiled budget, before "
+            "--num-gpu-blocks-override applies, so the override alone cannot "
+            "get past it."
+        ),
+    )
+    parser.add_argument(
         "--num-gpu-blocks-override",
         type=int,
         default=256,
@@ -261,6 +273,7 @@ def main() -> None:
         enable_prefix_caching=False,
         skip_tokenizer_init=True,
         kv_cache_dtype=args.kv_cache_dtype,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
         async_scheduling=False,
         additional_config={"neuron_config": neuron_config},

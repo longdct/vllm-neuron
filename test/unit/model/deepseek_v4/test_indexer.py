@@ -27,6 +27,7 @@ from vllm_neuron.model.deepseek_v4 import nki_indexer
 from vllm_neuron.model.deepseek_v4.nki_indexer import (
     _pad_single_query_bucket,
     _query_tiles,
+    _use_static_decode_kernel,
     _visible_page_counts,
 )
 
@@ -45,11 +46,33 @@ def test_q1_indexer_is_padded_to_q8_with_masked_rows():
     query = torch.ones(1, 1, 64, 128)
     gate = torch.ones(1, 1, 64)
     visible = torch.tensor([17], dtype=torch.int32)
-    visible_pages = torch.tensor([4], dtype=torch.int32)
-    padded = _pad_single_query_bucket(query, gate, visible, visible_pages)
-    assert [value.shape[0] for value in padded] == [8, 8, 8, 8]
+    padded = _pad_single_query_bucket(query, gate, visible)
+    # No page-count tensor: the decode kernel's page bound is a trace-time
+    # constant, so padded rows carry no page-count obligation.
+    assert [value.shape[0] for value in padded] == [8, 8, 8]
     assert padded[2].tolist() == [17, 0, 0, 0, 0, 0, 0, 0]
-    assert padded[3].tolist() == [4] * 8
+
+
+def test_decode_bucket_routes_to_the_static_kernel_and_prefill_does_not():
+    assert _use_static_decode_kernel(8)
+    assert not _use_static_decode_kernel(16)
+    assert not _use_static_decode_kernel(8192)
+
+
+def test_dynamic_page_loop_env_flag_restores_the_runtime_kernel(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP", "1")
+    assert not _use_static_decode_kernel(8)
+    monkeypatch.setenv("VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP", "0")
+    assert _use_static_decode_kernel(8)
+
+
+def test_decode_indexer_kernel_has_no_runtime_control_flow():
+    source = inspect.getsource(nki_indexer._decode_indexer_kernel)
+    assert "nl.fori_loop" not in source
+    assert "nisa.register_alloc" not in source
+    assert "for page in nl.static_range(max_pages)" in source
+    assert "for local_q_idx in nl.affine_range(queries_per_program)" in source
+    assert "queries_per_program * max_pages <= _MAX_STATIC_SCAN_BODIES" in source
 
 
 def test_indexer_query_axis_is_a_runtime_loop_not_static_expansion():
@@ -61,8 +84,54 @@ def test_indexer_query_axis_is_a_runtime_loop_not_static_expansion():
     assert "process_query(0)" not in source
 
 
+def test_shared_scan_emitter_takes_no_keyword_only_arguments():
+    """NKI traces this helper with its caller and rejects keyword arguments.
+
+    A keyword-only signature fails only under the real tracer -- the CPU
+    simulator and eager device calls both accept it -- and surfaces as
+    ``_emit_scan_page() got an unexpected keyword argument`` during engine
+    graph extraction, so pin it here where it is cheap to catch.
+    """
+    signature = inspect.signature(nki_indexer._emit_scan_page)
+    keyword_only = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert keyword_only == []
+    for kernel in (
+        nki_indexer._decode_indexer_kernel,
+        nki_indexer._projected_bf16_indexer_kernel,
+    ):
+        source = inspect.getsource(kernel)
+        assert "_emit_scan_page(" in source
+        assert "topk=topk" not in source
+
+
+def test_scan_emitter_is_module_level_and_never_bound_as_a_closure():
+    """NKI allows an inner function only as a fori_loop/while_loop body.
+
+    Binding the emitter to a local name and calling it -- the closure-factory
+    shape -- fails the real tracer with "inner functions can only be used as
+    fori_loop/while_loop body arguments". Decode must therefore call the
+    module-level emitter straight from its unrolled loop, while prefill may
+    keep an inner ``scan_page`` precisely because fori_loop takes a body.
+    """
+    assert nki_indexer._emit_scan_page.__qualname__ == "_emit_scan_page"
+
+    decode = inspect.getsource(nki_indexer._decode_indexer_kernel)
+    assert "scan_page = _emit_scan_page" not in decode
+    assert "for page in nl.static_range(max_pages)" in decode
+
+    prefill = inspect.getsource(nki_indexer._projected_bf16_indexer_kernel)
+    assert "scan_page = _emit_scan_page" not in prefill
+    assert "def scan_page(page):" in prefill
+    assert "nl.fori_loop(0, page_count_reg, scan_page)" in prefill
+
+
 def test_paged_indexer_splits_block256_gather_at_nki_partition_limit():
-    source = inspect.getsource(nki_indexer._projected_bf16_indexer_kernel)
+    # The scan body is shared by both kernels, so it is pinned on the emitter.
+    source = inspect.getsource(nki_indexer._emit_scan_page)
     assert "slot_dma_width = min(logical_slots_per_block, 128)" in source
     assert "logical_slots_per_block // slot_dma_width" in source
     assert "slot_chunk * slot_dma_width" in source

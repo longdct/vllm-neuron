@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import nki
 import nki.isa as nisa
@@ -23,6 +24,299 @@ _SCHEDULER_QUERY_BUCKETS = frozenset(
 _MAX_RUNTIME_LOOP_TRIPS = 2048
 _INDEXER_QUERIES_PER_LNC = 8
 _INDEXER_QUERY_TILE = 2 * _INDEXER_QUERIES_PER_LNC
+# Largest query bucket routed to the fully unrolled decode kernel.
+_STATIC_DECODE_QUERY_MAX = 8
+# Trace-time ceiling on unrolled ``queries_per_program * max_pages`` scan
+# bodies, so growth in ``max_model_len`` fails loudly here instead of as a
+# compiler instruction-count explosion.
+_MAX_STATIC_SCAN_BODIES = 256
+
+
+def _dynamic_page_loop_forced() -> bool:
+    """Route decode back through the runtime page loop for A/B attribution.
+
+    The static decode kernel is the default.  Setting
+    ``VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP=1`` restores the previous
+    ``fori_loop`` path verbatim, which is how a device run attributes a change
+    in behavior to this kernel rather than to anything else in the graph.
+    """
+    return os.environ.get("VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP", "0") == "1"
+
+
+def _use_static_decode_kernel(q_count: int) -> bool:
+    """Route a padded decode launch to the fully unrolled kernel."""
+    return q_count <= _STATIC_DECODE_QUERY_MAX and not _dynamic_page_loop_forced()
+
+
+def _emit_scan_page(
+    page,
+    q_t,
+    gate_t,
+    keys,
+    visible_sb,
+    used_count,
+    running_scores,
+    running_indices,
+    topk,
+    heads,
+    head_dim,
+    key_dim,
+    paged,
+    static_page,
+    block_table,
+    block_valid,
+    physical_page_stride,
+    logical_slots_per_block,
+):
+    """Emit one 512-entry score page's scan, mask and running top-k merge.
+
+    Every parameter is positional: NKI traces this helper along with its
+    caller, and its tracer supports neither keyword-only parameters nor
+    keyword arguments at the call site.
+
+    Shared by both indexer kernels so the scoring body has exactly one
+    definition.  ``page`` is a Python ``int`` when ``static_page`` is set --
+    the decode kernel unrolls its page loop at trace time -- and an
+    ``nl.fori_loop`` register otherwise.
+
+    This is deliberately a module-level function that emits directly rather
+    than a closure factory: NKI allows an inner function only as a
+    fori_loop/while_loop body, and rejects calling one directly.
+    """
+
+    page_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    page_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+    if static_page:
+        # ``page`` is a Python int because the caller unrolled the page
+        # loop at trace time, so the page index is a compile-time
+        # constant and no runtime register is involved.
+        nisa.memset(page_sb, value=page)
+    else:
+        nisa.register_store(page_sb, page)
+    nisa.tensor_scalar(
+        dst=page_base,
+        data=page_sb,
+        op0=nl.multiply,
+        operand0=512,
+    )
+    key_t = nl.ndarray((head_dim, 512), dtype=keys.dtype, buffer=nl.sbuf)
+    if paged:
+        blocks_per_score_page = 512 // logical_slots_per_block
+        for page_block in nl.static_range(blocks_per_score_page):
+            column_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=column_sb,
+                data=page_sb,
+                op0=nl.multiply,
+                operand0=blocks_per_score_page,
+                op1=nl.add,
+                operand1=page_block,
+            )
+            column_reg = nisa.register_alloc()
+            nisa.register_load(column_reg, column_sb)
+            slot_dma_width = min(logical_slots_per_block, 128)
+            for slot_chunk in nl.static_range(
+                logical_slots_per_block // slot_dma_width
+            ):
+                slot = nl.ndarray(
+                    (slot_dma_width, 1),
+                    dtype=nl.uint32,
+                    buffer=nl.sbuf,
+                )
+                nisa.dma_copy(
+                    dst=slot,
+                    src=block_table.ap(
+                        pattern=[[0, slot_dma_width]],
+                        scalar_offset=column_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                nisa.tensor_scalar(
+                    dst=slot,
+                    data=slot,
+                    op0=nl.multiply,
+                    operand0=physical_page_stride,
+                    op1=nl.add,
+                    operand1=slot_chunk * slot_dma_width,
+                )
+                start = (
+                    page_block * logical_slots_per_block
+                    + slot_chunk * slot_dma_width
+                )
+                nisa.dma_transpose(
+                    dst=key_t[:, start : start + slot_dma_width],
+                    src=keys.ap(
+                        pattern=[
+                            [key_dim, slot_dma_width],
+                            [1, key_dim],
+                        ],
+                        vector_offset=slot,
+                        indirect_dim=0,
+                    ),
+                    oob_mode=nisa.oob_mode.skip,
+                )
+    else:
+        nisa.dma_transpose(
+            dst=key_t,
+            src=keys.ap(
+                pattern=[[128, 512], [1, 128]],
+                scalar_offset=page_base,
+                indirect_dim=0,
+            ),
+        )
+    per_head_psum = nl.ndarray((heads, 512), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(per_head_psum, q_t, key_t)
+    per_head = nl.ndarray((heads, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.activation(
+        dst=per_head,
+        op=nl.relu,
+        data=per_head_psum,
+        scale=1.0 / math.sqrt(128),
+    )
+    page_psum = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(page_psum, gate_t, per_head)
+    page_scores = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.sbuf)
+    if paged:
+        blocks_per_score_page = 512 // logical_slots_per_block
+        for page_block in nl.static_range(blocks_per_score_page):
+            column_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=column_sb,
+                data=page_sb,
+                op0=nl.multiply,
+                operand0=blocks_per_score_page,
+                op1=nl.add,
+                operand1=page_block,
+            )
+            column_reg = nisa.register_alloc()
+            nisa.register_load(column_reg, column_sb)
+            upper = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            valid_block = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=valid_block,
+                src=block_valid.ap(
+                    pattern=[[1, 1]],
+                    scalar_offset=column_reg,
+                    indirect_dim=0,
+                ),
+            )
+            nisa.tensor_tensor(
+                dst=upper,
+                data1=visible_sb,
+                data2=page_base,
+                op=nl.subtract,
+            )
+            nisa.tensor_scalar(
+                dst=upper,
+                data=upper,
+                op0=nl.maximum,
+                operand0=0,
+            )
+            nisa.tensor_scalar(
+                dst=upper,
+                data=upper,
+                op0=nl.subtract,
+                operand0=page_block * logical_slots_per_block,
+                op1=nl.maximum,
+                operand1=0,
+            )
+            nisa.tensor_scalar(
+                dst=upper,
+                data=upper,
+                op0=nl.minimum,
+                operand0=logical_slots_per_block,
+            )
+            nisa.tensor_tensor(
+                dst=upper,
+                data1=upper,
+                data2=valid_block,
+                op=nl.multiply,
+            )
+            nisa.tensor_tensor(
+                dst=used_count,
+                data1=used_count,
+                data2=upper,
+                op=nl.add,
+            )
+            upper_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=upper_f32, src=upper)
+            start = page_block * logical_slots_per_block
+            nisa.range_select(
+                page_scores[:, start : start + logical_slots_per_block],
+                on_true_tile=page_psum[
+                    :, start : start + logical_slots_per_block
+                ],
+                on_false_value=-3.4028234663852886e38,
+                comp_op0=nl.greater_equal,
+                comp_op1=nl.less,
+                bound0=0.0,
+                bound1=upper_f32,
+                range_start=0,
+            )
+    else:
+        page_upper = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=page_upper,
+            data1=visible_sb,
+            data2=page_base,
+            op=nl.subtract,
+        )
+        nisa.tensor_scalar(
+            dst=page_upper,
+            data=page_upper,
+            op0=nl.maximum,
+            operand0=0,
+        )
+        nisa.tensor_scalar(
+            dst=page_upper,
+            data=page_upper,
+            op0=nl.minimum,
+            operand0=512,
+        )
+        page_upper_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=page_upper_f32, src=page_upper)
+        nisa.range_select(
+            page_scores,
+            on_true_tile=page_psum,
+            on_false_value=-3.4028234663852886e38,
+            comp_op0=nl.greater_equal,
+            comp_op1=nl.less,
+            bound0=0.0,
+            bound1=page_upper_f32,
+            range_start=0,
+        )
+    nisa.tensor_scalar(
+        dst=page_scores,
+        data=page_scores,
+        op0=nl.multiply,
+        operand0=1.0 / math.sqrt(64),
+    )
+
+    merged_scores = nl.ndarray((1, 1024), dtype=nl.float32, buffer=nl.sbuf)
+    merged_indices = nl.ndarray((1, 1024), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=merged_scores[:, :topk], src=running_scores)
+    nisa.tensor_copy(dst=merged_scores[:, topk:], src=page_scores)
+    nisa.tensor_copy(dst=merged_indices[:, :topk], src=running_indices)
+    page_indices_f32 = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.sbuf)
+    page_base_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=page_indices_f32, pattern=[[1, 512]], offset=0)
+    nisa.tensor_copy(dst=page_base_f32, src=page_base)
+    nisa.tensor_scalar(
+        dst=page_indices_f32,
+        data=page_indices_f32,
+        op0=nl.add,
+        operand0=page_base_f32,
+    )
+    nisa.tensor_copy(dst=merged_indices[:, topk:], src=page_indices_f32)
+    next_scores, offsets = topk_core(merged_scores, topk)
+    next_indices = nl.ndarray((1, topk), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.nc_n_gather(
+        dst=next_indices,
+        data=merged_indices,
+        indices=offsets,
+    )
+    nisa.tensor_copy(dst=running_scores, src=next_scores)
+    nisa.tensor_copy(dst=running_indices, src=next_indices)
 
 
 @nki.jit
@@ -59,6 +353,7 @@ def _projected_bf16_indexer_kernel(
         entries = block_table.shape[0] * logical_slots_per_block
     assert one == 1 and heads == 64 and head_dim == key_dim == 128
     assert entries % 512 == 0 and topk == 512
+    one_page = entries == 512
 
     output = nl.ndarray((q_count, topk), dtype=nl.int32, buffer=nl.shared_hbm)
     valid_counts = nl.ndarray((q_count,), dtype=nl.int32, buffer=nl.shared_hbm)
@@ -174,242 +469,32 @@ def _projected_bf16_indexer_kernel(
         nisa.register_load(page_count_reg, page_count_sb)
 
         def scan_page(page):
-            page_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-            page_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-            if entries == 512:
-                # A one-page specialization has no runtime loop. Besides
-                # avoiding pointless control flow, this keeps the NKI compiler
-                # from assigning different basic-block counts to the two LNCs
-                # in the tiny Q8 graph.
-                nisa.memset(page_sb, value=0)
-            else:
-                nisa.register_store(page_sb, page)
-            nisa.tensor_scalar(
-                dst=page_base,
-                data=page_sb,
-                op0=nl.multiply,
-                operand0=512,
-            )
-            key_t = nl.ndarray((head_dim, 512), dtype=keys.dtype, buffer=nl.sbuf)
-            if paged:
-                blocks_per_score_page = 512 // logical_slots_per_block
-                for page_block in nl.static_range(blocks_per_score_page):
-                    column_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_scalar(
-                        dst=column_sb,
-                        data=page_sb,
-                        op0=nl.multiply,
-                        operand0=blocks_per_score_page,
-                        op1=nl.add,
-                        operand1=page_block,
-                    )
-                    column_reg = nisa.register_alloc()
-                    nisa.register_load(column_reg, column_sb)
-                    slot_dma_width = min(logical_slots_per_block, 128)
-                    for slot_chunk in nl.static_range(
-                        logical_slots_per_block // slot_dma_width
-                    ):
-                        slot = nl.ndarray(
-                            (slot_dma_width, 1),
-                            dtype=nl.uint32,
-                            buffer=nl.sbuf,
-                        )
-                        nisa.dma_copy(
-                            dst=slot,
-                            src=block_table.ap(
-                                pattern=[[0, slot_dma_width]],
-                                scalar_offset=column_reg,
-                                indirect_dim=0,
-                            ),
-                        )
-                        nisa.tensor_scalar(
-                            dst=slot,
-                            data=slot,
-                            op0=nl.multiply,
-                            operand0=physical_page_stride,
-                            op1=nl.add,
-                            operand1=slot_chunk * slot_dma_width,
-                        )
-                        start = (
-                            page_block * logical_slots_per_block
-                            + slot_chunk * slot_dma_width
-                        )
-                        nisa.dma_transpose(
-                            dst=key_t[:, start : start + slot_dma_width],
-                            src=keys.ap(
-                                pattern=[
-                                    [key_dim, slot_dma_width],
-                                    [1, key_dim],
-                                ],
-                                vector_offset=slot,
-                                indirect_dim=0,
-                            ),
-                            oob_mode=nisa.oob_mode.skip,
-                        )
-            else:
-                nisa.dma_transpose(
-                    dst=key_t,
-                    src=keys.ap(
-                        pattern=[[128, 512], [1, 128]],
-                        scalar_offset=page_base,
-                        indirect_dim=0,
-                    ),
-                )
-            per_head_psum = nl.ndarray((heads, 512), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(per_head_psum, q_t, key_t)
-            per_head = nl.ndarray((heads, 512), dtype=nl.bfloat16, buffer=nl.sbuf)
-            nisa.activation(
-                dst=per_head,
-                op=nl.relu,
-                data=per_head_psum,
-                scale=1.0 / math.sqrt(128),
-            )
-            page_psum = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(page_psum, gate_t, per_head)
-            page_scores = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.sbuf)
-            if paged:
-                blocks_per_score_page = 512 // logical_slots_per_block
-                for page_block in nl.static_range(blocks_per_score_page):
-                    column_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.tensor_scalar(
-                        dst=column_sb,
-                        data=page_sb,
-                        op0=nl.multiply,
-                        operand0=blocks_per_score_page,
-                        op1=nl.add,
-                        operand1=page_block,
-                    )
-                    column_reg = nisa.register_alloc()
-                    nisa.register_load(column_reg, column_sb)
-                    upper = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    valid_block = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=valid_block,
-                        src=block_valid.ap(
-                            pattern=[[1, 1]],
-                            scalar_offset=column_reg,
-                            indirect_dim=0,
-                        ),
-                    )
-                    nisa.tensor_tensor(
-                        dst=upper,
-                        data1=visible_sb,
-                        data2=page_base,
-                        op=nl.subtract,
-                    )
-                    nisa.tensor_scalar(
-                        dst=upper,
-                        data=upper,
-                        op0=nl.maximum,
-                        operand0=0,
-                    )
-                    nisa.tensor_scalar(
-                        dst=upper,
-                        data=upper,
-                        op0=nl.subtract,
-                        operand0=page_block * logical_slots_per_block,
-                        op1=nl.maximum,
-                        operand1=0,
-                    )
-                    nisa.tensor_scalar(
-                        dst=upper,
-                        data=upper,
-                        op0=nl.minimum,
-                        operand0=logical_slots_per_block,
-                    )
-                    nisa.tensor_tensor(
-                        dst=upper,
-                        data1=upper,
-                        data2=valid_block,
-                        op=nl.multiply,
-                    )
-                    nisa.tensor_tensor(
-                        dst=used_count,
-                        data1=used_count,
-                        data2=upper,
-                        op=nl.add,
-                    )
-                    upper_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                    nisa.tensor_copy(dst=upper_f32, src=upper)
-                    start = page_block * logical_slots_per_block
-                    nisa.range_select(
-                        page_scores[:, start : start + logical_slots_per_block],
-                        on_true_tile=page_psum[
-                            :, start : start + logical_slots_per_block
-                        ],
-                        on_false_value=-3.4028234663852886e38,
-                        comp_op0=nl.greater_equal,
-                        comp_op1=nl.less,
-                        bound0=0.0,
-                        bound1=upper_f32,
-                        range_start=0,
-                    )
-            else:
-                page_upper = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
-                nisa.tensor_tensor(
-                    dst=page_upper,
-                    data1=visible_sb,
-                    data2=page_base,
-                    op=nl.subtract,
-                )
-                nisa.tensor_scalar(
-                    dst=page_upper,
-                    data=page_upper,
-                    op0=nl.maximum,
-                    operand0=0,
-                )
-                nisa.tensor_scalar(
-                    dst=page_upper,
-                    data=page_upper,
-                    op0=nl.minimum,
-                    operand0=512,
-                )
-                page_upper_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=page_upper_f32, src=page_upper)
-                nisa.range_select(
-                    page_scores,
-                    on_true_tile=page_psum,
-                    on_false_value=-3.4028234663852886e38,
-                    comp_op0=nl.greater_equal,
-                    comp_op1=nl.less,
-                    bound0=0.0,
-                    bound1=page_upper_f32,
-                    range_start=0,
-                )
-            nisa.tensor_scalar(
-                dst=page_scores,
-                data=page_scores,
-                op0=nl.multiply,
-                operand0=1.0 / math.sqrt(64),
+            # A one-page capacity pins the index to the constant 0 rather than
+            # reading the loop register, which is what keeps the NKI compiler
+            # from giving the two LNCs different basic-block counts in the
+            # tiny Q8 graph.
+            _emit_scan_page(
+                0 if one_page else page,
+                q_t,
+                gate_t,
+                keys,
+                visible_sb,
+                used_count,
+                running_scores,
+                running_indices,
+                topk,
+                heads,
+                head_dim,
+                key_dim,
+                paged,
+                one_page,
+                block_table,
+                block_valid,
+                physical_page_stride,
+                logical_slots_per_block,
             )
 
-            merged_scores = nl.ndarray((1, 1024), dtype=nl.float32, buffer=nl.sbuf)
-            merged_indices = nl.ndarray((1, 1024), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=merged_scores[:, :topk], src=running_scores)
-            nisa.tensor_copy(dst=merged_scores[:, topk:], src=page_scores)
-            nisa.tensor_copy(dst=merged_indices[:, :topk], src=running_indices)
-            page_indices_f32 = nl.ndarray((1, 512), dtype=nl.float32, buffer=nl.sbuf)
-            page_base_f32 = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.iota(dst=page_indices_f32, pattern=[[1, 512]], offset=0)
-            nisa.tensor_copy(dst=page_base_f32, src=page_base)
-            nisa.tensor_scalar(
-                dst=page_indices_f32,
-                data=page_indices_f32,
-                op0=nl.add,
-                operand0=page_base_f32,
-            )
-            nisa.tensor_copy(dst=merged_indices[:, topk:], src=page_indices_f32)
-            next_scores, offsets = topk_core(merged_scores, topk)
-            next_indices = nl.ndarray((1, topk), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.nc_n_gather(
-                dst=next_indices,
-                data=merged_indices,
-                indices=offsets,
-            )
-            nisa.tensor_copy(dst=running_scores, src=next_scores)
-            nisa.tensor_copy(dst=running_indices, src=next_indices)
-
-        if entries == 512:
+        if one_page:
             nl.fori_loop(0, 1, scan_page)
         else:
             nl.fori_loop(0, page_count_reg, scan_page)
@@ -470,7 +555,103 @@ def _projected_bf16_indexer_kernel(
     return output, valid_counts
 
 
+@nki.jit
+def _decode_indexer_kernel(
+    query,
+    keys,
+    gate,
+    visible,
+    topk: int,
+    max_pages: int,
+    block_table=None,
+    block_valid=None,
+    physical_page_stride: int = 0,
+    logical_slots_per_block: int = 0,
+):
+    """Fully static small-query indexer for batch-1 decode.
+
+    ``_projected_bf16_indexer_kernel`` bounds its page loop with a runtime
+    register, which forces every launch to hold the two LNC programs in
+    lockstep by data: no zero-trip loops, an identical trip count on every row,
+    and padded decode rows carrying the real row's page count.  Decode instead
+    unrolls both loops at trace time.  ``max_pages`` is the compiled capacity
+    in 512-entry score pages, and scanning past ``visible`` is already inert --
+    ``range_select`` fills those pages with -inf and the paged ``used_count``
+    accumulation adds zero -- so the static bound changes work only, never
+    selection.  The result contains no runtime control flow, so the two LNC
+    programs cannot diverge.
+    """
+    q_count, one, heads, head_dim = query.shape
+    assert q_count in (2, 4, 8), "decode indexer expects a small even bucket"
+    entries, key_dim = keys.shape
+    paged = block_table is not None
+    if paged:
+        entries = block_table.shape[0] * logical_slots_per_block
+    assert one == 1 and heads == 64 and head_dim == key_dim == 128
+    assert entries % 512 == 0 and topk == 512
+    assert max_pages == entries // 512
+
+    output = nl.ndarray((q_count, topk), dtype=nl.int32, buffer=nl.shared_hbm)
+    valid_counts = nl.ndarray((q_count,), dtype=nl.int32, buffer=nl.shared_hbm)
+    n_programs = nl.num_programs(0)
+    program_id = nl.program_id(0)
+    assert q_count % n_programs == 0
+    queries_per_program = q_count // n_programs
+    assert queries_per_program * max_pages <= _MAX_STATIC_SCAN_BODIES
+
+    for local_q_idx in nl.affine_range(queries_per_program):
+        q_idx = program_id * queries_per_program + local_q_idx
+        q_t = nl.ndarray((head_dim, heads), dtype=query.dtype, buffer=nl.sbuf)
+        gate_t = nl.ndarray((heads, 1), dtype=gate.dtype, buffer=nl.sbuf)
+        nisa.dma_transpose(dst=q_t, src=query[q_idx, 0, :, :])
+        nisa.dma_transpose(dst=gate_t, src=gate[q_idx, 0, :].reshape((1, heads)))
+
+        running_scores = nl.ndarray((1, topk), dtype=nl.float32, buffer=nl.sbuf)
+        running_indices = nl.ndarray((1, topk), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(running_scores, value=float("-inf"))
+        nisa.memset(running_indices, value=-1)
+
+        visible_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=visible_sb, src=visible[q_idx : q_idx + 1])
+        used_count = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(used_count, value=0)
+
+        for page in nl.static_range(max_pages):
+            _emit_scan_page(
+                page,
+                q_t,
+                gate_t,
+                keys,
+                visible_sb,
+                used_count,
+                running_scores,
+                running_indices,
+                topk,
+                heads,
+                head_dim,
+                key_dim,
+                paged,
+                True,
+                block_table,
+                block_valid,
+                physical_page_stride,
+                logical_slots_per_block,
+            )
+
+        nisa.dma_copy(dst=output[q_idx : q_idx + 1, :], src=running_indices)
+        if not paged:
+            nisa.tensor_scalar(
+                dst=used_count,
+                data=visible_sb,
+                op0=nl.minimum,
+                operand0=topk,
+            )
+        nisa.dma_copy(dst=valid_counts[q_idx : q_idx + 1], src=used_count)
+    return output, valid_counts
+
+
 _wrapped_projected_indexer = wrap_nki(_projected_bf16_indexer_kernel)
+_wrapped_decode_indexer = wrap_nki(_decode_indexer_kernel)
 
 
 def _query_tiles(q_count: int) -> tuple[tuple[int, int], ...]:
@@ -483,6 +664,12 @@ def _query_tiles(q_count: int) -> tuple[tuple[int, int], ...]:
 
 
 def _visible_page_counts(visible: torch.Tensor, capacity: int) -> torch.Tensor:
+    """Per-row page counts for the runtime-loop prefill kernel.
+
+    Both distortions below exist only because that kernel's page bound is a
+    runtime register.  Decode no longer calls this: ``_decode_indexer_kernel``
+    unrolls its page loop at trace time and takes no page-count tensor at all.
+    """
     bounded = visible.to(torch.int32).clamp(min=0, max=capacity)
     # The LNC2 NKI ``fori_loop`` used by the indexer does not safely execute a
     # dynamic zero-trip loop: first-chunk CSA rows with visible==0 deadlock in
@@ -505,26 +692,25 @@ def _pad_single_query_bucket(
     query: torch.Tensor,
     gate: torch.Tensor,
     visible: torch.Tensor,
-    visible_pages: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run decode through the validated Q8/LNC2 specialization.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad a Q1 decode launch up to the Q8 decode specialization.
 
-    A literal Q1 runtime loop gives the two compiler cores different control-
-    flow graphs.  Padding the seven inactive rows keeps the LNC programs in
-    lockstep; zero visibility makes those rows semantically inert.  Every
-    padded row must still scan the real row's page count: the two LNC programs
-    share synchronization inside the data-dependent page loop, so giving the
-    inactive rows a shorter trip count can deadlock once decode sees more than
-    one 512-entry score page.
+    The launch grid is always 2 -- LNC1 is not a legal launch on this host --
+    so a literal Q1 launch would hand both programs the same query and write
+    the one output row twice.  Padding gives each program its own rows, and
+    zero visibility makes the inactive ones semantically inert.
+
+    The padded rows carry no page-count obligation: the decode kernel's page
+    bound is a trace-time constant, so inactive rows cannot desynchronize the
+    two programs the way they could under the runtime-loop prefill path.
     """
     if query.shape[0] != 1:
-        return query, gate, visible, visible_pages
+        return query, gate, visible
     pad = _INDEXER_QUERIES_PER_LNC - 1
     return (
         torch.cat((query, torch.zeros_like(query).expand(pad, -1, -1, -1))),
         torch.cat((gate, torch.zeros_like(gate).expand(pad, -1, -1))),
         torch.cat((visible, torch.zeros_like(visible).expand(pad))),
-        torch.cat((visible_pages, visible_pages.expand(pad))),
     )
 
 
@@ -556,18 +742,27 @@ def projected_bf16_indexer(
     ):
         raise RuntimeError("DeepSeek-V4 NKI indexer requires BF16 inputs")
     visible_i32 = visible.to(torch.int32).clamp(min=0, max=keys.shape[0])
-    visible_pages = _visible_page_counts(visible_i32, keys.shape[0])
     parts = []
     for start, stop in _query_tiles(query.shape[0]):
-        query_part, gate_part, visible_part, visible_pages_part = (
-            _pad_single_query_bucket(
-                query[start:stop],
-                gate[start:stop],
-                visible_i32[start:stop],
-                visible_pages[start:stop],
-            )
+        query_part, gate_part, visible_part = _pad_single_query_bucket(
+            query[start:stop],
+            gate[start:stop],
+            visible_i32[start:stop],
         )
-        part = _wrapped_projected_indexer[2](
+        if _use_static_decode_kernel(query_part.shape[0]):
+            part = _wrapped_decode_indexer[2](
+                query_part,
+                keys,
+                gate_part,
+                visible_part,
+                512,
+                keys.shape[0] // 512,
+            )
+        else:
+            visible_pages_part = _visible_page_counts(
+                visible_part, keys.shape[0]
+            )
+            part = _wrapped_projected_indexer[2](
                 query_part,
                 keys,
                 gate_part,
@@ -640,19 +835,33 @@ def paged_projected_bf16_indexer(
     safe_table = kernel_block_table.clamp(0, key_cache.shape[0] - 1).to(torch.int32)
     flat_cache = key_cache[:, 0].reshape(-1, 128)
     visible_i32 = visible.to(torch.int32).clamp(min=0, max=capacity)
-    visible_pages = _visible_page_counts(visible_i32, capacity)
     block_valid_i32 = block_valid.to(torch.int32)
+    # The kernel derives ``entries`` from the padded table, so the static page
+    # bound must be derived the same way rather than from ``capacity``.
+    max_pages = (padded_columns * logical_slots_per_block) // 512
     parts = []
     for start, stop in _query_tiles(query.shape[0]):
-        query_part, gate_part, visible_part, visible_pages_part = (
-            _pad_single_query_bucket(
-                query[start:stop],
-                gate[start:stop],
-                visible_i32[start:stop],
-                visible_pages[start:stop],
-            )
+        query_part, gate_part, visible_part = _pad_single_query_bucket(
+            query[start:stop],
+            gate[start:stop],
+            visible_i32[start:stop],
         )
-        part = _wrapped_projected_indexer[2](
+        if _use_static_decode_kernel(query_part.shape[0]):
+            part = _wrapped_decode_indexer[2](
+                query_part,
+                flat_cache,
+                gate_part,
+                visible_part,
+                512,
+                max_pages,
+                safe_table,
+                block_valid_i32,
+                key_cache.shape[2],
+                logical_slots_per_block,
+            )
+        else:
+            visible_pages_part = _visible_page_counts(visible_part, capacity)
+            part = _wrapped_projected_indexer[2](
                 query_part,
                 flat_cache,
                 gate_part,
