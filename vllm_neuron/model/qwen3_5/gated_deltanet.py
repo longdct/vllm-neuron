@@ -44,85 +44,27 @@ from torch import nn
 from .attention import Qwen3_5RMSNormGated
 from .config import Qwen3_5TextConfig
 
+# The convolution lives in nki_gdn.py alongside its NKI dispatcher, so the
+# kernel and its torch reference travel together -- the arrangement nki_mla.py
+# uses for its own oracle. Re-exported because this module is the layer's
+# public face.
+from .nki_gdn import causal_conv1d, causal_conv1d_with_state
+
+__all__ = [
+    "Qwen3_5GatedDeltaNet",
+    "causal_conv1d",
+    "causal_conv1d_with_state",
+    "chunk_gated_delta_rule",
+    "l2norm",
+    "recurrent_gated_delta_rule",
+    "unit_triangular_inverse",
+]
+
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
     """Match the FLA library's l2norm, which the reference calls in-kernel."""
     inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
     return x * inv_norm
-
-
-# ===========================================================================
-# Causal depthwise convolution
-# ===========================================================================
-
-
-def causal_conv1d(
-    hidden_states: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    activation: str | None = "silu",
-) -> torch.Tensor:
-    """Left-padded depthwise conv over the sequence. ``[B, C, T] -> [B, C, T]``.
-
-    On device this is ``nkilib.experimental.conv.depthwise_conv1d_implicit_gemm``
-    with ``padding=((0, 0), (kernel - 1, 0))``; this is the reference form.
-    """
-    channels = hidden_states.shape[1]
-    padding = weight.shape[-1] - 1
-
-    out = F.conv1d(
-        hidden_states.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=bias,
-        padding=padding,
-        groups=channels,
-    )[..., : hidden_states.shape[-1]]
-
-    if activation == "silu":
-        out = F.silu(out)
-    elif activation is not None:
-        raise ValueError(f"Unsupported conv activation {activation!r}")
-    return out.to(hidden_states.dtype)
-
-
-def causal_conv1d_with_state(
-    hidden_states: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    activation: str | None = "silu",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Conv over ``[state | new tokens]``, returning output and the new state.
-
-    ``conv_state`` is the trailing ``kernel - 1`` inputs from previous steps,
-    ``[B, C, kernel - 1]``. This is a *fixed-size* window: its width is a
-    compile-time constant, never derived from ``cached_seq_len``. A zero state
-    is the correct representation of "no history" because the reference
-    left-pads with zeros, so no ``has_initial_state`` branch is needed here.
-
-    Returns the output for the new tokens only, plus the updated state.
-    """
-    kernel = weight.shape[-1]
-    seq_len = hidden_states.shape[-1]
-
-    extended = torch.cat([conv_state, hidden_states], dim=-1)
-
-    out = F.conv1d(
-        extended.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=bias,
-        padding=0,
-        groups=hidden_states.shape[1],
-    )
-    out = out[..., -seq_len:]
-
-    if activation == "silu":
-        out = F.silu(out)
-    elif activation is not None:
-        raise ValueError(f"Unsupported conv activation {activation!r}")
-
-    new_state = extended[..., -(kernel - 1) :] if kernel > 1 else conv_state
-    return out.to(hidden_states.dtype), new_state
 
 
 # ===========================================================================
