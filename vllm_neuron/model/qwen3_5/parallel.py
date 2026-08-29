@@ -80,6 +80,11 @@ class Qwen3_5ShardingPolicy:
     num_kv_replicas: int
 
     # -- Gated DeltaNet
+    num_k_heads: int
+    num_v_heads: int
+    num_v_per_k: int
+    key_head_dim: int
+    value_head_dim: int
     k_heads_per_rank: int
     v_heads_per_rank: int
     #: How many ranks share one key-head group by splitting the value dim.
@@ -99,6 +104,93 @@ class Qwen3_5ShardingPolicy:
     def gated_norm_needs_allreduce(self) -> bool:
         """True when the value dim is split, so the gated RMSNorm is partial."""
         return self.v_dim_shards > 1
+
+    # -- Gated DeltaNet geometry ------------------------------------------
+    #
+    # Every consumer -- the layer's module sizes, the state-cache spec and all
+    # five weight loaders -- derives its widths from here, so the partition is
+    # defined exactly once.
+
+    @property
+    def key_dim(self) -> int:
+        return self.num_k_heads * self.key_head_dim
+
+    @property
+    def value_dim(self) -> int:
+        return self.num_v_heads * self.value_head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        """Width of the fused ``[q | k | v]`` conv input."""
+        return 2 * self.key_dim + self.value_dim
+
+    @property
+    def key_dim_per_rank(self) -> int:
+        return self.k_heads_per_rank * self.key_head_dim
+
+    @property
+    def value_dim_per_rank(self) -> int:
+        return self.v_heads_per_rank * self.v_dim_per_rank
+
+    @property
+    def conv_dim_per_rank(self) -> int:
+        """This rank's conv width. **Not** ``conv_dim // tp_degree``.
+
+        Under value-dimension splitting the query and key blocks are
+        *replicated* across the ranks sharing a key head -- only ``v`` is
+        split. At tp=32 a rank therefore holds ``2 * 128 + 3 * 64 = 448``
+        channels, not ``10240 // 32 = 320``. The naive form is correct at every
+        degree up to 16 and wrong only at 32, which is the worst way to be
+        wrong, so nothing may recompute it locally.
+        """
+        return 2 * self.key_dim_per_rank + self.value_dim_per_rank
+
+    # -- Which global heads / rows belong to a rank ------------------------
+
+    def k_head_indices(self, rank: int) -> list[int]:
+        """Global key heads held by ``rank``."""
+        if self.v_dim_shards > 1:
+            # Consecutive ranks share a key head and split its value dim.
+            return [rank // self.v_dim_shards]
+        start = rank * self.k_heads_per_rank
+        return list(range(start, start + self.k_heads_per_rank))
+
+    def v_head_indices(self, rank: int) -> list[int]:
+        """Global value heads held by ``rank``. Value head ``j`` belongs to key
+        head ``j // num_v_per_k``, so these follow the key heads."""
+        return [
+            k * self.num_v_per_k + j
+            for k in self.k_head_indices(rank)
+            for j in range(self.num_v_per_k)
+        ]
+
+    def v_dim_offset(self, rank: int) -> int:
+        """Offset into each value head's dimension, 0 unless the dim is split."""
+        if self.v_dim_shards == 1:
+            return 0
+        return (rank % self.v_dim_shards) * self.v_dim_per_rank
+
+    def key_row_ranges(self, rank: int) -> list[tuple[int, int]]:
+        """Half-open row ranges into one ``key_dim``-wide block."""
+        d = self.key_head_dim
+        return [(h * d, (h + 1) * d) for h in self.k_head_indices(rank)]
+
+    def value_row_ranges(self, rank: int) -> list[tuple[int, int]]:
+        """Half-open row ranges into one ``value_dim``-wide block."""
+        d = self.value_head_dim
+        lo = self.v_dim_offset(rank)
+        width = self.v_dim_per_rank
+        return [(h * d + lo, h * d + lo + width) for h in self.v_head_indices(rank)]
+
+    def conv_row_ranges(self, rank: int) -> list[tuple[int, int]]:
+        """Row ranges into the fused ``[q | k | v]`` conv block, in order."""
+        kd = self.key_dim
+        qk = self.key_row_ranges(rank)
+        return (
+            qk
+            + [(lo + kd, hi + kd) for lo, hi in qk]
+            + [(lo + 2 * kd, hi + 2 * kd) for lo, hi in self.value_row_ranges(rank)]
+        )
 
 
 def resolve_sharding(
@@ -183,6 +275,11 @@ def resolve_sharding(
         q_heads_per_rank=q_heads_per_rank,
         kv_heads_per_rank=kv_heads_per_rank,
         num_kv_replicas=num_kv_replicas,
+        num_k_heads=k_heads,
+        num_v_heads=v_heads,
+        num_v_per_k=config.num_v_per_k,
+        key_head_dim=config.linear_key_head_dim,
+        value_head_dim=v_head_dim,
         k_heads_per_rank=k_heads_per_rank,
         v_heads_per_rank=v_heads_per_rank,
         v_dim_shards=v_dim_shards,

@@ -6,6 +6,8 @@ geometry that every later phase depends on, and they pin the *rejections* --
 a config that quietly defaults is a config that quietly narrows the gate.
 """
 
+import collections
+
 import pytest
 
 from vllm_neuron.model.qwen3_5.config import (
@@ -271,3 +273,109 @@ def test_rejects_tp_that_splits_kv_heads_unevenly():
     c = Qwen3_5TextConfig(num_key_value_heads=3)
     with pytest.raises(ValueError, match="must be a multiple of"):
         resolve_sharding(c, 8)
+
+
+# ---------------------------------------------------------------------------
+# Gated DeltaNet row partition
+#
+# Every GDN weight loader and the state-cache spec derive their widths from
+# these helpers, so a wrong partition here is wrong everywhere at once.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16, 32])
+def test_conv_rows_partition_the_value_block_exactly_once(tp):
+    """Value rows are split; no row may be dropped or handed to two ranks."""
+    c = Qwen3_5TextConfig()
+    p = resolve_sharding(c, tp)
+
+    covered = collections.Counter()
+    for rank in range(tp):
+        for lo, hi in p.value_row_ranges(rank):
+            covered.update(range(lo, hi))
+
+    assert set(covered) == set(range(p.value_dim))
+    assert set(covered.values()) == {1}
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16, 32])
+def test_query_and_key_rows_are_replicated_across_value_dim_shards(tp):
+    """q and k are *not* split when the value dim is.
+
+    A rank sharing a key head with another needs the whole query and key for
+    that head -- only the value columns of its state are its own. This is what
+    makes conv_dim_per_rank exceed conv_dim // tp at tp=32.
+    """
+    c = Qwen3_5TextConfig()
+    p = resolve_sharding(c, tp)
+
+    covered = collections.Counter()
+    for rank in range(tp):
+        for lo, hi in p.key_row_ranges(rank):
+            covered.update(range(lo, hi))
+
+    assert set(covered) == set(range(p.key_dim))
+    assert set(covered.values()) == {p.v_dim_shards}
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16, 32])
+def test_conv_row_ranges_are_the_three_blocks_in_order(tp):
+    """conv_row_ranges must be q, then k, then v -- the checkpoint's order."""
+    c = Qwen3_5TextConfig()
+    p = resolve_sharding(c, tp)
+
+    for rank in range(tp):
+        ranges = p.conv_row_ranges(rank)
+        width = sum(hi - lo for lo, hi in ranges)
+        assert width == p.conv_dim_per_rank
+
+        n_k = len(p.key_row_ranges(rank))
+        q_block = ranges[:n_k]
+        k_block = ranges[n_k : 2 * n_k]
+        v_block = ranges[2 * n_k :]
+        assert all(hi <= p.key_dim for _, hi in q_block)
+        assert all(p.key_dim < hi <= 2 * p.key_dim for _, hi in k_block)
+        assert all(hi > 2 * p.key_dim for _, hi in v_block)
+        # k is the same rows as q, shifted by one key_dim block.
+        assert [(lo - p.key_dim, hi - p.key_dim) for lo, hi in k_block] == q_block
+
+
+def test_conv_dim_per_rank_is_not_the_naive_quotient_at_tp32():
+    """Pin the trap: the naive form is right at every degree but the target one.
+
+    ``conv_dim // tp`` agrees up to tp=16 and undersizes the conv state cache by
+    28% at tp=32, which would corrupt the convolution window rather than fail.
+    """
+    c = Qwen3_5TextConfig()
+    for tp in (1, 2, 4, 8, 16):
+        assert resolve_sharding(c, tp).conv_dim_per_rank == c.conv_dim // tp
+
+    p32 = resolve_sharding(c, 32)
+    assert p32.conv_dim_per_rank == 2 * 128 + 3 * 64 == 448
+    assert c.conv_dim // 32 == 320
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16, 32])
+def test_value_heads_follow_their_key_head(tp):
+    """Value head j belongs to key head j // num_v_per_k, on every rank."""
+    c = Qwen3_5TextConfig()
+    p = resolve_sharding(c, tp)
+
+    for rank in range(tp):
+        k_heads = p.k_head_indices(rank)
+        v_heads = p.v_head_indices(rank)
+        assert len(v_heads) == p.v_heads_per_rank
+        assert {v // c.num_v_per_k for v in v_heads} == set(k_heads)
+
+
+def test_partner_ranks_at_tp32_share_heads_but_split_the_dimension():
+    """The two ranks on one key head must cover its value dim between them."""
+    p = resolve_sharding(Qwen3_5TextConfig(), 32)
+
+    for pair in range(16):
+        a, b = 2 * pair, 2 * pair + 1
+        assert p.k_head_indices(a) == p.k_head_indices(b) == [pair]
+        assert p.v_head_indices(a) == p.v_head_indices(b)
+        assert p.v_dim_offset(a) == 0
+        assert p.v_dim_offset(b) == 64
+        assert p.value_row_ranges(a) != p.value_row_ranges(b)

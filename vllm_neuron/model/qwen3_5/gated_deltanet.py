@@ -41,8 +41,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm_neuron.utils.weight_loader import set_weight_loader
+
 from .attention import Qwen3_5RMSNormGated
 from .config import Qwen3_5TextConfig
+from .parallel import Qwen3_5ShardingPolicy, resolve_sharding, resolve_tp_context
+from .weight_loaders import (
+    gdn_conv1d_weight_loader,
+    gdn_gated_norm_loader,
+    gdn_head_vector_loader,
+    gdn_out_proj_weight_loader,
+    gdn_qkv_weight_loader,
+    gdn_row_weight_loader,
+)
 
 # The convolution lives in nki_gdn.py alongside its NKI dispatcher, so the
 # kernel and its torch reference travel together -- the arrangement nki_mla.py
@@ -289,17 +300,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     why upstream constructs this layer with ``gqa_interleaved_layout=False``.
     """
 
-    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        layer_idx: int,
+        policy: Qwen3_5ShardingPolicy | None = None,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         self.config = config
         self.dtype = config.torch_dtype
 
+        tp = resolve_tp_context()
+        self.tp_group = tp.group
+        self.world_size = tp.world_size
+        self.rank = tp.rank
+        # Tests construct this layer directly with no process group, where the
+        # context degrades to a single rank and the default policy is the
+        # unsharded one. The engine always passes the model's resolved policy.
+        self.policy = (
+            policy if policy is not None else resolve_sharding(config, tp.world_size)
+        )
+
         self.hidden_size = config.hidden_size
-        self.num_k_heads = config.linear_num_key_heads
-        self.num_v_heads = config.linear_num_value_heads
+        self.num_k_heads = self.policy.k_heads_per_rank
+        self.num_v_heads = self.policy.v_heads_per_rank
         self.head_k_dim = config.linear_key_head_dim
-        self.head_v_dim = config.linear_value_head_dim
+        #: This rank's slice of each value head. Equals the full
+        #: ``linear_value_head_dim`` unless tp exceeds the 16 key heads, at
+        #: which point the value dimension itself is split.
+        self.head_v_dim = self.policy.v_dim_per_rank
         self.num_v_per_k = config.num_v_per_k
         self.conv_kernel_size = config.linear_conv_kernel_dim
 
@@ -309,9 +339,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         #: Must stay in the kernel's accepted set (16/32/64/128).
         self.chunk_size = 64
 
-        self.key_dim = config.key_dim
-        self.value_dim = config.value_dim
-        self.conv_dim = config.conv_dim
+        # Per-rank widths. conv_dim is *not* the global conv_dim // tp: under
+        # value-dimension splitting the q and k blocks are replicated across
+        # the ranks sharing a key head. See Qwen3_5ShardingPolicy.
+        self.key_dim = self.policy.key_dim_per_rank
+        self.value_dim = self.policy.value_dim_per_rank
+        self.conv_dim = self.policy.conv_dim_per_rank
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)
@@ -335,10 +368,38 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.head_v_dim, config.rms_norm_eps, config.torch_dtype
         )
 
+        # Global value-head columns this rank owns, used to place its partial
+        # sums of squares in the cross-rank gated-norm reduction.
+        self.global_v_heads = self.policy.v_head_indices(self.rank)
+        self.needs_norm_allreduce = (
+            self.policy.gated_norm_needs_allreduce and self.world_size > 1
+        )
+
+        self._install_weight_loaders()
+
         # Bound by Qwen3_5TextForCausalLM.bind_kv_cache. Both are indexed by
         # request, not by token: [num_requests, ...].
         self.conv_state_cache = None
         self.recurrent_state_cache = None
+
+    def _install_weight_loaders(self):
+        """Attach the per-rank shard transforms.
+
+        All six loaders are rank-generic -- they take the rank as an
+        argument like
+        ``gated_qkv_weight_loader`` does -- so a single policy drives every
+        rank's slice and the partition is never restated here.
+        """
+        policy = self.policy
+        set_weight_loader(self.in_proj_qkv.weight, gdn_qkv_weight_loader(policy))
+        set_weight_loader(self.conv1d.weight, gdn_conv1d_weight_loader(policy))
+        set_weight_loader(self.in_proj_z.weight, gdn_row_weight_loader(policy))
+        set_weight_loader(self.out_proj.weight, gdn_out_proj_weight_loader(policy))
+        set_weight_loader(self.in_proj_b.weight, gdn_head_vector_loader(policy))
+        set_weight_loader(self.in_proj_a.weight, gdn_head_vector_loader(policy))
+        set_weight_loader(self.dt_bias, gdn_head_vector_loader(policy))
+        set_weight_loader(self.A_log, gdn_head_vector_loader(policy))
+        set_weight_loader(self.norm.weight, gdn_gated_norm_loader(policy))
 
     # -- pieces, exposed so tests can diff them individually ---------------
 
@@ -354,6 +415,51 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k_end = self.key_dim
         v_start = 2 * self.key_dim
         return mixed[..., :k_end], mixed[..., k_end:v_start], mixed[..., v_start:]
+
+    def head_sum_squares(self, core_out_flat: torch.Tensor):
+        """``(sum_squares, dim_size)`` for the gated norm, or ``(None, None)``.
+
+        The gated RMSNorm normalizes over the *full* ``linear_value_head_dim``.
+        When tp exceeds the 16 key heads each rank holds only part of that
+        width, so its local sum of squares is a fraction of the true one and
+        normalizing with it would scale every shard differently -- silently,
+        and differently per rank.
+        """
+        if not self.needs_norm_allreduce:
+            return None, None
+        local = core_out_flat.float().pow(2).sum(-1).reshape(-1, self.num_v_heads)
+        totals = self._all_reduce_head_sums(local).reshape(-1, 1)
+        return totals, self.policy.value_head_dim
+
+    def _all_reduce_head_sums(self, local_sums: torch.Tensor) -> torch.Tensor:
+        """Sum each value head's partial squares across the ranks sharing it.
+
+        The reduction runs over the **whole** TP group on a
+        ``[tokens, num_v_heads]`` buffer in which each rank writes only its own
+        head columns. Ranks holding different key heads write disjoint columns
+        and cannot interfere; ranks sharing a key head write the same columns
+        and their partials add to the true full-width sum. Using the full group
+        avoids creating ``v_dim_shards``-sized subgroups, which would have to
+        be built collectively and exactly once across all 48 GDN layers, and
+        costs one [tokens, 48] fp32 all-reduce per layer.
+
+        Overridable so a single-process test can accumulate across simulated
+        shards without a production-only injection seam.
+        """
+        cols = torch.tensor(
+            self.global_v_heads, dtype=torch.long, device=local_sums.device
+        )
+        buffer = torch.zeros(
+            local_sums.shape[0],
+            self.policy.num_v_heads,
+            dtype=local_sums.dtype,
+            device=local_sums.device,
+        )
+        buffer = buffer.index_copy(1, cols, local_sums)
+        reduced = self.tp_group.all_reduce(buffer)
+        if reduced is not None:
+            buffer = reduced
+        return buffer.index_select(1, cols)
 
     def gates(self, hidden_states: torch.Tensor):
         """``beta`` and the log-decay ``g``.
@@ -442,7 +548,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
 
         z = self.in_proj_z(hidden_states).reshape(-1, self.head_v_dim)
-        core_out = self.norm(core_out.reshape(-1, self.head_v_dim), z)
+        core_out = core_out.reshape(-1, self.head_v_dim)
+        sum_squares, dim_size = self.head_sum_squares(core_out)
+        core_out = self.norm(core_out, z, sum_squares=sum_squares, dim_size=dim_size)
         core_out = core_out.reshape(batch, seq_len, -1)
 
         return self.out_proj(core_out), new_conv_state, new_recurrent_state
@@ -477,6 +585,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 f"layer {self.layer_idx}: GDN state cache was never bound; "
                 "bind_kv_cache must run before the first forward"
             )
+
+        # Sequence parallelism: on prefill the residual stream arrives
+        # scattered along tokens, and this layer *cannot* work on a slice --
+        # the delta rule is a token-ordered recurrence, so a rank holding a
+        # subset of the sequence computes a different result, not a partial
+        # one. Gather first, exactly as Qwen3_5MLP and Qwen3_5Attention do.
+        if not is_decode and self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
 
         meta = attn_metadata[f"layers.{self.layer_idx}.linear_attn"]
         index = self.state_index(attn_metadata)
@@ -516,4 +632,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             0, index, new_recurrent_state.to(self.recurrent_state_cache.dtype)
         )
 
-        return output.reshape(tokens, -1)
+        output = output.reshape(tokens, -1)
+
+        # out_proj is column-sharded, so each rank holds a partial sum over the
+        # value dimension: reduce on the way out, scattering back to this
+        # rank's token slice on prefill.
+        if self.world_size > 1:
+            if is_decode:
+                self.tp_group.all_reduce(output)
+            else:
+                output = self.tp_group.reduce_scatter(output, dim=0)
+        return output

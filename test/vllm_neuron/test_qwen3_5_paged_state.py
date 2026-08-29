@@ -164,8 +164,27 @@ def test_uneven_token_split_across_requests_is_rejected():
         )
 
 
+#: Branch subjects ``forward_paged`` may legitimately test, all of them known
+#: at trace time. ``is_decode`` is a Python bool argument and ``world_size`` a
+#: process-group size, which is what the sequence-parallel collectives switch
+#: on -- the same Python-level branch ``Qwen3_5MLP.forward`` makes. Nothing
+#: here reads the *contents* of a device tensor, which is the actual hazard.
+PERMITTED_BRANCH_SUBJECTS = (
+    "is None",
+    "cached is not None",
+    "%",
+    "is_decode",
+    "world_size",
+)
+
+
 def test_fresh_mask_uses_no_python_branch_on_tensor_values():
-    """Structural: the fresh-sequence decision must be a mask, not an if."""
+    """Structural: the fresh-sequence decision must be a mask, not an if.
+
+    Branching on ``cached_seq_len``'s value instead of masking with it is what
+    produced nine consecutive DeepSeek-V4 Dynamo blockers, so this asserts the
+    shape of the code rather than only its output.
+    """
     import ast
     import inspect
     import textwrap
@@ -175,11 +194,7 @@ def test_fresh_mask_uses_no_python_branch_on_tensor_values():
 
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
-            # The only permitted branches are on None-ness and on Python ints,
-            # never on the contents of a device tensor.
             rendered = ast.unparse(node.test)
-            assert (
-                "is None" in rendered
-                or "cached is not None" in rendered
-                or "%" in rendered
+            assert any(
+                subject in rendered for subject in PERMITTED_BRANCH_SUBJECTS
             ), rendered

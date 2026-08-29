@@ -383,7 +383,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         if self.layer_type == FULL_ATTENTION:
             self.self_attn = Qwen3_5Attention(config, policy, layer_idx)
         else:
-            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx, policy)
 
         self.mlp = Qwen3_5MLP(config, policy)
 
@@ -543,23 +543,11 @@ class Qwen3_5TextForCausalLM(nn.Module):
         self.world_size = tp.world_size
         self.rank = tp.rank
 
+        # Both layer kinds consume this: full attention pads its 24 query
+        # heads up to a multiple of the degree, and the Gated DeltaNet shards
+        # its 16 key / 48 value heads, falling back to splitting each value
+        # head's dimension once the degree exceeds 16.
         self.policy = resolve_sharding(config, self.world_size)
-
-        # The sharding policy covers both layer kinds and is validated for every
-        # supported degree, but only the full-attention and MLP paths consume it
-        # so far -- Qwen3_5GatedDeltaNet still holds unsharded projections.
-        # Refuse loudly rather than silently computing each rank's GDN over the
-        # full head set and then summing the duplicates in out_proj, which would
-        # scale the linear layers' contribution by the world size and look like
-        # an accuracy bug rather than a missing feature.
-        if self.world_size > 1:
-            raise NotImplementedError(
-                f"tensor_parallel_size={self.world_size}: Gated DeltaNet layers "
-                "are not sharded yet, so only TP=1 is currently correct. The "
-                "policy for higher degrees is resolved and tested "
-                "(vllm_neuron/model/qwen3_5/parallel.py) -- what remains is "
-                "making the GDN projections and gated norm consume it."
-            )
 
         self.model = Qwen3_5TextModel(config, self.policy)
 
@@ -601,6 +589,12 @@ class Qwen3_5TextForCausalLM(nn.Module):
     def _install_norm_loaders(self):
         """Attach the ``+1`` fold to exactly the HF ``Qwen3_5RMSNorm`` weights."""
         for name, param in self.named_parameters():
+            if name.endswith("linear_attn.norm.weight"):
+                # Owned by Qwen3_5GatedDeltaNet, which installs a loader that
+                # slices the weight to this rank's value width. Overwriting it
+                # with plain_loader() here would hand every rank the full
+                # 128-wide tensor and fail to load at tp=32.
+                continue
             if name.endswith("norm.weight") or name.endswith("layernorm.weight"):
                 loader = (
                     norm_plus_one_loader() if needs_plus_one_fold(name) else plain_loader()
@@ -697,8 +691,12 @@ class Qwen3_5TextForCausalLM(nn.Module):
                     )
                 )
             else:
+                # policy.conv_dim_per_rank, never config.conv_dim // tp: the
+                # query and key halves are replicated when the value dim is
+                # split, so the naive form undersizes this cache at tp=32 and
+                # is correct at every smaller degree.
                 conv_shape = (
-                    config.conv_dim // policy.tp_degree,
+                    policy.conv_dim_per_rank,
                     config.linear_conv_kernel_dim - 1,
                 )
                 recurrent_shape = (

@@ -123,7 +123,7 @@ def test_one_page_per_request_under_the_default_cache_mode():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tp", [1, 8, 16])
+@pytest.mark.parametrize("tp", [1, 8, 16, 32])
 def test_27b_state_footprint_per_request(tp):
     """Sanity-check the per-request cost, which caps max_num_seqs."""
     from vllm_neuron.model.qwen3_5.parallel import resolve_sharding
@@ -131,7 +131,11 @@ def test_27b_state_footprint_per_request(tp):
     config = Qwen3_5TextConfig()
     policy = resolve_sharding(config, tp)
 
-    conv_shape = (config.conv_dim // tp, config.linear_conv_kernel_dim - 1)
+    # policy.conv_dim_per_rank, not config.conv_dim // tp: the two agree at
+    # every degree up to 16 and diverge at 32, where the query and key halves
+    # are replicated across the ranks sharing a key head. Sizing this cache by
+    # the quotient there allocates 320 of the 448 channels the layer writes.
+    conv_shape = (policy.conv_dim_per_rank, config.linear_conv_kernel_dim - 1)
     recurrent_shape = (
         policy.v_heads_per_rank,
         config.linear_key_head_dim,
@@ -151,6 +155,11 @@ def test_27b_state_footprint_per_request(tp):
     assert total == per_layer * 48
     # At tp=16 the whole 48-layer state must stay well inside a GB per request.
     if tp == 16:
+        assert total < 16 * 1024 * 1024, total
+    if tp == 32:
+        # Going 16 -> 32 halves the recurrent state but *grows* the conv state,
+        # because q and k stop being split. Still a net win, just not a halving.
+        assert policy.conv_dim_per_rank == 448
         assert total < 16 * 1024 * 1024, total
 
 

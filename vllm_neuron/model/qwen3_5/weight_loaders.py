@@ -154,6 +154,113 @@ def gated_o_proj_weight_loader(
 
 
 # ===========================================================================
+# Gated DeltaNet
+# ===========================================================================
+#
+# Unlike the attention block, whose parameters are raw tensors stored
+# ``[hidden, out]``, the GDN keeps ``nn.Linear`` / ``nn.Conv1d`` modules whose
+# weights are already ``[out, in]`` -- the same layout as the checkpoint. So
+# none of the loaders below transposes; adding one would be silently wrong.
+#
+# Every partition comes from the policy's row-range helpers, so which rows a
+# rank owns is stated once, in ``Qwen3_5ShardingPolicy``, and never restated.
+
+
+def _rows(tensor_slice, ranges, dim: int = 0):
+    """Concatenate the given half-open ranges along ``dim``."""
+    parts = []
+    for lo, hi in ranges:
+        if dim == 0:
+            parts.append(tensor_slice[lo:hi][:])
+        else:
+            parts.append(tensor_slice[:, lo:hi][:])
+    return torch.cat(parts, dim=dim)
+
+
+def gdn_qkv_weight_loader(policy: Qwen3_5ShardingPolicy) -> SafetensorsWeightLoader:
+    """Shard ``in_proj_qkv`` over the fused ``[q | k | v]`` output rows.
+
+    At tp > 16 the q and k rows are *replicated* between the ranks sharing a
+    key head while only the v rows are split, which is why the result is
+    ``conv_dim_per_rank`` wide and not ``conv_dim // tp``.
+    """
+
+    def transform(slices, rank):
+        return _rows(slices[0], policy.conv_row_ranges(rank))
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def gdn_conv1d_weight_loader(policy: Qwen3_5ShardingPolicy) -> SafetensorsWeightLoader:
+    """Shard the depthwise ``conv1d`` weight, ``[conv_dim, 1, kernel]``.
+
+    Depthwise means one filter per channel, so the channel partition is exactly
+    the ``in_proj_qkv`` row partition -- reusing it keeps the conv and its input
+    from ever drifting apart.
+    """
+
+    def transform(slices, rank):
+        w = slices[0]
+        parts = [w[lo:hi, :, :][:] for lo, hi in policy.conv_row_ranges(rank)]
+        return torch.cat(parts, dim=0)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def gdn_row_weight_loader(policy: Qwen3_5ShardingPolicy) -> SafetensorsWeightLoader:
+    """Shard a ``[value_dim, hidden]`` projection (``in_proj_z``) by value rows."""
+
+    def transform(slices, rank):
+        return _rows(slices[0], policy.value_row_ranges(rank))
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def gdn_out_proj_weight_loader(
+    policy: Qwen3_5ShardingPolicy,
+) -> SafetensorsWeightLoader:
+    """Shard ``out_proj``, ``[hidden, value_dim]``, along its **input** dim.
+
+    Each rank then produces a partial sum over the value dimension, which the
+    layer's exit collective reduces.
+    """
+
+    def transform(slices, rank):
+        return _rows(slices[0], policy.value_row_ranges(rank), dim=1)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def gdn_head_vector_loader(policy: Qwen3_5ShardingPolicy) -> SafetensorsWeightLoader:
+    """Shard a per-value-head quantity by whole heads.
+
+    Covers both the ``[num_v_heads, hidden]`` gate projections
+    (``in_proj_b`` / ``in_proj_a``) and the bare ``[num_v_heads]`` parameters
+    ``dt_bias`` and ``A_log``, which differ only in rank.
+    """
+
+    def transform(slices, rank):
+        w = slices[0]
+        return torch.cat([w[h : h + 1][:] for h in policy.v_head_indices(rank)], dim=0)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+def gdn_gated_norm_loader(policy: Qwen3_5ShardingPolicy) -> SafetensorsWeightLoader:
+    """Slice the gated norm's ``[value_head_dim]`` weight to this rank's width.
+
+    No ``+1`` fold: HF's ``Qwen3_5RMSNormGated`` already uses the ordinary
+    convention (see the module docstring). Below tp=32 this is the identity.
+    """
+
+    def transform(slices, rank):
+        lo = policy.v_dim_offset(rank)
+        return slices[0][lo : lo + policy.v_dim_per_rank][:]
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
+# ===========================================================================
 # Checkpoint key mapping
 # ===========================================================================
 

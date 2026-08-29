@@ -16,6 +16,12 @@ from vllm_neuron.model.qwen3_5.weight_loaders import (
     VISION_PREFIX,
     gated_o_proj_weight_loader,
     gated_qkv_weight_loader,
+    gdn_conv1d_weight_loader,
+    gdn_gated_norm_loader,
+    gdn_head_vector_loader,
+    gdn_out_proj_weight_loader,
+    gdn_qkv_weight_loader,
+    gdn_row_weight_loader,
     needs_plus_one_fold,
     norm_plus_one_loader,
     plain_loader,
@@ -313,3 +319,170 @@ def test_every_full_attention_layer_maps_three_qkv_sources():
         sources = mappings[f"model.layers.{i}.self_attn.qkv_proj_weight"]
         assert len(sources) == 3
         assert sources[0].endswith("q_proj.weight")
+
+
+# ---------------------------------------------------------------------------
+# Gated DeltaNet sharding
+#
+# The tiny config below has 2 key heads and 6 value heads, so tp=2 is pure head
+# sharding, tp=4 splits each value head in two and tp=8 splits it four ways --
+# structurally the same three regimes the shipped 27B hits at tp<=16, 32 and
+# (hypothetically) 64, at a size a test can hold.
+# ---------------------------------------------------------------------------
+
+GDN_TP_DEGREES = [1, 2, 4, 8]
+
+
+def _row_ids(rows: int, cols: int) -> torch.Tensor:
+    """``[rows, cols]`` where every element of row ``i`` is ``i``.
+
+    Loading it back tells you exactly which global rows a rank was handed,
+    which is the only thing these loaders are responsible for.
+    """
+    ids = torch.arange(rows, dtype=torch.float32).unsqueeze(1)
+    return ids.expand(rows, cols).contiguous()
+
+
+def _loaded_row_ids(tensor: torch.Tensor, dim: int = 0) -> list[int]:
+    ids = tensor if dim == 0 else tensor.t()
+    return [int(v) for v in ids[:, 0].tolist()]
+
+
+@pytest.mark.parametrize("tp", GDN_TP_DEGREES)
+def test_gdn_qkv_loader_replicates_qk_and_splits_v(tp):
+    config = _config()
+    policy = resolve_sharding(config, tp)
+    ckpt = FakeSlice(_row_ids(config.conv_dim, config.hidden_size))
+    loader = gdn_qkv_weight_loader(policy)
+
+    kd = config.key_dim
+    d_k = config.linear_key_head_dim
+    d_v = config.linear_value_head_dim
+    width = policy.v_dim_per_rank
+
+    v_rows_seen = []
+    for rank in range(tp):
+        shard = loader.load([ckpt], rank=rank)
+        assert shard.shape == (policy.conv_dim_per_rank, config.hidden_size)
+        got = _loaded_row_ids(shard)
+
+        # Derived here from head arithmetic alone, independent of the policy.
+        if policy.v_dim_shards > 1:
+            k_heads = [rank // policy.v_dim_shards]
+            offset = (rank % policy.v_dim_shards) * width
+        else:
+            k_heads = list(
+                range(
+                    rank * policy.k_heads_per_rank,
+                    (rank + 1) * policy.k_heads_per_rank,
+                )
+            )
+            offset = 0
+
+        expect_q = [h * d_k + i for h in k_heads for i in range(d_k)]
+        expect_k = [kd + r for r in expect_q]
+        expect_v = [
+            2 * kd + v * d_v + offset + i
+            for h in k_heads
+            for v in range(h * config.num_v_per_k, (h + 1) * config.num_v_per_k)
+            for i in range(width)
+        ]
+        assert got == expect_q + expect_k + expect_v, rank
+        v_rows_seen.extend(expect_v)
+
+    # Value rows partition the block; q/k rows are replicated v_dim_shards ways.
+    assert sorted(v_rows_seen) == list(range(2 * kd, config.conv_dim))
+
+
+def test_gdn_qkv_partner_ranks_get_identical_query_and_key():
+    """The pair sharing a key head must both hold its whole q and k."""
+    config = _config()
+    policy = resolve_sharding(config, 4)  # v_dim_shards == 2
+    ckpt = FakeSlice(_row_ids(config.conv_dim, config.hidden_size))
+    loader = gdn_qkv_weight_loader(policy)
+
+    qk = 2 * policy.key_dim_per_rank
+    for pair in range(2):
+        a = loader.load([ckpt], rank=2 * pair)
+        b = loader.load([ckpt], rank=2 * pair + 1)
+        assert torch.equal(a[:qk], b[:qk]), pair
+        assert not torch.equal(a[qk:], b[qk:]), pair
+
+
+@pytest.mark.parametrize("tp", GDN_TP_DEGREES)
+def test_gdn_conv1d_loader_matches_the_qkv_channel_partition(tp):
+    """Depthwise: one filter per channel, so the two partitions must agree."""
+    config = _config()
+    policy = resolve_sharding(config, tp)
+    kernel = config.linear_conv_kernel_dim
+
+    conv = _row_ids(config.conv_dim, kernel).unsqueeze(1)  # [conv_dim, 1, K]
+    qkv = _row_ids(config.conv_dim, config.hidden_size)
+
+    for rank in range(tp):
+        conv_shard = gdn_conv1d_weight_loader(policy).load([FakeSlice(conv)], rank=rank)
+        qkv_shard = gdn_qkv_weight_loader(policy).load([FakeSlice(qkv)], rank=rank)
+        assert conv_shard.shape == (policy.conv_dim_per_rank, 1, kernel)
+        assert _loaded_row_ids(conv_shard[:, 0]) == _loaded_row_ids(qkv_shard), rank
+
+
+@pytest.mark.parametrize("tp", GDN_TP_DEGREES)
+def test_gdn_z_and_out_proj_cover_the_value_dim_exactly_once(tp):
+    """in_proj_z rows and out_proj columns are the same partition, transposed."""
+    config = _config()
+    policy = resolve_sharding(config, tp)
+
+    z = FakeSlice(_row_ids(config.value_dim, config.hidden_size))
+    o = FakeSlice(_row_ids(config.value_dim, config.hidden_size).t().contiguous())
+
+    seen = []
+    for rank in range(tp):
+        z_shard = gdn_row_weight_loader(policy).load([z], rank=rank)
+        o_shard = gdn_out_proj_weight_loader(policy).load([o], rank=rank)
+        assert z_shard.shape == (policy.value_dim_per_rank, config.hidden_size)
+        assert o_shard.shape == (config.hidden_size, policy.value_dim_per_rank)
+        rows = _loaded_row_ids(z_shard)
+        assert rows == _loaded_row_ids(o_shard, dim=1), rank
+        seen.extend(rows)
+
+    assert sorted(seen) == list(range(config.value_dim))
+
+
+@pytest.mark.parametrize("tp", GDN_TP_DEGREES)
+def test_gdn_head_vector_loader_handles_both_ranks_of_tensor(tp):
+    """dt_bias/A_log are 1-D; in_proj_b/a are 2-D. Same head partition."""
+    config = _config()
+    policy = resolve_sharding(config, tp)
+
+    matrix = FakeSlice(_row_ids(config.linear_num_value_heads, config.hidden_size))
+    vector = FakeSlice(torch.arange(config.linear_num_value_heads, dtype=torch.float32))
+
+    seen = []
+    for rank in range(tp):
+        m = gdn_head_vector_loader(policy).load([matrix], rank=rank)
+        v = gdn_head_vector_loader(policy).load([vector], rank=rank)
+        assert m.shape == (policy.v_heads_per_rank, config.hidden_size)
+        assert v.shape == (policy.v_heads_per_rank,)
+        assert _loaded_row_ids(m) == [int(x) for x in v.tolist()], rank
+        seen.extend(int(x) for x in v.tolist())
+
+    # Value heads are replicated, not split, when only the value *dim* splits.
+    expected = list(range(config.linear_num_value_heads)) * policy.v_dim_shards
+    assert sorted(seen) == sorted(expected)
+
+
+@pytest.mark.parametrize("tp", GDN_TP_DEGREES)
+def test_gdn_gated_norm_loader_slices_to_this_rank_width(tp):
+    """The norm weight spans one value head's dim, which tp may have split."""
+    config = _config()
+    policy = resolve_sharding(config, tp)
+    weight = FakeSlice(torch.arange(config.linear_value_head_dim, dtype=torch.float32))
+
+    for rank in range(tp):
+        shard = gdn_gated_norm_loader(policy).load([weight], rank=rank)
+        assert shard.shape == (policy.v_dim_per_rank,)
+        lo = (rank % policy.v_dim_shards) * policy.v_dim_per_rank
+        assert shard.tolist() == list(range(lo, lo + policy.v_dim_per_rank)), rank
+
+    # No +1 fold here: this is HF's gated norm, already in the ordinary form.
+    assert needs_plus_one_fold("model.layers.0.linear_attn.norm.weight") is False
