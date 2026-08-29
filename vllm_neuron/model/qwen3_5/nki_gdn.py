@@ -560,6 +560,22 @@ def scan_lnc(rows: int) -> int:
     split evenly, so it falls back to a single program rather than dropping or
     double-counting a row. Mirrors ``nki_compressor``'s
     ``1 if candidate_count == 1 else 2``.
+
+    **The grid=1 fallback does not compile on an LNC=2 host.** Under LNC=2 a
+    logical core is two physical NeuronCores and codegen is checked per
+    physical core; a single program puts the kernel body on core 0 and leaves
+    core 1 empty, which neuronx-cc rejects::
+
+        [NCC_IXGM002] Expected function sg0000 in subgraph 0 to have 49 basic
+        blocks, but on core 1 it has 1 basic blocks
+
+    Isolated on device at fixed TP=4 by varying only this return value: grid 2
+    generates tokens, grid 1 fails with that error. It is why the kernel is
+    unusable at TP=8, where 3 value heads per rank make ``rows`` odd. The fix
+    is to pad ``rows`` to even and launch at a fixed grid of 2 the way
+    ``_wrapped_depthwise_conv1d[_LNC]`` does; it changes kernel input shapes
+    and has not been made yet. See
+    docs/model-dev/qwen3-5-tp8-device-bringup.md.
     """
     return 2 if rows % 2 == 0 else 1
 

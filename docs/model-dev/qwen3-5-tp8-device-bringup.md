@@ -16,7 +16,8 @@ RESULT {"tensor_parallel_size": 8, "visible_cores": "32-39",
 ```
 
 That run has the **chunk-scan NKI kernel on its torch fallback**; the depthwise
-conv kernel is active. See "Open blocker" below.
+conv kernel is active -- see "Root cause" below, which explains why and
+what fixes it.
 
 The same configuration runs with **both GDN states stored at bf16** instead of
 fp32 (`mamba_state_dtype=bfloat16`), on the same devices and geometry:
@@ -41,42 +42,86 @@ configurations produced different token sequences after the first token, which i
 expected at this scale but means **the NKI conv's numerics have not been verified
 against torch on device** -- only that both compile and run.
 
-## Open blocker: the chunk-scan kernel fails neuronx-cc codegen
+## Root cause: a grid=1 NKI launch on an LNC=2 host
 
-With the chunk-scan kernel enabled, the **decode** graph fails:
+**Resolved.** The chunk-scan kernel fails `neuronx-cc` codegen whenever it is
+launched with **one** program on a host running `logical-neuroncore-config 2`:
 
 ```
 [INTERNAL_ERROR] [NCC_IXGM002] Expected function sg0000 in subgraph 0 to have
 49 basic blocks, but on core 1 it has 1 basic blocks
 ```
 
-Prefill compiles fine. Attribution is from a full 2x2, one device run per cell:
+Under LNC=2 a logical NeuronCore is **two physical NeuronCore-v3 sharing one
+address space** (Trn2: 8 physical -> 4 logical). Codegen is emitted and checked
+per physical core. A kernel launched at grid 1 puts its body on core 0 and
+leaves core 1 with a stub -- which is exactly 49 basic blocks against 1.
 
-| conv kernel | scan kernel | outcome |
-|---|---|---|
-| off | off | pass |
-| off | on  | fail (NCC_IXGM002, decode) |
-| on  | on  | fail (NCC_IXGM002, decode) |
-| on  | off | **pass** -- the best working configuration |
+The launch grid is data-dependent, and that is what made this look like a
+property of the model rather than of the kernel:
 
-So the scan kernel is necessary and sufficient; the conv kernel is not implicated.
+```python
+def scan_lnc(rows: int) -> int:      # rows = batch x heads
+    return 2 if rows % 2 == 0 else 1
+```
 
-Two hypotheses were tested and **disproved**:
+With `num_seqs_buckets: [1]` and 24 value heads on the fixture, `rows` is just
+the per-rank value-head count, so the grid is decided by the TP degree:
 
-- *The LNC=2 core split.* Forcing `scan_lnc` to return 1 reproduced the error
-  identically. The host is LNC=2 globally, so "core 1" is the second physical
-  core of every logical core -- the message is about the whole subgraph, not the
-  kernel's launch grid.
-- *Decode does not use the scan.* Decode runs the recurrent path, yet enabling
-  the scan is what breaks the decode compile. Whatever the mechanism, presence of
-  the kernel is the trigger.
+| TP | v heads/rank | rows | grid | outcome |
+|---|---|---|---|---|
+| 8 | 3 | 3 | **1** | fail (`NCC_IXGM002`) |
+| 4 | 6 | 6 | 2 | **pass** |
+| 2 | 12 | 12 | 2 | (not run) |
 
-The message asks for a support ticket, so this may be a compiler issue rather
-than a defect in the kernel source. Next step is `XLA_IR_DEBUG=1
-XLA_HLO_DEBUG=1` and a per-core comparison of `sg0000`.
+Isolated with a control that varies **only** the grid, at fixed TP=4, fixed
+fixture, scan kernel enabled in both:
 
-Reproduce: build the fixture, run `tools/qwen3_5/generate_tiny.py` at TP=8. To
-get a working run meanwhile, make `can_use_chunk_scan_kernel` return False.
+| TP | grid | source | outcome |
+|---|---|---|---|
+| 4 | 2 | natural (`rows=6`) | pass -- tokens generated |
+| 4 | 1 | `scan_lnc` forced to 1 | fail, error identical to TP=8 |
+
+So TP is not the variable; the grid is. The depthwise conv kernel is never
+implicated because it hardcodes `_wrapped_depthwise_conv1d[_LNC]` with
+`_LNC = 2` -- it cannot launch at grid 1.
+
+### Two earlier conclusions in this document were wrong
+
+Both are corrected above, and both are worth recording because the reasoning
+failed in an instructive way.
+
+1. *"The LNC=2 core split was tested and disproved."* The test forced
+   `scan_lnc` to return **1** and observed the error reproduce. But grid 1 is
+   the *failing* value, so that experiment could only ever reproduce. The
+   informative direction was forcing it to **2**, which requires an even `rows`
+   and is why TP=4 was the run that settled it. A hypothesis test that cannot
+   fail is not a test.
+
+2. *"The decode graph is what fails."* The failure is reported at the decode
+   extraction, but the log says plainly: *"Neuron errors are reported
+   asynchronously. The Python traceback shows where the error was detected
+   (synchronization point), not necessarily where the failing operation was
+   dispatched."* Prefill logs `Successfully extracted` -- extracted, not
+   compiled -- ~30s before the decode step reports the failure. Prefill is
+   where the grid=1 scan kernel actually lives; decode takes the recurrent
+   path and never calls the scan. The "decode fails even though decode does
+   not use the scan" paradox was an artifact of async reporting.
+
+### Fix
+
+Launch the scan at a fixed grid of 2, as the conv kernel already does, and pad
+`rows` to even so the grid is never data-dependent. That removes the failure
+mode by construction rather than avoiding it, and makes the kernel usable at
+TP=8 instead of permanently on its torch fallback. Not yet implemented -- it
+changes kernel input shapes and wants review.
+
+Until then, `can_use_chunk_scan_kernel` returning False keeps the scan on its
+torch fallback; that is the conv-on/scan-off configuration both TP=8 device
+runs used.
+
+Reproduce either side: `tools/qwen3_5/generate_tiny.py` at TP=8 (fails) or
+TP=4 (passes), same fixture, scan kernel enabled.
 
 ## Bugs found and fixed
 
