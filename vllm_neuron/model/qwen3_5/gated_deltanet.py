@@ -382,6 +382,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.head_v_dim, config.rms_norm_eps, config.torch_dtype
         )
 
+        # Bound by Qwen3_5TextForCausalLM.bind_kv_cache. Both are indexed by
+        # request, not by token: [num_requests, ...].
+        self.conv_state_cache = None
+        self.recurrent_state_cache = None
+
     # -- pieces, exposed so tests can diff them individually ---------------
 
     def split_mixed_qkv(self, mixed: torch.Tensor):
@@ -463,3 +468,74 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_out = core_out.reshape(batch, seq_len, -1)
 
         return self.out_proj(core_out), new_conv_state, new_recurrent_state
+
+    # ------------------------------------------------------------------
+    # Paged entry point
+    # ------------------------------------------------------------------
+
+    def state_index(self, attn_metadata) -> torch.Tensor:
+        """Per-request state slot.
+
+        The Mamba group's block table is a single column -- one page per
+        request, because ``mamba_block_size`` defaults to ``max_model_len`` --
+        so column 0 *is* the state index. ``slot_mapping`` does not apply to
+        this group; it addresses tokens, and this state is not per token.
+        Matches upstream's ``mamba_get_block_table_tensor``.
+        """
+        meta = attn_metadata[f"layers.{self.layer_idx}.linear_attn"]
+        return meta["block_table_tensor"][:, 0].to(torch.long)
+
+    def forward_paged(self, hidden_states, attn_metadata, is_decode: bool):
+        """Read state for the batch, run the layer, write the state back.
+
+        The "is this a fresh sequence?" decision is a **mask**, never a Python
+        branch: a zero-valued state is exactly the correct representation of no
+        history for both the conv window (the reference left-pads with zeros)
+        and the recurrent accumulator. Branching on ``cached_seq_len`` instead
+        is what produced nine consecutive DeepSeek-V4 Dynamo blockers.
+        """
+        if self.conv_state_cache is None or self.recurrent_state_cache is None:
+            raise RuntimeError(
+                f"layer {self.layer_idx}: GDN state cache was never bound; "
+                "bind_kv_cache must run before the first forward"
+            )
+
+        meta = attn_metadata[f"layers.{self.layer_idx}.linear_attn"]
+        index = self.state_index(attn_metadata)
+
+        batch = index.shape[0]
+        tokens = hidden_states.shape[0]
+        if tokens % batch:
+            raise ValueError(
+                f"layer {self.layer_idx}: {tokens} tokens do not divide evenly "
+                f"across {batch} requests"
+            )
+        x = hidden_states.view(batch, tokens // batch, -1)
+
+        conv_state = self.conv_state_cache[index]
+        recurrent_state = self.recurrent_state_cache[index]
+
+        cached = meta.get("cached_seq_len")
+        if cached is not None:
+            keep = (cached.reshape(-1).to(torch.int64) > 0).to(recurrent_state.dtype)
+            # Broadcast the mask over each state's trailing dims.
+            conv_state = conv_state * keep.reshape(-1, *([1] * (conv_state.dim() - 1)))
+            recurrent_state = recurrent_state * keep.reshape(
+                -1, *([1] * (recurrent_state.dim() - 1))
+            )
+
+        output, new_conv_state, new_recurrent_state = self.forward(
+            x,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            use_recurrent=is_decode,
+        )
+
+        self.conv_state_cache.index_copy_(
+            0, index, new_conv_state.to(self.conv_state_cache.dtype)
+        )
+        self.recurrent_state_cache.index_copy_(
+            0, index, new_recurrent_state.to(self.recurrent_state_cache.dtype)
+        )
+
+        return output.reshape(tokens, -1)
