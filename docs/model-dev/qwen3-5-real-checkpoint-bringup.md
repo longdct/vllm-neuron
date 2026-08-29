@@ -57,71 +57,115 @@ a real checkpoint can. Same 32-token prompt, final position, fp32 on CPU:
 
 Argmax agrees, top-4 identical, distributions match; the fifth slot is a
 near-tie. **bf16 on CPU gives the same top-5**, so precision is not a factor.
-Prefill *and* decode are finite on CPU. The model, the weight loading and the
-tied-embedding mapping are therefore all correct.
 
-## Two device-only NaNs
+This establishes the weight loading and the tied-embedding mapping, and nothing
+more. Read as "the model is correct" it was actively misleading: this prompt is
+32 tokens with `slot_mapping = arange(32)`, which is not a shape the serving path
+ever produces, and the bug below needs the padded bucket to appear. A parity run
+whose inputs the runtime cannot generate proves less than its agreement suggests
+-- the same 32 tokens placed in their real 2048 bucket go NaN on this exact
+checkpoint. The padded-bucket case now reproduces the same top-5.
 
-On device the same checkpoint emits token 0 forever. Logprobs show why -- it is
-NaN, and argmax over an all-NaN vector ties to index 0:
+## The NaN: an unstable matrix inverse, not a device fault
 
-```
-TOKENS [0, 0, 0]
-STEP0 0:nan 3:nan 4:nan 1:nan 2:nan
-```
+The previous revision of this document called these "two device-only NaNs" and
+spent several device runs bisecting the attention sublayer. Both claims were
+wrong, and the way they were wrong is the most reusable thing here.
 
-Bisection, one device run per row, all on the real checkpoint:
+**Root cause.** `unit_triangular_inverse` in `gated_deltanet.py` -- the port's one
+deliberate departure from the reference -- replaced HuggingFace's 63-step forward
+substitution with the binary-powering identity
 
-| variable | verdict |
-|---|---|
-| model + weights (CPU fp32 and bf16) | correct -- matches HF |
-| `head_dim=256` | exonerated -- a fixture at 256 generates normally |
-| `max_model_len` 2048 | exonerated -- fixture generates normally at 2048 |
-| NKI conv + scan kernels | exonerated -- NaN persists with both disabled |
-| TP degree (8 vs 2) | exonerated -- NaN at both |
-| TP=1 | **cannot compile**: SBUF exhaustion. This model has a minimum |
-| | viable TP degree, so TP=1 is not available as a debugging fallback. |
+    (I - A)^-1 = I + A + ... + A^(n-1) = (I + A)(I + A^2)(I + A^4)...(I + A^(n/2))
 
-Skipping the attention sublayer entirely (`torch.zeros_like`, not multiplying
-its output by zero -- `NaN * 0` is still NaN) splits the failure in two:
+to keep the traced graph small (10 matmuls, static shapes, no per-row scan). The
+identity is exact. The evaluation is catastrophically unstable for the matrices
+this layer actually produces.
 
-```
-TOKENS [106384, 0, 0]
-STEP0 106384:-4.6152 27614:-5.2402 228671:-5.3027   <- finite, real distribution
-STEP1 0:nan ...                                      <- still NaN
-```
+Here `A = -(k_beta @ key^T) * decay_mask` with l2-normalized keys. When
+successive keys are near-identical, `k . k == 1` and `A` approaches `-beta` times
+the strictly-lower-triangular ones matrix -- whose powers *grow*:
 
-**NaN 1 -- prefill attention.** Step 0 is NaN with attention on and finite with
-it skipped. `forward_prefill` calls `NF.flash_attention` with no explicit mask;
-at `head_dim=256` that falls back to torch inside `NF`. A fully-masked softmax
-row is the classic way to produce NaN here, and a 32-token prompt in a 2048
-bucket leaves ~2000 padding rows. Not yet confirmed -- the mask behaviour
-inside the fallback has not been read.
+| A | true max\|inv\| | sequential | binary powering | max\|A^32\| |
+|---|---|---|---|---|
+| random, entries ~0.1 | 1 | err 1e-7 | err 1e-7 | 5e-24 |
+| -0.5 * lower-ones | 1 | err 3e-8 | **112** | 1.1e8 |
+| -0.9 * lower-ones | 1 | err 7e-8 | **1.07e9** | 1.6e16 |
+| -0.99 * lower-ones | 1 | err 2e-8 | **6.87e10** | 3.4e17 |
 
-**NaN 2 -- GDN decode.** Steps 1+ stay NaN with attention skipped *and* both
-NKI kernels disabled, so pure-torch GDN decode goes NaN on device while the
-identical code is finite on CPU. Untouched.
+The true inverse is bounded by 1; the algorithm builds 1e17-magnitude
+intermediates and relies on cancellation to get back. fp32 keeps none of it, and
+**fp64 does not rescue it either** (error 64 at beta = 0.99), so this is not a
+precision shortfall -- the scheme is unusable for this matrix class.
 
-These are independent: fixing either alone leaves the other.
+**What made it fire.** Bucket padding. A 32-token prompt occupies a 2048 bucket,
+so ~2016 rows carry the same padded token -- exactly the near-identical-keys
+regime. Real prompts reach it too, just later: 2000 real tokens diverged at layer
+5 instead of layer 0.
 
-### Reproducer
+**The fix.** Recursive 2x2 block substitution. If `x` holds the inverses of the
+`b`-sized diagonal blocks, then `x @ a @ x` restricted to each `2b` block's lower
+quadrant is exactly `X22 @ A21 @ X11`, so one masked update per level and
+`log2(n)` levels suffices. It never forms a power of `A`: every factor is a true
+inverse or a sub-block of `A`, so there is nothing to cancel. 12 matmuls at
+n = 64 against the binary form's 10, same static shapes, same compile-time bound.
+Measured error 3e-8 on the matrices above, exact at beta = 1.
 
-A 4-layer prefix of the real checkpoint reproduces both, so iteration is
-minutes rather than tens of minutes. Symlink the weight files into a new
-directory and truncate `num_hidden_layers` and `layer_types` to 4 in
-`config.json` -- the loader only requests the layers the config declares. The
-prefix must keep the 3:1 schedule's own indices, because layer index decides
-which weights exist; 4 layers is the shortest prefix containing an attention
-layer.
+`nki_gdn.py` imports the same function, so the one fix covers the oracle and the
+device path together.
 
-A GDN-only prefix (3 layers) is **not** a usable control. The config guard
-rejects it, and with the guard relaxed the runner fails anyway at
-`model.py:483`, `next(k for k in attn_metadata if k.endswith("self_attn"))`,
-with `StopIteration`. A purely linear stack is unsupported end to end.
+## Why the bisection took as long as it did
+
+Worth recording, because the cost was almost entirely in the method rather than
+the bug.
+
+**The CPU oracle was fed inputs the serving path never produces.** Every CPU
+probe passed exactly the real tokens: 32 ids, positions 0..31,
+`slot_mapping = arange(32)`. The device always pads to the bucket. So "finite on
+CPU, NaN on device" was never a device/CPU difference at all -- it was two
+different inputs, and the framing it produced sent every subsequent run at the
+wrong sublayer. Reproducing the device's *metadata* on CPU took one script and
+inverted the whole diagnosis. **Before concluding "device-only", check that the
+CPU path is being given the device's actual inputs, padding included.**
+
+**Component substitution kept exonerating things because the culprit was
+upstream.** `_project`, `NF.flash_attention`, `NF.o_proj`, `_write_cache` and the
+SP collectives were each replaced or removed on device, one run apiece, and each
+came back "still NaN" -- correctly, since the fault was in layer 0's GDN, three
+layers before any attention layer runs.
+
+**A forward hook cannot see the GDN.** `Qwen3_5DecoderLayer.forward` calls
+`self.linear_attn.forward_paged(...)` directly rather than through `__call__`, so
+`register_forward_hook` never fires on it. Every hook-based observation was blind
+to the module that was actually failing. Instrument `forward_paged` explicitly.
+
+**The existing tests could not have caught it.**
+`test_blocked_inverse_matches_the_reference_loop` uses `randn * 0.3`, which gives
+`max|A^32| = 5e-24` -- no cancellation, error 1e-7, passes clean. The failure
+needs entries near 1 with consistent sign. The regression tests now pin that
+structure and are verified to fail against the old implementation.
+
+A structure test also pinned the *wrong* thing: it asserted `span *= 2`, i.e. the
+specific doubling scheme, which made a numerically unusable algorithm look load
+bearing. It now constrains the graph shape -- logarithmic bound, no per-row scan,
+no power of the input formed -- and leaves numerics to the accuracy tests.
+
+## Still open
+
+- **Attention propagates padding NaN into real rows.** Through layers 0-2 the 32
+  real rows stayed clean while padding rows were NaN (`bad_real = 0`); at layer 3,
+  the first attention layer, all 2048 rows went bad including the real ones.
+  Padding sits strictly *after* the real tokens and every op here is per-token or
+  causal, so a causal-correct attention cannot do that. The inverse fix removes
+  the NaN source, but this contamination path is a separate defect and would bite
+  again for any other source of non-finite values.
+- **The GDN state absorbs padding tokens.** `forward_paged` has no per-token
+  validity mask, so all 2048 bucket rows enter the recurrence and the final state
+  written to the cache includes padding contributions. Numerically harmless now,
+  but it is not the state a decode continuation should resume from. Any mask must
+  come from a tensor, never a Python int (section 4.2).
 
 ## Where the 27B stands
 
 Downloaded (18 shards, 52 GB, 1199 keys: 850 text, 333 visual, 15 MTP) and all
-four load blockers above are fixed. It was deliberately **not** compiled: a
-64-layer cold compile that reproduces these NaNs would cost hours and teach
-nothing the 0.8B has not already shown more cheaply.
+four load blockers above are fixed. Not yet compiled.

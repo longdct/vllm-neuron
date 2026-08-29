@@ -88,6 +88,33 @@ def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
 # ===========================================================================
 
 
+def _block_substitution_masks(
+    n: int, dtype: torch.dtype, device: torch.device
+) -> list[torch.Tensor]:
+    """One constant mask per level of the block substitution.
+
+    Level ``b`` merges adjacent ``b``-sized diagonal blocks into ``2b`` ones, so
+    its mask selects exactly the lower off-diagonal quadrant of each ``2b``
+    block: same ``2b`` block, different ``b`` half, below the diagonal.
+
+    ``log2(n)`` masks, all compile-time constants.
+    """
+    idx = torch.arange(n, device=device)
+    row, col = idx[:, None], idx[None, :]
+    masks = []
+    b = 1
+    while b < n:
+        same_pair = row.div(2 * b, rounding_mode="floor") == col.div(
+            2 * b, rounding_mode="floor"
+        )
+        other_half = row.div(b, rounding_mode="floor") != col.div(
+            b, rounding_mode="floor"
+        )
+        masks.append((same_pair & other_half & (row > col)).to(dtype))
+        b *= 2
+    return masks
+
+
 def unit_triangular_inverse(a: torch.Tensor) -> torch.Tensor:
     """Invert ``I - A`` for strictly lower-triangular ``A``, without a scan.
 
@@ -99,16 +126,40 @@ def unit_triangular_inverse(a: torch.Tensor) -> torch.Tensor:
 
     which is ``chunk_size - 1`` sequential, data-dependent, in-place slice
     writes -- 63 of them at the default chunk size. Under XLA that unrolls into
-    63 op groups *per chunk per head per layer*.
+    63 op groups *per chunk per head per layer*, so it cannot be used as-is.
 
-    ``A`` is strictly lower triangular, hence nilpotent with ``A^n == 0``, so
+    **Do not replace this with the Neumann/binary-powering identity.** ``A`` is
+    nilpotent, so ``(I - A)^-1 == I + A + ... + A^(n-1) ==
+    (I + A)(I + A^2)(I + A^4)...(I + A^(n/2))``, which is algebraically exact and
+    needs only ``2*log2(n)`` matmuls. It is also catastrophically unstable for
+    the matrices this layer actually produces, and it was the cause of a
+    whole-model NaN.
 
-        (I - A)^-1  =  I + A + A^2 + ... + A^(n-1)
-                    =  (I + A)(I + A^2)(I + A^4) ... (I + A^(n/2))
+    Here ``A = -(k_beta @ key^T) * decay_mask`` with l2-normalized keys, so when
+    successive keys are near-identical -- which bucket padding guarantees, since
+    every padded row carries the same token -- ``k . k == 1`` and ``A`` is close
+    to ``-beta`` times the strictly-lower-triangular ones matrix. Its powers
+    then *grow*: at ``n = 64`` and ``beta = 0.99``, ``max|A^32| = 3.4e17`` while
+    the true inverse is bounded by 1. The sum is pure cancellation, and fp32
+    keeps none of it -- measured error 6.9e10 against a bounded-by-1 answer.
+    fp64 does not rescue it either (error 64). Random test matrices hide this
+    completely: entries of 0.1 give ``max|A^32| = 5e-24``.
 
-    by the binary expansion of the exponents. That is ``2 * log2(n)`` matmuls --
-    10 rather than 63 at n = 64 -- with a loop bound that is a compile-time
-    constant, so it unrolls to a fixed, small, shape-independent graph.
+    So instead: recursive 2x2 block substitution. For ``M = I - A`` split into
+    two ``b``-sized halves,
+
+        M = [[M11, 0  ]        M^-1 = [[X11,         0  ]
+             [M21, M22]]               [X22 A21 X11, X22]]
+
+    If ``x`` already holds the inverses of the ``b``-sized diagonal blocks (so it
+    is block diagonal), then ``x @ a @ x`` restricted to a ``2b`` block's lower
+    quadrant is exactly ``X22 @ A21 @ X11``. One masked update per level and
+    ``log2(n)`` levels -- 12 matmuls at ``n = 64`` against the binary form's 10,
+    with the same static shapes and compile-time-constant bound.
+
+    No power of ``A`` is ever formed. Every factor is either a true inverse or a
+    sub-block of ``A``, so there is nothing to cancel: measured error 3e-8 on the
+    same matrices, and exact at ``beta = 1``.
 
     Args:
         a: ``[..., n, n]``, strictly lower triangular.
@@ -119,13 +170,10 @@ def unit_triangular_inverse(a: torch.Tensor) -> torch.Tensor:
     n = a.shape[-1]
     eye = torch.eye(n, dtype=a.dtype, device=a.device)
 
-    result = eye + a
-    power = a
-    span = 1
-    while span * 2 < n:
-        power = power @ power
-        result = result @ (eye + power)
-        span *= 2
+    # Seed: every 1x1 diagonal block of a unit triangular matrix inverts to 1.
+    result = eye.expand_as(a).clone()
+    for mask in _block_substitution_masks(n, a.dtype, a.device):
+        result = result + mask * (result @ a @ result)
     return result
 
 

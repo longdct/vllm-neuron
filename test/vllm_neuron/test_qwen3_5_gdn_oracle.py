@@ -26,6 +26,7 @@ from transformers.models.qwen3_5.configuration_qwen3_5 import (  # noqa: E402
 from vllm_neuron.model.qwen3_5.config import Qwen3_5TextConfig  # noqa: E402
 from vllm_neuron.model.qwen3_5.gated_deltanet import (  # noqa: E402
     Qwen3_5GatedDeltaNet,
+    _block_substitution_masks,
     causal_conv1d,
     causal_conv1d_with_state,
     chunk_gated_delta_rule,
@@ -158,20 +159,97 @@ def test_blocked_inverse_is_a_true_inverse(n):
     torch.testing.assert_close(unit_triangular_inverse(a) @ (eye - a), eye, **ALGEBRAIC)
 
 
+@pytest.mark.parametrize("beta", [0.5, 0.9, 0.99, 1.0])
+def test_inverse_is_stable_when_successive_keys_are_near_identical(beta):
+    """Regression: the failure mode random test matrices cannot produce.
+
+    ``a`` here is ``-(k_beta @ key^T) * decay_mask`` with l2-normalized keys, so
+    successive near-identical keys give ``k . k == 1`` and drive ``a`` towards
+    ``-beta`` times the strictly-lower ones matrix. Bucket padding guarantees
+    this: every padded row carries the same token.
+
+    The binary-powering form that used to live in ``unit_triangular_inverse`` is
+    algebraically exact and fails here by ten orders of magnitude, because
+    ``max|a^32| = 3.4e17`` at ``beta = 0.99`` while the true inverse is bounded
+    by 1 -- the sum is entirely cancellation. The tests above miss it because
+    ``randn * 0.3`` gives ``max|a^32| = 5e-24``.
+
+    Ground truth is an fp64 triangular solve, not the fp32 reference loop, so
+    this pins accuracy rather than agreement between two fp32 routines.
+    """
+    n = 64
+    a = torch.full((n, n), -float(beta), dtype=torch.float32).tril(-1)
+
+    eye64 = torch.eye(n, dtype=torch.float64)
+    exact = torch.linalg.solve_triangular(
+        eye64 - a.to(torch.float64), eye64, upper=False
+    )
+
+    got = unit_triangular_inverse(a)
+    assert torch.isfinite(got).all()
+    # The true inverse is bounded by 1 for this family; anything larger is the
+    # cancellation blow-up rather than a real value.
+    assert got.abs().max() <= 1.0 + 1e-4, f"inverse blew up to {got.abs().max()}"
+    torch.testing.assert_close(
+        got, exact.to(torch.float32), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_chunk_rule_stays_finite_on_a_long_run_of_identical_tokens():
+    """End-to-end guard on the same structure, at bucket length.
+
+    A 2048-token bucket holding one repeated token is what a short prompt
+    actually looks like on this backend. Before the block-substitution inverse
+    this produced 1472 NaN rows and a non-finite final state, which then
+    poisoned the state cache and every later decode step.
+    """
+    torch.manual_seed(0)
+    batch, seq, heads, k_dim, v_dim = 1, 2048, 4, 64, 64
+
+    one_token_q = torch.randn(1, 1, heads, k_dim)
+    one_token_k = torch.randn(1, 1, heads, k_dim)
+    one_token_v = torch.randn(1, 1, heads, v_dim)
+    query = one_token_q.expand(batch, seq, heads, k_dim).contiguous()
+    key = one_token_k.expand(batch, seq, heads, k_dim).contiguous()
+    value = one_token_v.expand(batch, seq, heads, v_dim).contiguous()
+
+    # beta near 1 and negligible decay is the worst case, and is what the real
+    # gates produce on a run of identical tokens.
+    beta = torch.full((batch, seq, heads), 0.99)
+    g = torch.full((batch, seq, heads), -1e-4)
+
+    out, state = chunk_gated_delta_rule(
+        query, key, value, g=g, beta=beta, chunk_size=64, initial_state=None
+    )
+    assert torch.isfinite(out).all(), "chunk output went non-finite on repeated tokens"
+    assert torch.isfinite(state).all(), "final state went non-finite -- corrupts decode"
+
+
 def test_blocked_inverse_uses_no_python_scan_over_the_chunk():
     """Structural guard: iteration count must be logarithmic, not linear.
 
     A per-row scan is what unrolls into 63 op groups per chunk per head per
     layer under XLA, so the *shape* of the loop is the thing worth pinning --
     not merely the result, which the parity test above already covers.
+
+    This deliberately does not pin *which* logarithmic scheme is used. It first
+    did, by asserting on the doubling loop's ``span *= 2``, and that scheme
+    turned out to be numerically unusable here (see the near-identical-keys
+    regression test above). A structure test should constrain the graph, which
+    is what the compiler cares about, and leave the numerics to the accuracy
+    tests -- pinning the implementation made the wrong algorithm look load
+    bearing.
     """
     source = code_of(unit_triangular_inverse)
+    helper = code_of(_block_substitution_masks)
 
-    assert "while" in source
-    # No per-row forward substitution.
+    # No per-row forward substitution, in either the function or its helper.
     assert "range(1," not in source
-    # A doubling loop: the bound is logarithmic in the chunk size.
-    assert "span * 2" in source or "span *= 2" in source
+    assert "range(1," not in helper
+    # The level bound doubles, so it is logarithmic in the chunk size.
+    assert "b *= 2" in helper
+    # No power of the input is formed: that is what cancels catastrophically.
+    assert "@ power" not in source and "power @" not in source
 
 
 def test_blocked_inverse_iteration_count_is_logarithmic():

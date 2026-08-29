@@ -468,10 +468,16 @@ def _prepare_chunk_scan(query, key, value, g, beta, chunk_size, use_qk_l2norm):
 
     ``l2norm`` and ``unit_triangular_inverse`` are imported here rather than at
     module scope because ``gated_deltanet`` imports this module for the conv;
-    sharing them is deliberate, since ``unit_triangular_inverse`` is the
-    graph-explosion mitigation and is already pinned against HuggingFace's
-    forward-substitution loop. What the two paths must *not* share is the scan
-    itself, which is what the simulator test diffs.
+    sharing them is deliberate, and it earned its keep: the inverse turned out to
+    be numerically unusable on near-identical keys, and because both paths import
+    the one function, the device path was fixed by fixing the oracle.
+
+    Note the pin against HuggingFace's forward-substitution loop did *not* catch
+    that -- it compares on random matrices, where the failure cannot appear. The
+    test that pins it is the near-identical-keys regression in the oracle suite.
+
+    What the two paths must *not* share is the scan itself, which is what the
+    simulator test diffs.
     """
     from .gated_deltanet import l2norm, unit_triangular_inverse
 
