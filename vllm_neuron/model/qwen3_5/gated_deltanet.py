@@ -48,7 +48,12 @@ from .config import Qwen3_5TextConfig
 # kernel and its torch reference travel together -- the arrangement nki_mla.py
 # uses for its own oracle. Re-exported because this module is the layer's
 # public face.
-from .nki_gdn import causal_conv1d, causal_conv1d_with_state
+from .nki_gdn import (
+    can_use_chunk_scan_kernel,
+    causal_conv1d,
+    causal_conv1d_with_state,
+    chunk_gated_delta_rule_nki,
+)
 
 __all__ = [
     "Qwen3_5GatedDeltaNet",
@@ -298,6 +303,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.num_v_per_k = config.num_v_per_k
         self.conv_kernel_size = config.linear_conv_kernel_dim
 
+        #: Chunk width for the prefill delta rule. 64 is the reference default
+        #: and the widest the NKI scan accepts while leaving room for a
+        #: [chunk, chunk] tile alongside the state on one SBUF partition set.
+        #: Must stay in the kernel's accepted set (16/32/64/128).
+        self.chunk_size = 64
+
         self.key_dim = config.key_dim
         self.value_dim = config.value_dim
         self.conv_dim = config.conv_dim
@@ -400,10 +411,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_per_k, dim=2)
             key = key.repeat_interleave(self.num_v_per_k, dim=2)
 
-        rule = recurrent_gated_delta_rule if use_recurrent else chunk_gated_delta_rule
-        core_out, new_recurrent_state = rule(
-            query, key, value, g=g, beta=beta, initial_state=recurrent_state
-        )
+        # Decode is one token, so its recurrence has a single iteration and
+        # costs nothing to trace. Prefill takes the NKI scan when it is
+        # available, and the torch chunk rule otherwise -- the latter stays the
+        # oracle the kernel is diffed against, never a silent second
+        # implementation.
+        if use_recurrent:
+            core_out, new_recurrent_state = recurrent_gated_delta_rule(
+                query, key, value, g=g, beta=beta, initial_state=recurrent_state
+            )
+        elif can_use_chunk_scan_kernel(query, self.chunk_size):
+            core_out, new_recurrent_state = chunk_gated_delta_rule_nki(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                chunk_size=self.chunk_size,
+                initial_state=recurrent_state,
+            )
+        else:
+            core_out, new_recurrent_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                chunk_size=self.chunk_size,
+                initial_state=recurrent_state,
+            )
 
         z = self.in_proj_z(hidden_states).reshape(-1, self.head_v_dim)
         core_out = self.norm(core_out.reshape(-1, self.head_v_dim), z)

@@ -17,6 +17,13 @@ left zero-padding, so there is only one code path: always concatenate the
 state -- zeros for a fresh sequence -- and convolve with no padding. That
 removes a branch on "is this a new sequence?", which on a traced graph would be
 a data-dependent shape.
+
+Note on testing these on CPU. ``wrap_nki`` here is ``torch_neuronx.nki_hop``'s,
+matching every other kernel wrapper in this repo, and it requires real Neuron
+tensors -- ``VLLM_NEURON_CPU_MODE=1`` does not give it a CPU fallback. So the
+simulator tests drive ``nki.simulate(kernel[lnc])`` directly rather than going
+through the dispatchers below, which is the same arrangement
+``test_deepseek_v4_nki_simulator.py`` uses.
 """
 
 import logging
@@ -158,3 +165,418 @@ def causal_conv1d(
     )
     out, _ = causal_conv1d_with_state(hidden_states, state, weight, bias, activation)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Chunk scan: the sequential half of the delta rule
+# ---------------------------------------------------------------------------
+#
+# Only the inter-chunk state recurrence is sequential. Everything else the
+# chunked delta rule does -- the intra-chunk decay mask, the UT-transform
+# inverse, ``attn @ v_beta``, ``k_cumdecay`` -- is independent per chunk and
+# traces as ordinary batched tensor ops that do not unroll. So the kernel's job
+# is exactly the loop, and nothing more:
+#
+#   v_new_i     = v_i - k_cumdecay_i @ S
+#   out_i       = (q_i * exp(g_i)) @ S + attn_i @ v_new_i
+#   S           = S * exp(g_last_i) + (k_i * exp(g_last_i - g_i))^T @ v_new_i
+#
+# Four matmuls per chunk, all with a contraction dimension of at most 128.
+#
+# Every operand is pre-arranged host-side so each matmul is a direct
+# ``nc_matmul(dst, stationary, moving) == stationary.T @ moving`` with no
+# in-kernel transposes: what the tensor engine wants on its partition axis is
+# the contraction dimension.
+
+
+_gdn_chunk_scan_kernel = None
+_wrapped_gdn_chunk_scan = None
+
+try:  # pragma: no cover - depends on the installed nki
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
+    from torch_neuronx.nki_hop import wrap_nki
+
+    @nki.jit
+    def _gdn_chunk_scan_kernel(
+        q_g_T,          # [rows, chunks, k_dim, chunk]  stationary: q_i * exp(g_i)
+        k_cumdecay_T,   # [rows, chunks, k_dim, chunk]  stationary: k_cumdecay_i
+        attn_T,         # [rows, chunks, chunk, chunk]  stationary: attn_i^T
+        k_decay,        # [rows, chunks, chunk, k_dim]  stationary: k_i*exp(g_last-g_i)
+        v_base,         # [rows, chunks, chunk, v_dim]  moving: attn_i @ v_beta_i
+        g_last_rep,     # [rows, chunks, k_dim, 1]      exp(g_last_i), per-partition
+        state_in,       # [rows, k_dim, v_dim]
+    ):
+        """Sequential inter-chunk scan of the gated delta rule.
+
+        ``rows`` is batch and head folded together, so one launch covers a whole
+        layer -- the alternative, a Python loop over 48 heads, would recreate
+        exactly the per-call-site fan-out that made a three-layer DeepSeek-V4
+        graph take 2h52m to compile without emitting a NEFF.
+
+        Two nested ``nl.fori_loop``s, so the body is emitted once regardless of
+        head count or sequence length. ``nl.affine_range`` and
+        ``nl.static_range`` both unroll; only ``fori_loop`` does not.
+
+        Loop indices arrive as VirtualRegisters. ``int * reg`` and ``reg + reg``
+        are both rejected by the tracer, so index arithmetic is done in the SBUF
+        domain -- spill with ``register_store``, combine with
+        ``tensor_scalar``/``tensor_tensor``, reload with ``register_load`` --
+        and every access is register-offset ``.ap()``. Indexing ``tensor[i]``
+        with a register cannot narrow a leading dimension, which is the
+        unresolved blocker still sitting in ``nki_mla.py``.
+        """
+        rows, chunks, k_dim, chunk = q_g_T.shape
+        v_dim = v_base.shape[-1]
+
+        # Tuples, never frozensets: the tracer rejects `in <frozenset>`.
+        assert k_dim in (16, 32, 64, 128)
+        assert v_dim in (16, 32, 64, 128)
+        assert chunk in (16, 32, 64, 128)
+
+        out = nl.ndarray(
+            (rows, chunks, chunk, v_dim), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+        state_out = nl.ndarray(
+            (rows, k_dim, v_dim), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+
+        flat_q = q_g_T.reshape((rows * chunks * k_dim, chunk))
+        flat_kc = k_cumdecay_T.reshape((rows * chunks * k_dim, chunk))
+        flat_attn = attn_T.reshape((rows * chunks * chunk, chunk))
+        flat_kd = k_decay.reshape((rows * chunks * chunk, k_dim))
+        flat_v = v_base.reshape((rows * chunks * chunk, v_dim))
+        flat_g = g_last_rep.reshape((rows * chunks * k_dim, 1))
+        flat_out = out.reshape((rows * chunks * chunk, v_dim))
+        flat_state_in = state_in.reshape((rows * k_dim, v_dim))
+        flat_state_out = state_out.reshape((rows * k_dim, v_dim))
+
+        def per_row(r):
+            r_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.register_store(r_sb, r)
+
+            # Row bases for this (batch, head).
+            k_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=k_base, data=r_sb, op0=nl.multiply, operand0=chunks * k_dim
+            )
+            c_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=c_base, data=r_sb, op0=nl.multiply, operand0=chunks * chunk
+            )
+            s_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=s_base, data=r_sb, op0=nl.multiply, operand0=k_dim
+            )
+            s_reg = nisa.register_alloc()
+            nisa.register_load(s_reg, s_base)
+
+            state = nl.ndarray((k_dim, v_dim), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=state,
+                src=flat_state_in.ap(
+                    pattern=[[v_dim, k_dim], [1, v_dim]],
+                    scalar_offset=s_reg,
+                    indirect_dim=0,
+                ),
+            )
+
+            def scan_chunk(i):
+                i_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.register_store(i_sb, i)
+
+                k_off = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    dst=k_off, data=i_sb, op0=nl.multiply, operand0=k_dim
+                )
+                nisa.tensor_tensor(dst=k_off, data1=k_off, data2=k_base, op=nl.add)
+                k_reg = nisa.register_alloc()
+                nisa.register_load(k_reg, k_off)
+
+                c_off = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    dst=c_off, data=i_sb, op0=nl.multiply, operand0=chunk
+                )
+                nisa.tensor_tensor(dst=c_off, data1=c_off, data2=c_base, op=nl.add)
+                c_reg = nisa.register_alloc()
+                nisa.register_load(c_reg, c_off)
+
+                q_t = nl.ndarray((k_dim, chunk), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=q_t,
+                    src=flat_q.ap(
+                        pattern=[[chunk, k_dim], [1, chunk]],
+                        scalar_offset=k_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                kc_t = nl.ndarray((k_dim, chunk), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=kc_t,
+                    src=flat_kc.ap(
+                        pattern=[[chunk, k_dim], [1, chunk]],
+                        scalar_offset=k_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                attn_t = nl.ndarray((chunk, chunk), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=attn_t,
+                    src=flat_attn.ap(
+                        pattern=[[chunk, chunk], [1, chunk]],
+                        scalar_offset=c_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                kd = nl.ndarray((chunk, k_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=kd,
+                    src=flat_kd.ap(
+                        pattern=[[k_dim, chunk], [1, k_dim]],
+                        scalar_offset=c_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                v_sb = nl.ndarray((chunk, v_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=v_sb,
+                    src=flat_v.ap(
+                        pattern=[[v_dim, chunk], [1, v_dim]],
+                        scalar_offset=c_reg,
+                        indirect_dim=0,
+                    ),
+                )
+                g_last = nl.ndarray((k_dim, 1), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=g_last,
+                    src=flat_g.ap(
+                        pattern=[[1, k_dim], [1, 1]],
+                        scalar_offset=k_reg,
+                        indirect_dim=0,
+                    ),
+                )
+
+                # v_new = v_i - k_cumdecay_i @ S
+                psum_vp = nl.ndarray((chunk, v_dim), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(psum_vp, kc_t, state)
+                v_new = nl.ndarray((chunk, v_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=v_new, data1=v_sb, data2=psum_vp, op=nl.subtract
+                )
+
+                # out_i = (q_i * exp(g_i)) @ S + attn_i @ v_new
+                psum_inter = nl.ndarray(
+                    (chunk, v_dim), dtype=nl.float32, buffer=nl.psum
+                )
+                nisa.nc_matmul(psum_inter, q_t, state)
+                inter = nl.ndarray((chunk, v_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=inter, src=psum_inter)
+
+                psum_intra = nl.ndarray(
+                    (chunk, v_dim), dtype=nl.float32, buffer=nl.psum
+                )
+                nisa.nc_matmul(psum_intra, attn_t, v_new)
+
+                chunk_out = nl.ndarray(
+                    (chunk, v_dim), dtype=nl.float32, buffer=nl.sbuf
+                )
+                # At most one PSUM operand per tensor_tensor.
+                nisa.tensor_tensor(
+                    dst=chunk_out, data1=inter, data2=psum_intra, op=nl.add
+                )
+                nisa.dma_copy(
+                    dst=flat_out.ap(
+                        pattern=[[v_dim, chunk], [1, v_dim]],
+                        scalar_offset=c_reg,
+                        indirect_dim=0,
+                    ),
+                    src=chunk_out,
+                )
+
+                # S = S * exp(g_last) + k_decay_i^T @ v_new
+                psum_state = nl.ndarray(
+                    (k_dim, v_dim), dtype=nl.float32, buffer=nl.psum
+                )
+                nisa.nc_matmul(psum_state, kd, v_new)
+                decayed = nl.ndarray((k_dim, v_dim), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    dst=decayed, data=state, op0=nl.multiply, operand0=g_last
+                )
+                nisa.tensor_tensor(
+                    dst=state, data1=decayed, data2=psum_state, op=nl.add
+                )
+
+            nl.fori_loop(0, chunks, scan_chunk)
+            nisa.dma_copy(
+                dst=flat_state_out.ap(
+                    pattern=[[v_dim, k_dim], [1, v_dim]],
+                    scalar_offset=s_reg,
+                    indirect_dim=0,
+                ),
+                src=state,
+            )
+
+        nl.fori_loop(0, rows, per_row)
+        return out, state_out
+
+    _wrapped_gdn_chunk_scan = wrap_nki(_gdn_chunk_scan_kernel)
+except Exception as exc:  # noqa: BLE001
+    logger.debug("GDN chunk-scan kernel unavailable: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Host-side preparation and dispatch
+# ---------------------------------------------------------------------------
+
+
+def _prepare_chunk_scan(query, key, value, g, beta, chunk_size, use_qk_l2norm):
+    """Everything the chunked delta rule does *before* the sequential loop.
+
+    All of it is independent per chunk, so it stays in torch: batched tensor ops
+    trace to a fixed graph regardless of sequence length. Only the recurrence
+    needs a kernel.
+
+    Operands come back pre-transposed into the layout ``nc_matmul`` wants -- the
+    contraction dimension on the partition axis -- so the kernel performs no
+    transposes of its own.
+
+    ``l2norm`` and ``unit_triangular_inverse`` are imported here rather than at
+    module scope because ``gated_deltanet`` imports this module for the conv;
+    sharing them is deliberate, since ``unit_triangular_inverse`` is the
+    graph-explosion mitigation and is already pinned against HuggingFace's
+    forward-substitution loop. What the two paths must *not* share is the scan
+    itself, which is what the simulator test diffs.
+    """
+    from .gated_deltanet import l2norm, unit_triangular_inverse
+
+    if use_qk_l2norm:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    query, key, value, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
+    )
+    batch, heads, seq_len, k_dim = key.shape
+    v_dim = value.shape[-1]
+
+    pad = (chunk_size - seq_len % chunk_size) % chunk_size
+    if pad:
+        query = F.pad(query, (0, 0, 0, pad))
+        key = F.pad(key, (0, 0, 0, pad))
+        value = F.pad(value, (0, 0, 0, pad))
+        beta = F.pad(beta, (0, pad))
+        g = F.pad(g, (0, pad))
+
+    query = query * (k_dim**-0.5)
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    def to_chunks(x):
+        return x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+
+    q_c, k_c, k_beta_c, v_beta_c = (to_chunks(x) for x in (query, key, k_beta, v_beta))
+    g_c = g.reshape(batch, heads, -1, chunk_size).cumsum(dim=-1)
+
+    decay_mask = (g_c.unsqueeze(-1) - g_c.unsqueeze(-2)).tril().exp().float().tril()
+    strict_upper = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
+    )
+    a = -((k_beta_c @ k_c.transpose(-1, -2)) * decay_mask).masked_fill(strict_upper, 0)
+    attn = unit_triangular_inverse(a)
+
+    v_base = attn @ v_beta_c
+    k_cumdecay = attn @ (k_beta_c * g_c.exp().unsqueeze(-1))
+
+    causal = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
+    )
+    attn_i = (q_c @ k_c.transpose(-1, -2) * decay_mask).masked_fill(causal, 0)
+
+    g_last = g_c[..., -1, None]
+    q_g = q_c * g_c.unsqueeze(-1).exp()
+    k_decay = k_c * (g_last.unsqueeze(-1) - g_c.unsqueeze(-1)).exp()
+
+    rows = batch * heads
+    num_chunks = q_c.shape[2]
+
+    def fold(x):
+        return x.reshape(rows, *x.shape[2:]).contiguous()
+
+    return {
+        "q_g_T": fold(q_g.transpose(-1, -2)),
+        "k_cumdecay_T": fold(k_cumdecay.transpose(-1, -2)),
+        "attn_T": fold(attn_i.transpose(-1, -2)),
+        "k_decay": fold(k_decay),
+        "v_base": fold(v_base),
+        "g_last_rep": fold(
+            g_last.exp()
+            .reshape(batch, heads, num_chunks, 1, 1)
+            .expand(batch, heads, num_chunks, k_dim, 1)
+        ),
+        "batch": batch,
+        "heads": heads,
+        "num_chunks": num_chunks,
+        "seq_len": seq_len,
+        "k_dim": k_dim,
+        "v_dim": v_dim,
+    }
+
+
+def can_use_chunk_scan_kernel(query: torch.Tensor, chunk_size: int) -> bool:
+    """Whether the scan kernel can serve this call."""
+    if _wrapped_gdn_chunk_scan is None:
+        return False
+    if not can_run_kernel(query):
+        return False
+    # Partition-axis bound, and the tracer's assert list.
+    return chunk_size in (16, 32, 64, 128)
+
+
+def chunk_gated_delta_rule_nki(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor | None = None,
+    use_qk_l2norm: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device path for the chunked gated delta rule.
+
+    Same contract as ``gated_deltanet.chunk_gated_delta_rule``: inputs
+    ``[B, T, H, D]``, returns ``(output, final_state)``.
+    """
+    initial_dtype = query.dtype
+    prep = _prepare_chunk_scan(query, key, value, g, beta, chunk_size, use_qk_l2norm)
+
+    rows = prep["batch"] * prep["heads"]
+    k_dim, v_dim = prep["k_dim"], prep["v_dim"]
+
+    if initial_state is None:
+        state_in = torch.zeros(
+            rows, k_dim, v_dim, dtype=torch.float32, device=query.device
+        )
+    else:
+        state_in = (
+            initial_state.reshape(rows, k_dim, v_dim).to(torch.float32).contiguous()
+        )
+
+    out, state_out = _wrapped_gdn_chunk_scan[1](
+        prep["q_g_T"],
+        prep["k_cumdecay_T"],
+        prep["attn_T"],
+        prep["k_decay"],
+        prep["v_base"],
+        prep["g_last_rep"],
+        state_in,
+    )
+
+    batch, heads, seq_len = prep["batch"], prep["heads"], prep["seq_len"]
+    out = out.reshape(batch, heads, -1, v_dim)[:, :, :seq_len]
+    out = out.transpose(1, 2).contiguous().to(initial_dtype)
+    return out, state_out.reshape(batch, heads, k_dim, v_dim)

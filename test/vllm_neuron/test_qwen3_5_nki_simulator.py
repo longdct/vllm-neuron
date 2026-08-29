@@ -29,9 +29,40 @@ pytestmark = pytest.mark.skipif(
 nki = pytest.importorskip("nki")
 
 from vllm_neuron.model.qwen3_5 import nki_gdn  # noqa: E402
+from vllm_neuron.model.qwen3_5.gated_deltanet import (  # noqa: E402
+    chunk_gated_delta_rule,
+)
 
 # bf16 online arithmetic vs an fp32 reference; the repo's standing NKI tolerance.
 TOL = dict(rtol=0.025, atol=0.025)
+
+
+def code_of(fn) -> str:
+    """Source of ``fn`` with docstrings removed.
+
+    Structure tests assert on source text, and these kernels *document* the
+    constructs they avoid in order to explain why. Matching raw source would
+    fire on the explanation rather than the code.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)
+        ):
+            continue
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(tree)
 
 
 def _requires_conv_kernel():
@@ -124,3 +155,148 @@ def test_state_carry_across_a_split_is_seamless():
     second = _simulate_conv(torch.cat([carried, x[..., 6:]], dim=-1), weight)
 
     torch.testing.assert_close(torch.cat([first, second], dim=-1), whole, **TOL)
+
+
+# ---------------------------------------------------------------------------
+# Chunk scan
+# ---------------------------------------------------------------------------
+
+
+def _requires_scan_kernel():
+    if nki_gdn._wrapped_gdn_chunk_scan is None:
+        pytest.skip("GDN chunk-scan kernel unavailable in this build")
+
+
+def _inputs(batch, heads, chunks, chunk, k_dim, v_dim, seed=0):
+    torch.manual_seed(seed)
+    tokens = chunks * chunk
+    return (
+        torch.randn(batch, tokens, heads, k_dim, dtype=torch.float32),
+        torch.randn(batch, tokens, heads, k_dim, dtype=torch.float32),
+        torch.randn(batch, tokens, heads, v_dim, dtype=torch.float32),
+        # g is a log-decay: negative, small magnitude.
+        -torch.rand(batch, tokens, heads, dtype=torch.float32) * 0.5,
+        torch.rand(batch, tokens, heads, dtype=torch.float32),
+    )
+
+
+def _simulate_scan(prep, state_in):
+    out, state_out = nki.simulate(nki_gdn._gdn_chunk_scan_kernel[1])(
+        prep["q_g_T"],
+        prep["k_cumdecay_T"],
+        prep["attn_T"],
+        prep["k_decay"],
+        prep["v_base"],
+        prep["g_last_rep"],
+        state_in,
+    )
+    return torch.as_tensor(out), torch.as_tensor(state_out)
+
+
+def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None):
+    """Mirror chunk_gated_delta_rule_nki, routing the kernel through simulate()."""
+    prep = nki_gdn._prepare_chunk_scan(q, k, v, g, beta, chunk, True)
+    rows = prep["batch"] * prep["heads"]
+    k_dim, v_dim = prep["k_dim"], prep["v_dim"]
+
+    if initial_state is None:
+        state_in = torch.zeros(rows, k_dim, v_dim, dtype=torch.float32)
+    else:
+        state_in = initial_state.reshape(rows, k_dim, v_dim).float().contiguous()
+
+    out, state_out = _simulate_scan(prep, state_in)
+    batch, heads, seq_len = prep["batch"], prep["heads"], prep["seq_len"]
+    out = out.reshape(batch, heads, -1, v_dim)[:, :, :seq_len].transpose(1, 2)
+    return out.contiguous(), state_out.reshape(batch, heads, k_dim, v_dim)
+
+
+@pytest.mark.parametrize(
+    "batch,heads,chunks,chunk,dim",
+    [
+        (1, 1, 3, 16, 16),      # smallest useful case
+        (2, 3, 3, 16, 16),      # batch and heads folded into one launch
+        (1, 2, 3, 64, 128),     # the shipped geometry: chunk 64, k=v=128
+    ],
+)
+def test_chunk_scan_matches_the_torch_oracle(batch, heads, chunks, chunk, dim):
+    """The kernel scan must agree with the independent torch implementation."""
+    _requires_scan_kernel()
+    q, k, v, g, beta = _inputs(batch, heads, chunks, chunk, dim, dim)
+
+    expected, expected_state = chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, chunk_size=chunk, initial_state=None
+    )
+    actual, actual_state = _scan_via_simulator(q, k, v, g, beta, chunk)
+
+    torch.testing.assert_close(actual, expected, **TOL)
+    torch.testing.assert_close(actual_state, expected_state, **TOL)
+
+
+def test_chunk_scan_carries_a_nonzero_initial_state():
+    """Continuing a sequence is the chunked-prefill case."""
+    _requires_scan_kernel()
+    batch, heads, chunks, chunk, dim = 1, 2, 3, 16, 16
+    q, k, v, g, beta = _inputs(batch, heads, chunks, chunk, dim, dim, seed=1)
+    torch.manual_seed(7)
+    state = torch.randn(batch, heads, dim, dim, dtype=torch.float32) * 0.1
+
+    expected, expected_state = chunk_gated_delta_rule(
+        q, k, v, g=g, beta=beta, chunk_size=chunk, initial_state=state
+    )
+    actual, actual_state = _scan_via_simulator(
+        q, k, v, g, beta, chunk, initial_state=state
+    )
+
+    torch.testing.assert_close(actual, expected, **TOL)
+    torch.testing.assert_close(actual_state, expected_state, **TOL)
+
+
+def test_heads_do_not_leak_into_each_other():
+    """Each row carries its own state; a shared SBUF tile would blend them."""
+    _requires_scan_kernel()
+    chunks, chunk, dim = 3, 16, 16
+    q, k, v, g, beta = _inputs(1, 2, chunks, chunk, dim, dim, seed=3)
+
+    both, _ = _scan_via_simulator(q, k, v, g, beta, chunk)
+    head0, _ = _scan_via_simulator(
+        q[:, :, :1], k[:, :, :1], v[:, :, :1], g[:, :, :1], beta[:, :, :1], chunk
+    )
+
+    torch.testing.assert_close(both[:, :, :1], head0, **TOL)
+
+
+def test_scan_kernel_uses_fori_loop_not_an_unrolled_range():
+    """Structural: the loop must be emitted once, not unrolled per chunk.
+
+    This is the invariant that separates a compile measured in seconds from the
+    DeepSeek-V4 MLA kernel's 2h52m with no NEFF, and it is not visible in any
+    numerical result -- hence a source-level assertion.
+    """
+    _requires_scan_kernel()
+    source = code_of(nki_gdn._gdn_chunk_scan_kernel)
+
+    assert source.count("fori_loop") == 2      # one per row, one per chunk
+    assert "affine_range" not in source
+    assert "static_range" not in source
+    # Register-offset addressing, never tensor[i] with a register index.
+    assert "scalar_offset=" in source
+    # State is carried in SBUF across iterations, per the fori_loop contract.
+    assert "buffer=nl.sbuf" in source
+    # Outputs only in shared HBM.
+    assert source.count("buffer=nl.shared_hbm") == 2
+
+
+def test_scan_kernel_allocates_nothing_shaped_by_the_sequence():
+    """No [chunks, ...] SBUF tile: allocations must be per-chunk, not per-bucket.
+
+    ``[Q, history, ...]`` allocations are what the DeepSeek-V4 Q512 investigation
+    identified as the in-kernel half of the explosion, and its acceptance
+    criteria call for a structural test that rejects them.
+    """
+    _requires_scan_kernel()
+    source = code_of(nki_gdn._gdn_chunk_scan_kernel)
+
+    for line in source.splitlines():
+        if "buffer=nl.sbuf" in line or "buffer=nl.psum" in line:
+            assert "chunks" not in line, line
+            assert "rows" not in line, line
