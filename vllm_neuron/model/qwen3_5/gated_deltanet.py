@@ -630,14 +630,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cached = meta.get("cached_seq_len")
         if cached is not None:
             fresh = cached.reshape(-1).to(torch.int64) > 0
-            # Cast the mask to *each* state's own dtype. The two states have
-            # different dtypes on purpose -- the conv state is bf16 and the
-            # recurrent state is an fp32 accumulator -- so a single fp32 mask
-            # silently promotes the conv state to fp32. That survives CPU
-            # (torch just promotes) but on device the promoted state reaches
-            # the depthwise conv through torch.cat and the kernel rejects it:
-            # "nc_matmul: if one input is tfloat32/float32, both must be. Got
-            # stationary=bfloat16, moving=float32".
+            # Cast the mask to *each* state's own dtype rather than building
+            # one mask and reusing it. get_kv_spec stores both states at the
+            # same dtype today, but a mask built at one state's dtype and
+            # multiplied into the other silently promotes it whenever they
+            # ever differ, and that promotion survives CPU (torch just
+            # promotes) only to fail on device, where the promoted conv state
+            # reaches the depthwise conv through torch.cat and the kernel
+            # rejects the pair: "nc_matmul: if one input is tfloat32/float32,
+            # both must be. Got stationary=bfloat16, moving=float32". Deriving
+            # each mask from its own state keeps that impossible by
+            # construction.
             conv_keep = fresh.to(conv_state.dtype)
             recurrent_keep = fresh.to(recurrent_state.dtype)
             # Broadcast the mask over each state's trailing dims.

@@ -18,6 +18,22 @@ RESULT {"tensor_parallel_size": 8, "visible_cores": "32-39",
 That run has the **chunk-scan NKI kernel on its torch fallback**; the depthwise
 conv kernel is active. See "Open blocker" below.
 
+The same configuration runs with **both GDN states stored at bf16** instead of
+fp32 (`mamba_state_dtype=bfloat16`), on the same devices and geometry:
+
+```
+RESULT {"tensor_parallel_size": 8, "visible_cores": "32-39",
+        "prompt_length": 32, "token_ids": [449, 731, 154, 695, 337, 385, 413, 850]}
+```
+
+Three of eight tokens match the fp32-state run before the sequences diverge,
+which is what a rounded state should do on random weights at this scale -- the
+top1/top2 logit gap here is ~0.04, so nothing about token identity is evidence
+either way (see the caveat above). The claim this run supports is narrow and
+structural: **both storage dtypes compile and execute at TP=8**, with no
+`aot_autograd` view-mutation error and no `nc_matmul` operand-dtype error.
+Whether bf16 storage is numerically acceptable is a real-checkpoint question.
+
 The fixture uses random weights, so this establishes *structure*, not accuracy --
 the DeepSeek-V4 record is explicit that tiny-model logits cannot settle numerical
 questions (`deepseek-v4-tiny-tp1-neuron-investigation.md:36-43`). Two passing
@@ -87,23 +103,59 @@ tensor-parallel work.
    dtype-consistent regardless of how the cache is typed. The function already
    treated `hidden_states.dtype` as authoritative on return.
 
-## Design change, flagged for review
+## Both GDN states share one storage dtype
 
-`get_kv_spec` now declares **both** GDN states fp32 rather than bf16 conv + fp32
-recurrent. The runner carves both from one raw page
-(`neuron_model_runner.py:8554`, mirroring vLLM's GPU carving) and the model
-writes both back in place; two views over one storage with different dtypes,
-each mutated, is rejected:
+`get_kv_spec` declares the conv window and the recurrent state at **the same**
+dtype, chosen by `Qwen3_5TextConfig.mamba_state_dtype` (`float32` by default,
+`bfloat16` supported). It is one knob and not two on purpose.
+
+**Why they cannot differ.** The runner carves both states out of a single raw
+page as two strided views over one storage (`neuron_model_runner.py:8546`), and
+the model mutates both in place -- that in-place write *is* how the state
+survives to the next step. Tracing rejects the pair:
 
 ```
 AssertionError: aot_autograd() does not yet handle input mutations on views
 with different dtypes.
 ```
 
-Matching the dtypes is the cheap way out. The conv window is ~2% of the page, so
-the real 27B pays **+1.9%** state memory. The better fix is to give each state
-its own allocation instead of sharing a page; that changes cache accounting, so
-it was left as a deliberate choice.
+**Casting does not dodge it.** This is worth stating because it is the obvious
+first move and it does not work. The rejected condition is *two differing-dtype
+views of one storage, both mutated* -- a property of the storage, not of any
+value. Whatever you cast, the write must still land back in the view, so the
+condition is unchanged. Only two things remove it: make the dtypes equal, or
+stop sharing the storage.
+
+Note this is a **tracer** limitation, not a layout one. vLLM's own `MambaSpec`
+takes a per-state `dtypes` tuple (`kv_cache_interface.py:629-646`) and
+`kda_state_dtype` ships a genuinely mixed `(model_dtype, float32)` pair, on the
+identical carving (`gpu_model_runner.py:7160-7181`). It works there because the
+state writes happen inside custom kernels the tracer never enters.
+
+**Which dtype.** fp32 keeps the recurrent accumulator exact and is the
+conservative default here. bf16 is what **vLLM itself defaults to** for this
+architecture: `gated_delta_net_state_dtype` -> `_mamba_state_dtype` with
+`mamba_ssm_cache_dtype="auto"` makes the recurrent state follow the model dtype,
+and fp32 is opt-in via `--mamba-ssm-cache-dtype float32`. So an earlier note in
+this document -- that the recurrent state "has to be fp32" -- was stricter than
+upstream and is corrected here.
+
+Internal arithmetic is fp32 either way: `chunk_gated_delta_rule`,
+`recurrent_gated_delta_rule` and the NKI path all upcast the incoming state on
+entry. The storage dtype therefore rounds the state once per step; it does not
+degrade the arithmetic.
+
+The trade is a straight halving of the state page. Against the real 27B that is
+the difference between paying +1.9% (matching upward to fp32) and saving ~49%
+(matching downward to bf16) -- so bf16 is worth measuring on a real checkpoint
+before fp32 is left as the default. Giving each state its own allocation would
+lift the restriction entirely and allow a true mixed pair, but that changes
+cache accounting and is left open.
+
+Both settings are covered by tests -- the declaration invariant and the page
+halving in `test_qwen3_5_state_cache.py`, a prefill->decode round trip through
+the real write-back seam in `test_qwen3_5_paged_state.py` -- and both are
+verified on device at TP=8 (see Result above).
 
 ## Blockers for serving a real checkpoint
 

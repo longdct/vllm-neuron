@@ -43,6 +43,11 @@ FULL_ATTENTION = "full_attention"
 #: exists. See docs/model-dev/ and the plan's section 1.5.
 MAX_KERNEL_HEAD_DIM = 128
 
+#: Storage dtypes the paged GDN state may use. Both states share one value --
+#: see ``mamba_state_dtype``. fp32 keeps the recurrent accumulator exact; bf16
+#: halves the page and is what vLLM defaults to for this architecture.
+SUPPORTED_STATE_DTYPES = frozenset({"float32", "bfloat16"})
+
 
 def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     """Build a dataclass from an HF config sub-object.
@@ -134,8 +139,19 @@ class Qwen3_5TextConfig:
     linear_key_head_dim: int = 128
     linear_value_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
-    #: The recurrent state is accumulated in fp32 regardless of --kv-cache-dtype.
-    mamba_ssm_dtype: str = "float32"
+    #: Storage dtype for *both* paged GDN states -- the conv window and the
+    #: recurrent state alike. They are deliberately one knob and not two: the
+    #: runner carves both from a single raw page as strided views over one
+    #: storage (neuron_model_runner.py:8546) and the model mutates both in
+    #: place, and aot_autograd refuses input mutations on views of one storage
+    #: with differing dtypes. Internal arithmetic is fp32 whatever this says --
+    #: every consumer upcasts the state on entry -- so this chooses only the
+    #: precision the state is *stored* at between steps. "bfloat16" is what
+    #: vLLM itself defaults to for this architecture (mamba_ssm_cache_dtype
+    #: "auto" makes the recurrent state follow the model dtype) and halves
+    #: state memory; "float32" keeps the accumulator exact across long
+    #: sequences and is the conservative default here.
+    mamba_state_dtype: str = "float32"
     output_gate_type: str = "swish"
 
     # -- Layer schedule. Either given explicitly, or derived from the interval.
@@ -250,6 +266,13 @@ class Qwen3_5TextConfig:
             )
         if self.linear_conv_kernel_dim < 1:
             raise ValueError("linear_conv_kernel_dim must be >= 1.")
+        if self.mamba_state_dtype not in SUPPORTED_STATE_DTYPES:
+            raise ValueError(
+                f"mamba_state_dtype={self.mamba_state_dtype!r} is not supported; "
+                f"choose one of {sorted(SUPPORTED_STATE_DTYPES)}. Both GDN states "
+                "are stored at this dtype, so it must name a real torch dtype "
+                "the depthwise conv and the scan both accept."
+            )
 
     # ------------------------------------------------------------------
     # Derived geometry
@@ -331,8 +354,9 @@ class Qwen3_5TextConfig:
         return 2 * self.key_dim + self.value_dim
 
     @property
-    def ssm_dtype(self) -> torch.dtype:
-        return getattr(torch, self.mamba_ssm_dtype)
+    def state_dtype(self) -> torch.dtype:
+        """Storage dtype shared by both paged GDN states."""
+        return getattr(torch, self.mamba_state_dtype)
 
     @property
     def needs_single_shot_prefill(self) -> bool:

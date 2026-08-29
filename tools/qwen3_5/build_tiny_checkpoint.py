@@ -202,7 +202,14 @@ def build(args: argparse.Namespace) -> None:
     save_file(tensors, str(output / "model.safetensors"))
 
     shape = wrapper_config if args.wrapper_config else bare_text_config
-    (output / "config.json").write_text(json.dumps(shape(config), indent=2) + "\n")
+    emitted = shape(config)
+    if args.state_dtype is not None:
+        # Lands in the text sub-config either way: _from_hf_sub_config filters
+        # config.json against the dataclass fields, so the key flows through
+        # with no CLI plumbing on the runner side.
+        text = emitted.get("text_config", emitted)
+        text["mamba_state_dtype"] = args.state_dtype
+    (output / "config.json").write_text(json.dumps(emitted, indent=2) + "\n")
 
     linear = sum(1 for t in config.layer_types if t == "linear_attention")
     full = sum(1 for t in config.layer_types if t == "full_attention")
@@ -242,6 +249,14 @@ def main() -> None:
         "--value-split",
         action="store_true",
         help="Use 2 key heads so TP=8 exercises value-dimension splitting.",
+    )
+    parser.add_argument(
+        "--state-dtype",
+        choices=("float32", "bfloat16"),
+        default=None,
+        help="Storage dtype for both paged GDN states. Omit to leave the key "
+             "out of config.json and take the model default (float32). Both "
+             "states always share one dtype; see Qwen3_5TextConfig.",
     )
     build(parser.parse_args())
 

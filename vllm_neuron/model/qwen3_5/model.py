@@ -709,25 +709,33 @@ class Qwen3_5TextForCausalLM(nn.Module):
                         name=linear_layer_name(i),
                         num_kv_heads=1,
                         head_size=1,
-                        dtype=config.ssm_dtype,
+                        dtype=config.state_dtype,
                         cache_kind=CacheKind.MAMBA,
                         state_shapes=(conv_shape, recurrent_shape),
-                        # Both states are fp32. The recurrent one has to be --
-                        # it is an accumulator, whatever --kv-cache-dtype says.
-                        # The conv window would happily be bf16, but the runner
-                        # carves both states from one raw page
-                        # (neuron_model_runner.py:8554, mirroring vLLM's GPU
-                        # carving), and the model writes both back in place. Two
-                        # views over one storage with *different* dtypes, each
-                        # mutated, is rejected by this backend:
-                        # "aot_autograd() does not yet handle input mutations on
-                        # views with different dtypes". Matching the dtypes is
-                        # the cheap way out -- the conv window is ~2% of the
-                        # page, so the real 27B pays 1.9% more state memory.
-                        # The better fix is to give each state its own
-                        # allocation instead of sharing a page; that changes
-                        # cache accounting and is left as a deliberate choice.
-                        state_dtypes=(config.ssm_dtype, config.ssm_dtype),
+                        # One dtype for both states, never a mixed pair. The
+                        # runner carves the conv window and the recurrent state
+                        # from a single raw page as two strided views over one
+                        # storage (neuron_model_runner.py:8546, mirroring
+                        # vLLM's gpu_model_runner.py:7160), and the model
+                        # mutates both in place to persist them. Two views over
+                        # one storage with *different* dtypes, each mutated, is
+                        # rejected while tracing: "aot_autograd() does not yet
+                        # handle input mutations on views with different
+                        # dtypes". Note this is a tracer limitation, not a
+                        # layout one -- vLLM's own MambaSpec takes a per-state
+                        # dtype tuple and kda_state_dtype ships a genuinely
+                        # mixed pair, because its state writes happen inside
+                        # custom kernels the tracer never enters.
+                        #
+                        # Casting cannot dodge it: the write must still land
+                        # back in the view, so the condition survives any cast
+                        # of the value. Either both states move up to fp32 or
+                        # both move down to bf16; config.mamba_state_dtype
+                        # picks which, and every consumer upcasts to fp32
+                        # internally either way. Giving each state its own
+                        # allocation would lift the restriction entirely, but
+                        # that changes cache accounting and is left open.
+                        state_dtypes=(config.state_dtype, config.state_dtype),
                     )
                 )
         return KVSpec(layers=layers)

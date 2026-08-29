@@ -198,3 +198,105 @@ def test_fresh_mask_uses_no_python_branch_on_tensor_values():
             assert any(
                 subject in rendered for subject in PERMITTED_BRANCH_SUBJECTS
             ), rendered
+
+
+# ---------------------------------------------------------------------------
+# State storage dtype
+# ---------------------------------------------------------------------------
+#
+# Both paged states are stored at one dtype -- see Qwen3_5TextConfig's
+# mamba_state_dtype for why they cannot differ. The layer must not care which
+# one it is: every consumer upcasts the state to fp32 on entry, so the storage
+# dtype rounds the state once per step rather than degrading the arithmetic.
+
+
+def _typed_layer(config, state_dtype, num_slots=4):
+    layer = _layer(config, num_slots=num_slots)
+    layer.conv_state_cache = layer.conv_state_cache.to(state_dtype)
+    layer.recurrent_state_cache = layer.recurrent_state_cache.to(state_dtype)
+    return layer
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_prefill_decode_round_trip_at_either_state_dtype(state_dtype):
+    """Drives the write-back, which is where a dtype mismatch would surface.
+
+    A forward-only test never reaches ``index_copy_`` into the cache, so it
+    would miss exactly the failure this guards.
+    """
+    config = _config()
+    layer = _typed_layer(config, state_dtype)
+    torch.manual_seed(1)
+    hidden = torch.randn(7, config.hidden_size)
+
+    with torch.no_grad():
+        prefill = layer.forward_paged(
+            hidden[:-1], _metadata([0], cached_seq_len=0), is_decode=False
+        )
+        assert layer.conv_state_cache.dtype == state_dtype
+        assert layer.recurrent_state_cache.dtype == state_dtype
+        assert layer.recurrent_state_cache.abs().sum() > 0
+
+        decode = layer.forward_paged(
+            hidden[-1:], _metadata([0], cached_seq_len=6), is_decode=True
+        )
+
+    assert prefill.shape == (6, config.hidden_size)
+    assert decode.shape == (1, config.hidden_size)
+    assert torch.isfinite(prefill).all()
+    assert torch.isfinite(decode).all()
+    assert layer.conv_state_cache.dtype == state_dtype
+    assert layer.recurrent_state_cache.dtype == state_dtype
+
+
+def test_a_bfloat16_state_tracks_the_fp32_one():
+    """bf16 storage is a rounding of the same computation, not a different one.
+
+    Tolerance is bf16's own resolution at this scale, not a blanket rtol: the
+    state is rounded once on write-back and read straight back, so the decode
+    output may differ by that rounding and nothing more. A structural bug --
+    a state read from the wrong slot, a mask applied at the wrong dtype --
+    moves the output far outside this band.
+    """
+    config = _config()
+    outputs = {}
+    for state_dtype in (torch.float32, torch.bfloat16):
+        layer = _typed_layer(config, state_dtype)
+        torch.manual_seed(1)
+        hidden = torch.randn(7, config.hidden_size)
+        with torch.no_grad():
+            layer.forward_paged(
+                hidden[:-1], _metadata([0], cached_seq_len=0), is_decode=False
+            )
+            outputs[state_dtype] = layer.forward_paged(
+                hidden[-1:], _metadata([0], cached_seq_len=6), is_decode=True
+            )
+
+    torch.testing.assert_close(
+        outputs[torch.bfloat16], outputs[torch.float32], rtol=3e-2, atol=3e-2
+    )
+
+
+def test_a_fresh_sequence_is_masked_at_the_state_dtype():
+    """The validity mask must be built per state, never once and reused.
+
+    A mask built at one state's dtype and multiplied into the other promotes
+    it silently. CPU torch just promotes, so only the device rejects it -- the
+    depthwise conv sees the promoted state through torch.cat and fails with
+    "nc_matmul: if one input is tfloat32/float32, both must be". Asserting the
+    dtypes survive the mask keeps that from regressing without device time.
+    """
+    config = _config()
+    layer = _typed_layer(config, torch.bfloat16)
+    layer.conv_state_cache.normal_()
+    layer.recurrent_state_cache.normal_()
+
+    with torch.no_grad():
+        layer.forward_paged(
+            torch.randn(4, config.hidden_size),
+            _metadata([1], cached_seq_len=0),
+            is_decode=False,
+        )
+
+    assert layer.conv_state_cache.dtype == torch.bfloat16
+    assert layer.recurrent_state_cache.dtype == torch.bfloat16

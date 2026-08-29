@@ -184,3 +184,75 @@ def test_kv_spec_can_mix_mamba_and_full_attention_layers():
     kinds = {layer.cache_kind for layer in spec.layers}
     assert kinds == {CacheKind.FULL, CacheKind.MAMBA}
     assert len(spec.layers) == 8
+
+
+# ---------------------------------------------------------------------------
+# The two states must be declared at one dtype
+# ---------------------------------------------------------------------------
+#
+# layer_spec_to_vllm_spec above carries a mixed pair happily, and vLLM's own
+# MambaSpec is built for that -- kda_state_dtype ships a genuinely mixed pair,
+# because on GPU the state writes happen inside custom kernels the tracer never
+# enters. This backend traces them, so the Qwen3.5 model must not emit a mixed
+# pair: the runner carves both states from a single raw page as strided views
+# over one storage and the model mutates both in place, which fails with
+# "aot_autograd() does not yet handle input mutations on views with different
+# dtypes". No cast at the call site dodges it -- the write still lands in the
+# view -- so the pair has to be equal where it is declared.
+
+
+def _small_config(**overrides):
+    kwargs = dict(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=64,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        torch_dtype=torch.bfloat16,
+    )
+    kwargs.update(overrides)
+    return Qwen3_5TextConfig(**kwargs)
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16"])
+def test_gdn_states_are_declared_at_a_single_dtype(state_dtype):
+    from vllm_neuron.model.qwen3_5.model import Qwen3_5TextForCausalLM
+
+    config = _small_config(mamba_state_dtype=state_dtype)
+    spec = Qwen3_5TextForCausalLM(config).get_kv_spec()
+
+    mamba = [s for s in spec.layers if s.cache_kind is CacheKind.MAMBA]
+    assert mamba, "the 3:1 schedule must declare linear-attention layers"
+    for layer in mamba:
+        assert len(layer.state_dtypes) == 2
+        assert layer.state_dtypes[0] == layer.state_dtypes[1], layer.state_dtypes
+        assert layer.state_dtypes[0] == getattr(torch, state_dtype)
+
+
+def test_bfloat16_states_halve_the_page():
+    """Halving the page is the point of the knob, and vLLM's own default."""
+    from vllm_neuron.model.qwen3_5.model import Qwen3_5TextForCausalLM
+
+    pages = {}
+    for state_dtype in ("float32", "bfloat16"):
+        config = _small_config(mamba_state_dtype=state_dtype)
+        spec = Qwen3_5TextForCausalLM(config).get_kv_spec()
+        layer = next(s for s in spec.layers if s.cache_kind is CacheKind.MAMBA)
+        pages[state_dtype] = layer_spec_to_vllm_spec(
+            layer, block_size=32, dtype=torch.bfloat16
+        ).page_size_bytes
+
+    assert pages["bfloat16"] * 2 == pages["float32"]
+
+
+def test_an_unsupported_state_dtype_is_rejected_at_config_time():
+    """Fail where the name is written, not at the first device compile."""
+    with pytest.raises(ValueError, match="mamba_state_dtype"):
+        _small_config(mamba_state_dtype="float16")
