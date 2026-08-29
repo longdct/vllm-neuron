@@ -39,6 +39,7 @@ from dataclasses import dataclass
 import torch
 
 __all__ = [
+    "fixed_prefix_compressed_entries",
     "lightning_index_scores",
     "select_compressed_entries",
     "selection_mask_from_indices",
@@ -66,6 +67,37 @@ class IndexerSelection:
             or self.valid.shape != self.logical_indices.shape
         ):
             raise ValueError("indexer validity must be bool and match logical indices")
+
+
+def fixed_prefix_compressed_entries(
+    visible: torch.Tensor,
+    *,
+    topk: int,
+    capacity: int,
+) -> IndexerSelection:
+    """Return a graph-static dense-prefix selection for device bisection.
+
+    This deliberately performs no scoring.  It is exact only when ``topk``
+    covers every visible entry, which is the small-context isolation geometry:
+    the CSA ratio-4 cache has at most 64 logical entries while the production
+    indexer budget is 512.  Keeping this as a separate helper makes the
+    diagnostic output contract testable without compiling the model.
+    """
+    if visible.ndim != 1:
+        raise ValueError("fixed indexer visibility must have shape [Q]")
+    if topk < 1 or capacity < 1:
+        raise ValueError("fixed indexer topk and capacity must be positive")
+    if topk < capacity:
+        raise ValueError(
+            "fixed indexer selection is only exact when topk covers capacity"
+        )
+    indices = torch.arange(topk, dtype=torch.int32, device=visible.device)
+    indices = indices.unsqueeze(0).expand(visible.shape[0], -1)
+    valid = (indices < visible.to(torch.int32).unsqueeze(1)) & (indices < capacity)
+    return IndexerSelection(
+        torch.where(valid, indices, torch.full_like(indices, -1)),
+        valid,
+    )
 
 
 def streaming_topk_compressed_entries(

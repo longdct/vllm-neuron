@@ -36,14 +36,20 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 from vllm_neuron.vllm.worker.input_batch_params import (
     InputBatchGroupParams,
     build_input_batch_group_params,
     mla_cache_shape,
+)
+from vllm_neuron.vllm.worker.neuron_model_runner import (
+    _independent_kv_cache_tensor_sizes,
 )
 
 MAX_MODEL_LEN = 1024
@@ -164,6 +170,43 @@ class TestHeterogeneousGroups:
         )
         assert params.block_sizes == [32, 32, 32]
         assert params.max_num_blocks_per_req == [32, 32, 32]
+
+    def test_independent_deepseek_allocations_drop_packed_alias_amplification(self):
+        full = _mla(1024, compress_ratio=4)
+        sliding = SlidingWindowMLASpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.bfloat16,
+            sliding_window=128,
+        )
+        config = KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[
+                # A packed alias descriptor covers the entire interleaved pool;
+                # it must not be repeated for each independent layer.
+                KVCacheTensor(size=123_456_789, shared_by=["full", "sliding"])
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["full"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=full.block_size, kv_cache_specs={"full": full}
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["sliding"],
+                    UniformTypeKVCacheSpecs(
+                        block_size=sliding.block_size,
+                        kv_cache_specs={"sliding": sliding},
+                    ),
+                ),
+            ],
+        )
+        assert _independent_kv_cache_tensor_sizes(config) == {
+            "full": full.page_size_bytes * config.num_blocks,
+            "sliding": sliding.page_size_bytes * config.num_blocks,
+        }
 
 
 class TestEncoderOnlyGroupsAreSkipped:

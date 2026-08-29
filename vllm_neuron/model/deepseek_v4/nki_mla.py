@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import nki
 import nki.isa as nisa
@@ -18,19 +17,21 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # Keep the large-query kernel ABI deliberately small.  Scheduler buckets larger
 # than this are normalized by the Python dispatcher below; adding them here
 # would create a distinct (and extremely expensive) NKI specialization.
-_DIRECT_QUERY_BUCKETS = frozenset((1, 128, 256, 512, 1024))
-# Queries per NKI launch.  The launch grid is the LNC count (1 or 2 only), so
-# the query axis is split by the Python dispatcher below.  A small tile keeps
-# each compiled kernel body small but multiplies opaque custom calls in the
-# outer graph; a large tile does the reverse.  Overridable to sweep that
-# tradeoff without editing source.
-_PREFILL_QUERY_TILE = int(os.environ.get("VLLM_NEURON_DSV4_MLA_QUERY_TILE", "64"))
-_PAGED_KERNEL_QUERY_BUCKETS = frozenset((1, _PREFILL_QUERY_TILE))
+_DIRECT_QUERY_BUCKETS = frozenset((1, 8, 64, 128, 256, 512, 1024))
+_PAGED_KERNEL_QUERY_BUCKETS = frozenset(
+    (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
+)
+# Retained only as the compact static Q8 geometry used by simulator coverage.
+# Production prefill buckets above Q8 use the runtime query loop directly.
+_PREFILL_QUERY_TILE = 8
+_MAX_RUNTIME_LOOP_TRIPS = 2048
 # Gather each query run's sliding history once instead of once per query. Set to
 # 0 to restore the per-query vector-indirect gather, which is what the
 # bit-exactness test compares against.
-_SPAN_GATHER = os.environ.get("VLLM_NEURON_DSV4_MLA_SPAN_GATHER", "1") == "1"
-_SCHEDULER_QUERY_BUCKETS = frozenset((1, 512, 1024, 2048, 4096))
+_SPAN_GATHER = True
+_SCHEDULER_QUERY_BUCKETS = frozenset(
+    (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
+)
 _PREFILL_MICROCHUNK = 1024
 # Compiled HCA compressed-entry widths.  model.py picks the smallest one
 # that still covers the addressable entry capacity; rounding *up* is what
@@ -331,15 +332,62 @@ def _build_uniform_span(cache, slots, last_q, latent_dim):
     return span
 
 
-def _stream_paged_query(query, streams, sinks, q_idx, result):
+def _stream_paged_query(
+    query,
+    streams,
+    sinks,
+    q_idx,
+    result,
+    dynamic_q: bool = False,
+    program_query_base: int = 0,
+):
     """Stream 128-key cache tiles through FP32 online-softmax state."""
-    _, _, heads, latent_dim = query.shape
+    q_count, _, heads, latent_dim = query.shape
+    q_idx_sb = None
+    q_idx_reg = None
+    query_row = None
+    if dynamic_q:
+        local_q_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        q_idx_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.register_store(local_q_sb, q_idx)
+        nisa.tensor_scalar(
+            dst=q_idx_sb,
+            data=local_q_sb,
+            op0=nl.add,
+            operand0=program_query_base,
+        )
+        q_idx_reg = nisa.register_alloc()
+        nisa.register_load(q_idx_reg, q_idx_sb)
+        query_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=query_base,
+            data=q_idx_sb,
+            op0=nl.multiply,
+            operand0=heads * latent_dim,
+        )
+        query_base_reg = nisa.register_alloc()
+        nisa.register_load(query_base_reg, query_base)
+        query_row = nl.ndarray(
+            (heads, latent_dim), dtype=query.dtype, buffer=nl.sbuf
+        )
+        nisa.dma_copy(
+            dst=query_row,
+            src=query.reshape((q_count * heads * latent_dim,)).ap(
+                pattern=[[latent_dim, heads], [1, latent_dim]],
+                scalar_offset=query_base_reg,
+                indirect_dim=0,
+            ),
+        )
     q_tiles = []
     for d_idx in nl.static_range(4):
         q_tile = nl.ndarray((128, heads), dtype=query.dtype, buffer=nl.sbuf)
         nisa.dma_transpose(
             dst=q_tile,
-            src=query[q_idx, 0, :, d_idx * 128 : (d_idx + 1) * 128],
+            src=(
+                query_row[:, d_idx * 128 : (d_idx + 1) * 128]
+                if dynamic_q
+                else query[q_idx, 0, :, d_idx * 128 : (d_idx + 1) * 128]
+            ),
         )
         q_tiles.append(q_tile)
 
@@ -374,10 +422,35 @@ def _stream_paged_query(query, streams, sinks, q_idx, result):
             nisa.memset(value, value=0.0)
             if span_base is None:
                 offsets = nl.ndarray((width, 1), dtype=nl.int32, buffer=nl.sbuf)
-                nisa.dma_copy(
-                    dst=offsets,
-                    src=slots[q_idx, start : start + width].reshape((width, 1)),
-                )
+                if dynamic_q:
+                    slot_base = nl.ndarray(
+                        (1, 1), dtype=nl.int32, buffer=nl.sbuf
+                    )
+                    nisa.tensor_scalar(
+                        dst=slot_base,
+                        data=q_idx_sb,
+                        op0=nl.multiply,
+                        operand0=count,
+                        op1=nl.add,
+                        operand1=start,
+                    )
+                    slot_base_reg = nisa.register_alloc()
+                    nisa.register_load(slot_base_reg, slot_base)
+                    nisa.dma_copy(
+                        dst=offsets,
+                        src=slots.reshape((q_count * count,)).ap(
+                            pattern=[[1, width], [1, 1]],
+                            scalar_offset=slot_base_reg,
+                            indirect_dim=0,
+                        ),
+                    )
+                else:
+                    nisa.dma_copy(
+                        dst=offsets,
+                        src=slots[q_idx, start : start + width].reshape(
+                            (width, 1)
+                        ),
+                    )
                 # NOTE: the backend `unroll` pass expands this vector-indirect
                 # gather into one DMA descriptor per gathered row (Q x history of
                 # them), which is the dominant whole-model compile cost.  Dropping
@@ -426,12 +499,34 @@ def _stream_paged_query(query, streams, sinks, q_idx, result):
             )
             tile_mask = nl.ndarray((heads, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
             nisa.memset(tile_mask, value=float("-inf"))
-            nisa.dma_copy(
-                dst=tile_mask[:, :width],
-                src=mask.ap(
-                    pattern=[[0, heads], [1, width]], offset=q_idx * count + start
-                ),
-            )
+            if dynamic_q:
+                mask_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.tensor_scalar(
+                    dst=mask_base,
+                    data=q_idx_sb,
+                    op0=nl.multiply,
+                    operand0=count,
+                    op1=nl.add,
+                    operand1=start,
+                )
+                mask_base_reg = nisa.register_alloc()
+                nisa.register_load(mask_base_reg, mask_base)
+                nisa.dma_copy(
+                    dst=tile_mask[:, :width],
+                    src=mask.reshape((q_count * count,)).ap(
+                        pattern=[[0, heads], [1, width]],
+                        scalar_offset=mask_base_reg,
+                        indirect_dim=0,
+                    ),
+                )
+            else:
+                nisa.dma_copy(
+                    dst=tile_mask[:, :width],
+                    src=mask.ap(
+                        pattern=[[0, heads], [1, width]],
+                        offset=q_idx * count + start,
+                    ),
+                )
             masked_scores = nl.ndarray(
                 (heads, 128), dtype=nl.bfloat16, buffer=nl.sbuf
             )
@@ -566,7 +661,26 @@ def _stream_paged_query(query, streams, sinks, q_idx, result):
     nisa.tensor_scalar(
         dst=output, data=running_output, op0=nl.multiply, operand0=reciprocal
     )
-    nisa.dma_copy(dst=result[q_idx, 0, :, :], src=output)
+    if dynamic_q:
+        result_base = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=result_base,
+            data=q_idx_sb,
+            op0=nl.multiply,
+            operand0=heads * latent_dim,
+        )
+        result_base_reg = nisa.register_alloc()
+        nisa.register_load(result_base_reg, result_base)
+        nisa.dma_copy(
+            dst=result.reshape((q_count * heads * latent_dim,)).ap(
+                pattern=[[latent_dim, heads], [1, latent_dim]],
+                scalar_offset=result_base_reg,
+                indirect_dim=0,
+            ),
+            src=output,
+        )
+    else:
+        nisa.dma_copy(dst=result[q_idx, 0, :, :], src=output)
 
 
 @nki.jit
@@ -582,7 +696,7 @@ def _paged_shared_latent_mla_kernel(
     compressed_uniform: bool = False,
 ):
     q_count = query.shape[0]
-    assert q_count in (1, _PREFILL_QUERY_TILE)
+    assert q_count in (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
     assert sliding_slots.shape[1] == 128
     assert compressed_slots.shape[1] in _HCA_COUNT_BUCKETS
     latent_dim = query.shape[3]
@@ -590,7 +704,40 @@ def _paged_shared_latent_mla_kernel(
     n_programs = nl.num_programs(0)
     program_id = nl.program_id(0)
     queries_per_program = q_count if q_count == 1 else q_count // n_programs
-    assert queries_per_program <= _PREFILL_QUERY_TILE
+    if q_count > 8:
+        program_query_base = program_id * queries_per_program
+
+        def process_query(local_q_idx):
+            _stream_paged_query(
+                query,
+                (
+                    (
+                        compressed_cache,
+                        compressed_slots,
+                        compressed_mask,
+                        None,
+                    ),
+                    (sliding_cache, sliding_slots, sliding_mask, None),
+                ),
+                sinks,
+                local_q_idx,
+                result,
+                True,
+                program_query_base,
+            )
+
+        if queries_per_program > _MAX_RUNTIME_LOOP_TRIPS:
+            assert queries_per_program == 2 * _MAX_RUNTIME_LOOP_TRIPS
+            nl.fori_loop(0, _MAX_RUNTIME_LOOP_TRIPS, process_query)
+            nl.fori_loop(
+                _MAX_RUNTIME_LOOP_TRIPS,
+                2 * _MAX_RUNTIME_LOOP_TRIPS,
+                process_query,
+            )
+        else:
+            nl.fori_loop(0, queries_per_program, process_query)
+        return result
+
     first_q = 0 if q_count == 1 else program_id * queries_per_program
     sliding_span = None
     compressed_span = None
@@ -643,14 +790,39 @@ def _paged_sliding_latent_mla_kernel(
     query, sliding_cache, sliding_slots, sliding_mask, sinks
 ):
     q_count, history = sliding_slots.shape
-    assert q_count in (1, _PREFILL_QUERY_TILE)
+    assert q_count in (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
     assert history == 128
     latent_dim = query.shape[3]
     result = nl.ndarray(query.shape, dtype=query.dtype, buffer=nl.shared_hbm)
     n_programs = nl.num_programs(0)
     program_id = nl.program_id(0)
     queries_per_program = q_count if q_count == 1 else q_count // n_programs
-    assert queries_per_program <= _PREFILL_QUERY_TILE
+    if q_count > 8:
+        program_query_base = program_id * queries_per_program
+
+        def process_query(local_q_idx):
+            _stream_paged_query(
+                query,
+                ((sliding_cache, sliding_slots, sliding_mask, None),),
+                sinks,
+                local_q_idx,
+                result,
+                True,
+                program_query_base,
+            )
+
+        if queries_per_program > _MAX_RUNTIME_LOOP_TRIPS:
+            assert queries_per_program == 2 * _MAX_RUNTIME_LOOP_TRIPS
+            nl.fori_loop(0, _MAX_RUNTIME_LOOP_TRIPS, process_query)
+            nl.fori_loop(
+                _MAX_RUNTIME_LOOP_TRIPS,
+                2 * _MAX_RUNTIME_LOOP_TRIPS,
+                process_query,
+            )
+        else:
+            nl.fori_loop(0, queries_per_program, process_query)
+        return result
+
     first_q = 0 if q_count == 1 else program_id * queries_per_program
     sliding_span = None
     if _SPAN_GATHER:
@@ -789,44 +961,6 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
         raise ValueError("compressed_uniform requires a compressed stream")
 
     q_count = query.shape[0]
-    if can_run_kernel(query) and q_count > _PREFILL_MICROCHUNK:
-        if q_count not in _SCHEDULER_QUERY_BUCKETS or q_count % _PREFILL_MICROCHUNK:
-            raise RuntimeError(
-                "DeepSeek-V4 paged MLA has unsupported query bucket "
-                f"{q_count}; expected one of {sorted(_SCHEDULER_QUERY_BUCKETS)}"
-            )
-        # Caches are shared and were completely updated by _forward_packed
-        # before this dispatcher is entered.  Only query-derived rows are
-        # sliced, preserving token order and each row's causal visibility.
-        from .attention import SharedLatentMLAInputs
-
-        outputs = []
-        for start in range(0, q_count, _PREFILL_MICROCHUNK):
-            stop = start + _PREFILL_MICROCHUNK
-            outputs.append(
-                paged_shared_latent_mla(
-                    SharedLatentMLAInputs(
-                        query=query[start:stop],
-                        sliding_cache=inputs.sliding_cache,
-                        sliding_slots=inputs.sliding_slots[start:stop],
-                        sliding_valid=inputs.sliding_valid[start:stop],
-                        compressed_cache=inputs.compressed_cache,
-                        compressed_slots=(
-                            inputs.compressed_slots[start:stop]
-                            if has_compressed
-                            else None
-                        ),
-                        compressed_valid=(
-                            inputs.compressed_valid[start:stop]
-                            if has_compressed
-                            else None
-                        ),
-                        sinks=inputs.sinks,
-                        compressed_uniform=inputs.compressed_uniform,
-                    )
-                )
-            )
-        return torch.cat(outputs, dim=0)
 
     if not can_run_kernel(query):
         sliding, sliding_valid = gather_bounded_paged_latent(
@@ -862,7 +996,7 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
             f"DeepSeek-V4 paged MLA history geometry is unsupported: {history}"
         )
     if (
-        query.shape[0] not in _DIRECT_QUERY_BUCKETS
+        query.shape[0] not in _SCHEDULER_QUERY_BUCKETS
         or query.shape[1] != 1
         or not 1 <= query.shape[2] <= 64
         or query.shape[3] != 512
@@ -925,16 +1059,7 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
             inputs.compressed_uniform,
         )
 
-    if q_count == 1:
-        return launch(0, 1)
-    # Q512 and Q1024 deliberately reuse the same Q8/LNC2 specialization.
-    return torch.cat(
-        [
-            launch(start, start + _PREFILL_QUERY_TILE)
-            for start in range(0, q_count, _PREFILL_QUERY_TILE)
-        ],
-        dim=0,
-    )
+    return launch(0, q_count)
 
 
 def torch_reference(

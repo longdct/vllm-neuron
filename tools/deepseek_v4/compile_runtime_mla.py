@@ -80,7 +80,12 @@ class RuntimeMLA(torch.nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", type=int, choices=(1, 512, 1024), default=512)
+    parser.add_argument(
+        "--query",
+        type=int,
+        choices=(1, 2, 4, 8, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        default=512,
+    )
     parser.add_argument("--compressed", type=int, choices=(0, 512, 1024), default=512)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

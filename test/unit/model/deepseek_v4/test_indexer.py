@@ -10,16 +10,78 @@ entry. The bit-exact comparison against Transformers lives in
 still runs when transformers is not installed.
 """
 
+import inspect
+
 import pytest
 
 torch = pytest.importorskip("torch")
 
 from vllm_neuron.model.deepseek_v4.indexer import (
+    fixed_prefix_compressed_entries,
     lightning_index_scores,
     select_compressed_entries,
     selection_mask_from_indices,
     streaming_topk_compressed_entries,
 )
+from vllm_neuron.model.deepseek_v4 import nki_indexer
+from vllm_neuron.model.deepseek_v4.nki_indexer import (
+    _pad_single_query_bucket,
+    _query_tiles,
+    _visible_page_counts,
+)
+
+
+def test_zero_visible_rows_still_launch_one_fully_masked_indexer_page():
+    visible = torch.tensor([0, 0, 1, 511, 512, 513], dtype=torch.int32)
+    assert _visible_page_counts(visible, 1024).tolist() == [2, 2, 2, 2, 2, 2]
+
+
+def test_q8192_indexer_dispatch_uses_one_opaque_call():
+    tiles = _query_tiles(8192)
+    assert tiles == ((0, 8192),)
+
+
+def test_q1_indexer_is_padded_to_q8_with_masked_rows():
+    query = torch.ones(1, 1, 64, 128)
+    gate = torch.ones(1, 1, 64)
+    visible = torch.tensor([17], dtype=torch.int32)
+    visible_pages = torch.tensor([4], dtype=torch.int32)
+    padded = _pad_single_query_bucket(query, gate, visible, visible_pages)
+    assert [value.shape[0] for value in padded] == [8, 8, 8, 8]
+    assert padded[2].tolist() == [17, 0, 0, 0, 0, 0, 0, 0]
+    assert padded[3].tolist() == [4] * 8
+
+
+def test_indexer_query_axis_is_a_runtime_loop_not_static_expansion():
+    source = inspect.getsource(nki_indexer._projected_bf16_indexer_kernel)
+    assert "nl.fori_loop(0, queries_per_program, process_query)" in source
+    assert "nl.fori_loop(0, _MAX_RUNTIME_LOOP_TRIPS, process_query)" in source
+    assert "2 * _MAX_RUNTIME_LOOP_TRIPS" in source
+    assert "for local_q_idx in nl.affine_range" not in source
+    assert "process_query(0)" not in source
+
+
+def test_paged_indexer_splits_block256_gather_at_nki_partition_limit():
+    source = inspect.getsource(nki_indexer._projected_bf16_indexer_kernel)
+    assert "slot_dma_width = min(logical_slots_per_block, 128)" in source
+    assert "logical_slots_per_block // slot_dma_width" in source
+    assert "slot_chunk * slot_dma_width" in source
+
+
+def test_fixed_prefix_selection_is_dense_equivalent_within_capacity():
+    visible = torch.tensor([0, 1, 16, 64])
+    selected = fixed_prefix_compressed_entries(visible, topk=512, capacity=64)
+    assert selected.logical_indices.shape == (4, 512)
+    assert selected.logical_indices.dtype is torch.int32
+    assert selected.valid.sum(1).tolist() == [0, 1, 16, 64]
+    for row, count in enumerate(visible.tolist()):
+        assert selected.logical_indices[row, :count].tolist() == list(range(count))
+        assert bool((selected.logical_indices[row, count:] == -1).all())
+
+
+def test_fixed_prefix_selection_rejects_a_pruning_geometry():
+    with pytest.raises(ValueError, match="topk covers capacity"):
+        fixed_prefix_compressed_entries(torch.tensor([64]), topk=32, capacity=64)
 
 
 def _scores(batch=2, tokens=6, entries=8, heads=4, head_dim=8, seed=0):

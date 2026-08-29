@@ -103,6 +103,44 @@ NULL_BLOCK_ID = 0
 PAD_SLOT_ID = -1
 
 
+def _independent_kv_cache_tensor_sizes(
+    kv_cache_config: KVCacheConfig,
+) -> dict[str, int]:
+    """Return compact per-layer allocation sizes for an unaliased cache.
+
+    vLLM's packed DeepSeek planner emits alias descriptors whose ``size`` is
+    the entire interleaved backing pool. That is correct when all
+    ``shared_by`` layers view one allocation through offsets and strides, but
+    DeepSeek's functional cache updates require independent backing tensors.
+    Repeating the full packed-pool size once per layer amplifies the planned
+    cache by the number of aliases. Allocate each layer's own page width times
+    the common block count instead.
+    """
+    layer_specs: dict[str, KVCacheSpec] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        group_spec = group.kv_cache_spec
+        if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            layer_specs.update(group_spec.kv_cache_specs)
+        else:
+            layer_specs.update(
+                {layer_name: group_spec for layer_name in group.layer_names}
+            )
+
+    sizes: dict[str, int] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        for layer_name in tensor.shared_by:
+            try:
+                layer_spec = layer_specs[layer_name]
+            except KeyError as error:
+                raise ValueError(
+                    f"KV cache tensor references unknown layer {layer_name!r}"
+                ) from error
+            sizes[layer_name] = (
+                layer_spec.page_size_bytes * kv_cache_config.num_blocks
+            )
+    return sizes
+
+
 def _remap_null_block_to_sentinel(block_table: torch.Tensor) -> torch.Tensor:
     """Remap vLLM's null-block (0) in an int32 block table to -1 so the
     Neuron attention kernel can DMA-skip inactive slots via oob_mode.skip.
@@ -459,6 +497,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "max_logprobs", getattr(vllm_config.model_config, "max_logprobs", 0)
         )
         self.neuron_config = NeuronConfig.from_dict(neuron_config_dict)
+        # CacheConfig owns the public --block-size setting. Mirror its resolved
+        # value into the model-facing config so heterogeneous cache specs can
+        # choose compatible physical page sizes before vLLM groups them.
+        self.neuron_config.kv_cache_block_size = vllm_config.cache_config.block_size
 
         # Vision neuron config for multimodal models (None for text-only)
         vision_config_dict = vllm_config.additional_config.get("vision_neuron_config")
@@ -8490,6 +8532,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         isolate_shared_tensors = bool(
             getattr(self.model, "requires_independent_kv_cache_tensors", False)
         )
+        independent_sizes = (
+            _independent_kv_cache_tensor_sizes(kv_cache_config)
+            if isolate_shared_tensors
+            else {}
+        )
         for tensor in kv_cache_config.kv_cache_tensors:
             if isolate_shared_tensors:
                 # DeepSeek's compiled functional cache updates return complete
@@ -8498,7 +8545,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # clobber one another when graph outputs are written back.
                 for layer_name in tensor.shared_by:
                     kv_cache_raw_tensors[layer_name] = torch.zeros(
-                        tensor.size, dtype=torch.int8, device=self.device
+                        independent_sizes[layer_name],
+                        dtype=torch.int8,
+                        device=self.device,
                     )
             else:
                 raw_tensor = torch.zeros(

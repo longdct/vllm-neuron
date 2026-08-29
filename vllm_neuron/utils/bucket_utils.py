@@ -9,6 +9,7 @@ compiled model execution :
 """
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -355,6 +356,21 @@ def resolve_segmented_prefill_config(
         ValueError: On unsupported combinations of ``max_model_len`` and
             ``max_num_batched_tokens``.
     """
+    small_dsv4_isolation = os.environ.get(
+        "VLLM_NEURON_DSV4_SMALL_CONTEXT", "0"
+    ) == "1"
+    if (
+        small_dsv4_isolation
+        and max_model_len <= 256
+        and max_num_batched_tokens in (8, 64)
+    ):
+        # The one-request DeepSeek-V4 model bisection intentionally exercises
+        # Q8/Q64 packed attention without the generic segmented-attention
+        # kernel, whose public minimum is Q512.  Returning no segment buckets
+        # retains ordinary vLLM chunking while leaving production defaults and
+        # validation untouched when the diagnostic variable is absent.
+        return (None, None)
+
     if max_num_batched_tokens >= max_model_len:
         if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT:
             raise ValueError(
