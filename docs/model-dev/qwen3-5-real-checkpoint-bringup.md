@@ -251,6 +251,14 @@ The divergences are late and into coherent, factually correct text. The one at
 step 12 is the bf16 tie measured above. The one at 19 was not measured; it fits
 the same pattern but that is an inference, not a result.
 
+**TP=8 returns byte-identical output to TP=2** on all four prompts -- same
+tokens, same divergence points, same text. That is the TP-invariance section 7.5
+asks for, and it is not a weak check here: TP=8 gives each rank 2 value heads
+instead of 8, a different `conv_dim_per_rank`, and a different collective
+pattern, so agreeing token for token means the GDN sharding and the sequence-
+parallel gather/reduce-scatter around the recurrence are carrying the same
+state at both degrees.
+
 ## The chunk-scan kernel is wrong on device
 
 `VLLM_NEURON_DISABLE_NKI_KERNELS` is all-or-nothing, so "kernels off fixes it"
