@@ -30,6 +30,21 @@ class DeepseekV4ParallelTopology:
 
     @property
     def expert_tp_degree(self) -> int:
+        """Number of ranks that column-shard one expert's intermediate dim.
+
+        With EP enabled the expert-TP group is the TP x DP world partitioned
+        into ``ep_degree`` disjoint expert shards, so each partition has
+        ``world_size // ep_degree`` ranks.
+
+        With EP disabled (``ep_degree == 1``) there is no cross-replica expert
+        group at all: every DP replica carries a complete model and there is no
+        collective spanning replicas, so the ranks that column-shard an expert
+        are exactly the TP group.  Deriving this as ``world_size`` instead would
+        claim DP replicas share a shard -- and since ``_forward_*`` only ever
+        all-reduces over the TP group, those extra shards would never be summed.
+        """
+        if self.ep_degree == 1:
+            return self.tp_degree
         return self.world_size // self.ep_degree
 
     def validate(self, *, num_heads: int, output_groups: int,
@@ -87,8 +102,20 @@ def resolve_parallel_topology() -> DeepseekV4ParallelTopology:
         return DeepseekV4ParallelTopology()
 
     if not ep_enabled:
+        # ``expert_tp_rank`` MUST be plumbed here.  Routed-expert weights are
+        # column-sharded across ``expert_tp_degree`` ranks by
+        # ``weight_loaders.load_checkpoint_weights``, which narrows the
+        # checkpoint tensor at ``expert_tp_rank * shard_size``.  Leaving it at
+        # its default of 0 made every rank load shard 0, so the TP all-reduce
+        # in ``DeepseekV4MoE.forward`` summed ``tp_degree`` copies of the same
+        # partial while the other shards were never computed -- a silently
+        # wrong MoE output at any ``tp_degree > 1``.  With EP off the expert-TP
+        # group is the TP group, so the column index is the TP rank.
         return DeepseekV4ParallelTopology(
-            tp_degree=tp_degree, dp_degree=dp_degree, tp_rank=tp_rank
+            tp_degree=tp_degree,
+            dp_degree=dp_degree,
+            tp_rank=tp_rank,
+            expert_tp_rank=tp_rank,
         )
 
     from vllm_neuron.parallel.neuron_parallel_state import (
@@ -98,6 +125,16 @@ def resolve_parallel_topology() -> DeepseekV4ParallelTopology:
     )
 
     ep_degree = get_neuron_ep_degree()
+    if ep_degree <= 1:
+        # ``--enable-expert-parallel`` with a degenerate EP degree: no EP group
+        # exists (``get_neuron_ep_tp_group`` asserts ``ep_degree > 1``), so this
+        # is the plain TP geometry above.
+        return DeepseekV4ParallelTopology(
+            tp_degree=tp_degree,
+            dp_degree=dp_degree,
+            tp_rank=tp_rank,
+            expert_tp_rank=tp_rank,
+        )
     ep_tp_group = get_neuron_ep_tp_group()
     dp_rank = 0
     try:
