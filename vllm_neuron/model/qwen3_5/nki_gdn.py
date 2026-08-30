@@ -31,6 +31,7 @@ import logging
 import torch
 import torch.nn.functional as F
 
+from vllm_neuron import envs
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -644,7 +645,28 @@ def pad_rows_for_lnc(
 
 
 def can_use_chunk_scan_kernel(query: torch.Tensor, chunk_size: int) -> bool:
-    """Whether the scan kernel can serve this call."""
+    """Whether the scan kernel can serve this call.
+
+    Off unless explicitly opted into, because the kernel is **wrong on device**
+    while being exact in the simulator. On the 0.8B with real weights, swapping
+    only this kernel in turns
+
+        " Rome. The capital of Spain is Madrid. The capital of ..."
+
+    into ``" a..............."``. The depthwise conv in the same layer was
+    exonerated by the complementary run, and the fault survives at TP 2, 4 and 8
+    -- including TP=8, where each LNC program handles a single row, which rules
+    out the row split as well. The simulator agrees with the torch oracle to the
+    last bit at the shipped geometry, the real 32-chunk count and with the LNC
+    grid emulated, so this is a lowering divergence and not the algorithm.
+
+    Leaving it on by default would mean shipping a model that is fast and wrong;
+    the torch chunk rule is slower and right. Set
+    ``VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`` to debug the kernel -- not to
+    serve. See docs/model-dev/qwen3-5-real-checkpoint-bringup.md.
+    """
+    if not envs.VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL:
+        return False
     if _wrapped_gdn_chunk_scan is None:
         return False
     if not can_run_kernel(query):

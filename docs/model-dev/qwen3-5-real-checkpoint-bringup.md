@@ -207,13 +207,63 @@ sequence are 0.75 to 7.4 everywhere except step 12, where the gap is **0.125 --
 exactly one bf16 ULP at logit scale**, the floor this project already records
 as unachievable to beat. A tie at the working precision is not a bug to chase.
 
+## On device, with real weights
+
+With the padding fix in place and every NKI kernel off, the 0.8B at TP=2
+reproduces HuggingFace **exactly, 32 of 32 greedy tokens**:
+
+    " Rome. The capital of Spain is Madrid. The capital of Japan is Tokyo. The
+     capital of the United States is Washington, D.C. The capital of the"
+
+That is the first end-to-end statement about this port that is worth anything:
+prefill, decode, the paged GDN state seam, the attention layers and the real
+checkpoint, on hardware, against an independent oracle.
+
+The shipping default keeps the depthwise conv kernel and drops only the scan.
+That run agrees with HuggingFace for 12 tokens and then diverges -- at the same
+step 12 whose top-2 gap is one bf16 ULP. The conv kernel's rounding differs from
+torch's by less than that gap, so it lands on the other side of the tie. Both
+runs are correct to the precision the model works at; only the tie-break
+differs, and the run above is quoted as the exact one because it is.
+
+## The chunk-scan kernel is wrong on device
+
+`VLLM_NEURON_DISABLE_NKI_KERNELS` is all-or-nothing, so "kernels off fixes it"
+implicated the depthwise conv exactly as much as the scan. Disabling one at a
+time separates them:
+
+| configuration | 32 greedy tokens |
+|---|---|
+| torch conv + **NKI scan** | `" a..............."` |
+| **NKI conv** + torch scan | `" Rome. The capital of Spain is Madrid. ..."` |
+| both off | matches HuggingFace 32/32 |
+
+So the conv kernel is fine and the scan kernel alone is the defect. It is not
+the sharding either: the fault survives at TP 2, 4 and 8, and at TP=8 each LNC
+program handles a single row, which leaves the per-program row loop with nothing
+to get wrong.
+
+Meanwhile the same kernel is **bit-exact against the torch oracle in the NKI
+simulator** at the shipped geometry, at the real 32-chunk count, and with the
+LNC grid genuinely emulated (`nl.num_programs()` returns 2 and both programs
+run). Simulator-exact and device-wrong is a lowering divergence, not an
+algorithm bug, and none of the coverage that now exists can see it.
+
+It is therefore **off by default**, behind
+`VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`. The torch chunk rule is slower and
+right; shipping the kernel enabled would be fast and wrong. The flag is for
+debugging the kernel, not for serving.
+
+Running it in isolation on device would be the next step and is currently
+blocked: NKI's standalone numpy path fails in its own harness before reaching
+the compiler, re-invoking python on a path that is literally `None`
+(`can't open file '/tmp/nki_XXXXXXXX/None'`).
+
 ## Still open
 
-- **The NKI chunk-scan kernel is wrong.** With kernels enabled the device emits
-  token 61 thirty-two times; with `VLLM_NEURON_DISABLE_NKI_KERNELS=1` it tracks
-  the CPU path. It is the one component CPU never exercises, which is why it
-  survived the oracle and simulator suites -- those check the kernel against the
-  torch form on shapes the serving path does not produce.
+- **Root-cause the chunk-scan lowering divergence** (above). Until then the GDN
+  prefill runs the torch chunk rule, which is a performance gap, not a
+  correctness one.
 - **Attention propagates padding NaN into real rows.** Through layers 0-2 the 32
   real rows stayed clean while padding rows were NaN (`bad_real = 0`); at layer 3,
   the first attention layer, all 2048 rows went bad including the real ones.

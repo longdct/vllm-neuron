@@ -430,3 +430,21 @@ def test_scan_kernel_shards_rows_across_lnc_programs():
     assert "num_programs" in source
     assert "program_id" in source
     assert "fori_loop(row_start, row_start + rows_per_program" in source
+
+
+def test_the_scan_kernel_is_off_unless_explicitly_opted_into():
+    """The dispatcher must not reach the scan kernel by default.
+
+    It is exact in this very simulator and wrong on device -- isolated by
+    swapping only this kernel in on real weights, which turned coherent text
+    into `" a..............."` while the depthwise conv in the same layer was
+    exonerated by the complementary run. Until that lowering divergence is
+    root-caused the model must be slow and right rather than fast and wrong, so
+    the default is pinned here rather than left to whoever reads the docstring.
+    """
+    import torch
+
+    from vllm_neuron import envs
+
+    assert envs.VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL is False
+    assert not nki_gdn.can_use_chunk_scan_kernel(torch.zeros(1, 1, 1, 16), 64)

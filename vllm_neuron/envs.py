@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
+    VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL: bool = False
     VLLM_NEURON_VALIDATE_CACHE_METADATA: bool = False
     VLLM_NEURON_TINY_VALIDATION_DIR: Optional[str] = None
     VLLM_NEURON_SKIP_PREFILL_WARMUP: bool = False
@@ -188,6 +189,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable NKI kernels — forces can_run_kernel() to return False
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_NKI_KERNELS")) or False
+    ),
+    # Opt in to the Qwen3.5 Gated DeltaNet chunk-scan NKI kernel, which is
+    # correct in the NKI simulator but produces garbage on device -- see
+    # docs/model-dev/qwen3-5-real-checkpoint-bringup.md. Off by default so the
+    # model is slow and right rather than fast and wrong; set it to debug the
+    # kernel, not to serve.
+    "VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL"))
+        or False
     ),
     # Expensive device-to-host validation for correctness qualification runs.
     "VLLM_NEURON_VALIDATE_CACHE_METADATA": lambda: (
