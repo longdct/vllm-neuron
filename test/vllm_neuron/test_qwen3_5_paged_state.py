@@ -317,6 +317,40 @@ def test_each_request_is_masked_at_its_own_length():
     torch.testing.assert_close(layer.recurrent_state_cache[2], want[1], **ALGEBRAIC)
 
 
+def test_decode_runs_past_the_conv_window():
+    """Many decode steps, not one -- the window has to roll, not just exist.
+
+    The conv state is only ``kernel - 1`` columns wide, so after that many decode
+    steps every column has been replaced and nothing of the prefill remains in
+    it. A hand-off that is subtly wrong -- off by one, or writing the output
+    window instead of the input window -- still matches on the first step, when
+    the state is mostly prefill, and only separates once the window has turned
+    over. Every decode test here took exactly one step, so none of them could
+    see that. Plan section 4.3 asks for this regime by name.
+    """
+    config = _config()
+    prefill = 5
+    steps = 4 * (config.linear_conv_kernel_dim - 1)  # several window turnovers
+    total = prefill + steps
+
+    hidden = torch.randn(total, config.hidden_size)
+    layer = _layer(config)
+
+    with torch.no_grad():
+        whole, _, _ = layer(hidden.unsqueeze(0))
+        layer.forward_paged(hidden[:prefill], _metadata([0]), is_decode=False)
+        for step in range(steps):
+            row = prefill + step
+            got = layer.forward_paged(
+                hidden[row:row + 1],
+                _metadata([0], cached_seq_len=row),
+                is_decode=True,
+            )
+            torch.testing.assert_close(
+                got, whole.squeeze(0)[row:row + 1], **ALGEBRAIC
+            )
+
+
 def test_the_conv_window_is_gathered_at_a_tensor_offset():
     """Structural: the padded conv window must not be a Python-int slice.
 
