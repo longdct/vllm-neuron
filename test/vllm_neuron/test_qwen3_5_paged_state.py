@@ -198,7 +198,25 @@ def _padded_metadata(slots, real, cached_seq_len=0):
     return meta
 
 
-def test_padded_prefill_leaves_the_same_state_as_an_unpadded_one():
+@pytest.mark.parametrize(
+    "real,padded",
+    [
+        # Both inside one 64-token chunk.
+        (6, 40),
+        # Real tokens end mid-chunk, padding runs on into later chunks: the
+        # boundary case, because chunk 0 is part real and part filler while
+        # chunks 1 and 2 are filler end to end, and the delta rule's decay mask
+        # and UT inverse are computed per chunk. Everything below 64 rows --
+        # which was every case here -- keeps the whole prefill inside chunk 0
+        # and never exercises that at all.
+        (6, 200),
+        # Real tokens land exactly on a chunk boundary.
+        (64, 200),
+        # More than one full chunk of real tokens before the padding starts.
+        (100, 200),
+    ],
+)
+def test_padded_prefill_leaves_the_same_state_as_an_unpadded_one(real, padded):
     """The property the whole mask exists for.
 
     Filler rows are deliberately *not* zeros: zeros would flatter the mask,
@@ -208,8 +226,6 @@ def test_padded_prefill_leaves_the_same_state_as_an_unpadded_one():
     update is at its most aggressive precisely where the data is meaningless.
     """
     config = _config()
-    real = 6
-    padded = 40
 
     hidden = torch.randn(padded, config.hidden_size)
     hidden[real:] = hidden[real - 1]  # the runner repeats the last position
