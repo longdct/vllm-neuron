@@ -226,6 +226,31 @@ torch's by less than that gap, so it lands on the other side of the tie. Both
 runs are correct to the precision the model works at; only the tie-break
 differs, and the run above is quoted as the exact one because it is.
 
+## Batch > 1, unequal prompt lengths
+
+A batch of one cannot tell a correct per-request padding mask from one that uses
+the whole batch's length, and equal-length prompts cannot either -- they pad
+identically. So the check is four prompts of 3, 4, 12 and 24 tokens submitted
+together, each diffed against its own HuggingFace reference.
+
+TP=2, `max_num_seqs=4`, 32 greedy tokens each:
+
+| prompt tokens | vs HF | device |
+|---|---|---|
+| 3 | **32/32** | `" 100 C. If a 100 g sample of water is heated to ..."` |
+| 4 | **32/32** | `" four.\nTwo plus two equals four ..."` |
+| 12 | 12/32 | `" Rome. The capital of Spain is Madrid ..."` |
+| 24 | 19/32 | `" the Apollo 11 mission ... Neil Armstrong and Buzz Aldrin"` |
+
+The two shortest are the load-bearing rows. Three real tokens in a 2048 bucket
+is ~2045 padding rows -- the most padding-dominated case in the set -- and they
+come back exactly right. A mask taking one length for the whole batch would have
+destroyed those two first.
+
+The divergences are late and into coherent, factually correct text. The one at
+step 12 is the bf16 tie measured above. The one at 19 was not measured; it fits
+the same pattern but that is an inference, not a result.
+
 ## The chunk-scan kernel is wrong on device
 
 `VLLM_NEURON_DISABLE_NKI_KERNELS` is all-or-nothing, so "kernels off fixes it"
@@ -264,6 +289,11 @@ the compiler, re-invoking python on a path that is literally `None`
 - **Root-cause the chunk-scan lowering divergence** (above). Until then the GDN
   prefill runs the torch chunk rule, which is a performance gap, not a
   correctness one.
+- **TP=16 and TP=32 are unverified on hardware, and cannot be checked on the
+  0.8B at all**: vLLM requires `num_attention_heads % tp == 0` and this
+  checkpoint has 8, so TP=16 is rejected at config validation before reaching a
+  device. TP=8 is the ceiling here. TP=16 needs the 27B together with the 24->32
+  Q-head padding of section 2.2, so the two are gated on each other.
 - **Attention propagates padding NaN into real rows.** Through layers 0-2 the 32
   real rows stayed clean while padding rows were NaN (`bad_real = 0`); at layer 3,
   the first attention layer, all 2048 rows went bad including the real ones.
