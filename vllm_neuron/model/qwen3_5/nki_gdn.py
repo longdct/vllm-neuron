@@ -98,6 +98,7 @@ def causal_conv1d_with_state(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
     activation: str | None = "silu",
+    valid_len: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Causal depthwise conv over ``[state | tokens]``.
 
@@ -108,6 +109,11 @@ def causal_conv1d_with_state(
             reference's left zero-padding -- so this is not a special case.
         weight: ``[C, kernel]`` depthwise filter.
         bias: must be None; Qwen3.5's conv1d carries no bias.
+        valid_len: ``[B]`` count of leading real tokens per row, or None when
+            every row is real. Only the returned state depends on it -- the
+            output is computed for every column either way, because a padded
+            column's output is discarded downstream and computing it costs
+            nothing, whereas skipping it would need a data-dependent shape.
 
     Returns:
         ``(output, new_conv_state)`` with output covering the new tokens only.
@@ -153,8 +159,41 @@ def causal_conv1d_with_state(
         out = _torch_causal_conv1d(extended, weight, activation)
 
     out = out[..., -seq_len:]
-    new_state = extended[..., -(kernel - 1) :] if kernel > 1 else conv_state
+    new_state = (
+        _trailing_window(extended, kernel - 1, valid_len)
+        if kernel > 1
+        else conv_state
+    )
     return out.to(hidden_states.dtype), new_state
+
+
+def _trailing_window(
+    extended: torch.Tensor, width: int, valid_len: torch.Tensor | None
+) -> torch.Tensor:
+    """The ``width`` columns of ``extended`` ending at each row's last real token.
+
+    ``extended`` is ``[state | tokens]``, so real token ``j`` sits at column
+    ``width + j`` and the window ending at the last real token of a row with
+    ``n`` real tokens is ``extended[..., n : n + width]``. With no padding
+    ``n == seq_len`` and that is the plain trailing window.
+
+    Padding makes the distinction load bearing. A bucketed prefill appends
+    padding rows to every request, so the plain trailing window is a window
+    over *padding*, and decode then resumes the convolution from tokens the
+    prompt never contained.
+
+    The offset is read from a tensor and the gather has a fixed width, so no
+    Python ``int`` reaches a shape -- the discipline §4.2 of the plan requires
+    and that cost DeepSeek-V4 nine consecutive Dynamo blockers.
+    """
+    if valid_len is None:
+        return extended[..., -width:]
+    # [B, width] absolute columns, then broadcast over the channel dim.
+    offsets = valid_len.to(torch.long).reshape(-1, 1) + torch.arange(
+        width, device=extended.device
+    ).reshape(1, -1)
+    index = offsets.unsqueeze(1).expand(-1, extended.shape[1], -1)
+    return torch.gather(extended, 2, index)
 
 
 def causal_conv1d(

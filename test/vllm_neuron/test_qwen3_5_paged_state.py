@@ -178,6 +178,147 @@ PERMITTED_BRANCH_SUBJECTS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Bucket padding
+# ---------------------------------------------------------------------------
+#
+# The runner pads every request's token block up to a bucket, so a 12-token
+# prompt arrives as 12 real rows and ~2000 filler ones. Full attention shrugs
+# that off -- a padded key is a column the causal mask drops. A recurrence
+# cannot: every row it walks over mutates the state decode resumes from. These
+# pin the three things that have to happen, by comparing against the only
+# unambiguous reference, a prefill of exactly the real tokens.
+
+
+def _padded_metadata(slots, real, cached_seq_len=0):
+    meta = _metadata(slots, cached_seq_len=cached_seq_len)
+    meta["layers.0.linear_attn"]["num_valid_tokens"] = torch.tensor(
+        real, dtype=torch.int32
+    )
+    return meta
+
+
+def test_padded_prefill_leaves_the_same_state_as_an_unpadded_one():
+    """The property the whole mask exists for.
+
+    Filler rows are deliberately *not* zeros: zeros would flatter the mask,
+    since a zero row perturbs the state far less than a real one. Repeating one
+    token is what the runner actually emits, and it is the worst case -- the
+    l2-normalised keys of identical tokens are identical, so the delta rule's
+    update is at its most aggressive precisely where the data is meaningless.
+    """
+    config = _config()
+    real = 6
+    padded = 40
+
+    hidden = torch.randn(padded, config.hidden_size)
+    hidden[real:] = hidden[real - 1]  # the runner repeats the last position
+
+    layer = _layer(config)
+    with torch.no_grad():
+        layer.forward_paged(hidden[:real], _metadata([0]), is_decode=False)
+    want_conv = layer.conv_state_cache[0].clone()
+    want_rec = layer.recurrent_state_cache[0].clone()
+
+    layer = _layer(config)
+    with torch.no_grad():
+        layer.forward_paged(hidden, _padded_metadata([0], [real]), is_decode=False)
+
+    torch.testing.assert_close(layer.conv_state_cache[0], want_conv, **ALGEBRAIC)
+    torch.testing.assert_close(layer.recurrent_state_cache[0], want_rec, **ALGEBRAIC)
+
+
+def test_an_unmasked_padded_prefill_really_does_corrupt_the_state():
+    """The negative control: without the mask the states must *not* agree.
+
+    Without this, the test above would still pass if padding happened to be
+    harmless, and would then be pinning nothing.
+    """
+    config = _config()
+    real = 6
+    hidden = torch.randn(40, config.hidden_size)
+    hidden[real:] = hidden[real - 1]
+
+    layer = _layer(config)
+    with torch.no_grad():
+        layer.forward_paged(hidden[:real], _metadata([0]), is_decode=False)
+    want = layer.recurrent_state_cache[0].clone()
+
+    layer = _layer(config)
+    with torch.no_grad():
+        layer.forward_paged(hidden, _metadata([0]), is_decode=False)
+
+    assert not torch.allclose(layer.recurrent_state_cache[0], want, **ALGEBRAIC)
+
+
+def test_padded_prefill_then_decode_matches_the_unpadded_sequence():
+    """End to end across the seam: the state is only ever read by decode."""
+    config = _config()
+    real = 6
+    total = real + 1
+
+    hidden = torch.randn(40, config.hidden_size)
+    hidden[real:] = hidden[real - 1]
+    nxt = torch.randn(1, config.hidden_size)
+
+    layer = _layer(config)
+    with torch.no_grad():
+        whole, _, _ = layer(torch.cat([hidden[:real], nxt]).unsqueeze(0))
+        layer.forward_paged(hidden, _padded_metadata([0], [real]), is_decode=False)
+        decode = layer.forward_paged(
+            nxt, _padded_metadata([0], [1], cached_seq_len=real), is_decode=True
+        )
+
+    torch.testing.assert_close(decode, whole.squeeze(0)[-1:], **ALGEBRAIC)
+
+
+def test_each_request_is_masked_at_its_own_length():
+    """Two requests with different real lengths in one padded batch."""
+    config = _config()
+    rows = 20
+    lengths = [7, 3]
+
+    hidden = torch.randn(2, rows, config.hidden_size)
+    for i, n in enumerate(lengths):
+        hidden[i, n:] = hidden[i, n - 1]
+
+    want = []
+    for i, n in enumerate(lengths):
+        solo = _layer(config)
+        with torch.no_grad():
+            solo.forward_paged(hidden[i, :n], _metadata([0]), is_decode=False)
+        want.append(solo.recurrent_state_cache[0].clone())
+
+    layer = _layer(config)
+    with torch.no_grad():
+        layer.forward_paged(
+            hidden.reshape(2 * rows, -1),
+            _padded_metadata([1, 2], lengths),
+            is_decode=False,
+        )
+
+    torch.testing.assert_close(layer.recurrent_state_cache[1], want[0], **ALGEBRAIC)
+    torch.testing.assert_close(layer.recurrent_state_cache[2], want[1], **ALGEBRAIC)
+
+
+def test_the_conv_window_is_gathered_at_a_tensor_offset():
+    """Structural: the padded conv window must not be a Python-int slice.
+
+    ``new_state = extended[..., n : n + width]`` is the obvious spelling and is
+    a data-dependent shape the moment ``n`` is an int -- §4.2 of the plan, and
+    the class of bug that cost DeepSeek-V4 nine device runs. The gather has a
+    fixed width and reads its offset from a tensor instead.
+    """
+    import inspect
+
+    from vllm_neuron.model.qwen3_5 import nki_gdn
+
+    source = inspect.getsource(nki_gdn._trailing_window)
+    assert "torch.gather" in source
+    assert ".item()" not in source
+    assert "int(" not in source
+
+
 def test_fresh_mask_uses_no_python_branch_on_tensor_values():
     """Structural: the fresh-sequence decision must be a mask, not an if.
 

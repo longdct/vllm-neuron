@@ -2888,6 +2888,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Compute cached_seq_len for segmented prefill
         cached_seq_len = self._compute_cached_seq_len()
 
+        # Real tokens per request row, for layers that cannot mask padding
+        # causally. `_create_padded_inputs` appends `padding_map[req_id]`
+        # filler tokens to the end of each request's block, so the real tokens
+        # are the leading ones. Request slots beyond `num_reqs` are batch
+        # padding and hold nothing real, hence the zero fill.
+        valid_token_counts = torch.zeros(padded_num_reqs, dtype=torch.int32)
+        for i, req_id in enumerate(req_ids[:num_reqs]):
+            valid_token_counts[i] = int(
+                num_scheduled_tokens_padded[i] - padding_map.get(req_id, 0)
+            )
+
         # Build attention metadata
         attn_metadata = self._build_attention_metadata(
             padded_num_reqs,
@@ -2900,6 +2911,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 torch.arange(padded_num_reqs, dtype=torch.int32),
                 max_num_scheduled_tokens_padded,
             )[:total_num_scheduled_tokens_padded],
+            valid_token_counts=valid_token_counts,
         )
 
         # Spec decoding
@@ -4073,6 +4085,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
         token_to_request: torch.Tensor | None = None,
+        valid_token_counts: torch.Tensor | None = None,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -4087,6 +4100,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 slots (already MAX-reduced via `_get_dp_padding`). Drives the
                 `decode_context_length_buckets` pick for non-SWA decode
                 groups; ignored when bucketing is unset or the group is SWA.
+            valid_token_counts: `[padded_num_reqs]` count of real (non-padding)
+                leading tokens in each request's token block. Attention does
+                not need it -- padding is masked out causally -- but a
+                recurrent layer does: every row it walks over mutates state,
+                so filler rows would otherwise be carried into decode.
 
         Returns:
             AttentionMetadata object or None for simplified cases
@@ -4239,6 +4257,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     .mul(padded_num_reqs)
                     .div(total_num_scheduled_tokens, rounding_mode="floor")
                     .to(torch.int32)
+                ),
+                # Real tokens per request row. A value, never a shape, so the
+                # traced graph is identical to warmup's (which pads nothing and
+                # therefore passes a full row).
+                "num_valid_tokens": (
+                    valid_token_counts.to(device=self.device, dtype=torch.int32)
+                    if valid_token_counts is not None
+                    else torch.full(
+                        (padded_num_reqs,),
+                        max_query_len,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
                 ),
             }
             if raw_blk_table_tensor is not None:
@@ -4477,6 +4508,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 .mul(num_reqs)
                 .div(num_tokens, rounding_mode="floor")
                 .to(torch.int32),
+                # Warmup pads no request, so every row is real. Must be present
+                # and the same shape as the runtime key or the first padded
+                # batch retraces and `fail_on_recompile` aborts serving.
+                "num_valid_tokens": torch.full(
+                    (num_reqs,), max_query_len, dtype=torch.int32, device=device
+                ),
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset

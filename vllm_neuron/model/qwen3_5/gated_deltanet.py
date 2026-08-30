@@ -538,18 +538,57 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
         return beta, g
 
+    def mask_padding(
+        self,
+        beta: torch.Tensor,
+        g: torch.Tensor,
+        valid_len: torch.Tensor | None,
+    ):
+        """Neutralise padded rows in the delta rule.
+
+        Full attention tolerates bucket padding because a padded key is simply
+        a column the causal mask discards. A recurrence has no such mask: every
+        row it walks over mutates the state that decode later resumes from, so
+        the ~2000 padding rows of a short prompt in a 2048 bucket are *carried*
+        rather than ignored. Worse, padding rows repeat one token, so their
+        l2-normalised keys are near-identical and the delta rule's update is at
+        its most aggressive exactly where the data is meaningless.
+
+        Two quantities have to be neutralised, and both, not either:
+
+        * ``beta = 0`` zeroes ``k_beta`` and ``v_beta``, so the row adds nothing
+          to the state;
+        * ``g = 0`` makes ``exp(g) == 1``, so the row does not *decay* the state
+          it passes through either. Masking only ``beta`` leaves 2000 steps of
+          decay applied to a state that should have stopped evolving, which is
+          the subtler half and produces plausible-looking output.
+
+        Multiplying by a mask rather than indexing keeps the shape static.
+        """
+        if valid_len is None:
+            return beta, g
+        keep = (
+            torch.arange(beta.shape[1], device=beta.device).reshape(1, -1)
+            < valid_len.to(torch.long).reshape(-1, 1)
+        ).unsqueeze(-1)
+        return beta * keep.to(beta.dtype), g * keep.to(g.dtype)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         conv_state: torch.Tensor | None = None,
         recurrent_state: torch.Tensor | None = None,
         use_recurrent: bool = False,
+        valid_len: torch.Tensor | None = None,
     ):
         """Args:
             hidden_states: ``[B, T, hidden]``.
             conv_state: ``[B, conv_dim, kernel - 1]`` or None for a fresh sequence.
             recurrent_state: ``[B, H, Dk, Dv]`` or None.
             use_recurrent: take the single-step path (decode) rather than chunked.
+            valid_len: ``[B]`` count of leading real tokens per row, or None
+                when the caller guarantees every row is real. See
+                ``mask_padding`` for why a recurrent layer cannot ignore this.
 
         Returns:
             ``(output, new_conv_state, new_recurrent_state)``.
@@ -567,7 +606,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 device=mixed.device,
             )
         mixed, new_conv_state = causal_conv1d_with_state(
-            mixed, conv_state, self.conv1d.weight.squeeze(1), None, "silu"
+            mixed,
+            conv_state,
+            self.conv1d.weight.squeeze(1),
+            None,
+            "silu",
+            valid_len=valid_len,
         )
 
         mixed = mixed.transpose(1, 2)  # [B, T, conv_dim]
@@ -578,6 +622,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         value = value.reshape(batch, seq_len, -1, self.head_v_dim)
 
         beta, g = self.gates(hidden_states)
+        beta, g = self.mask_padding(beta, g, valid_len)
 
         if self.num_v_per_k > 1:
             query = query.repeat_interleave(self.num_v_per_k, dim=2)
@@ -637,6 +682,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         meta = attn_metadata[f"layers.{self.layer_idx}.linear_attn"]
         return meta["block_table_tensor"][:, 0].to(torch.long)
 
+    def valid_len(self, meta, rows_per_request: int) -> torch.Tensor:
+        """``[B]`` real-token count per request row, defaulting to all real.
+
+        The runner pads each request's token block up to the bucket, so this is
+        the only signal that separates prompt from filler. It is absent from
+        metadata built by callers that never pad -- the oracle tests and the
+        older paged-state tests -- and those genuinely have no padding, so the
+        default is a full row rather than an error.
+        """
+        counts = meta.get("num_valid_tokens")
+        if counts is None:
+            return None
+        return counts.reshape(-1).to(torch.long).clamp(max=rows_per_request)
+
     def forward_paged(self, hidden_states, attn_metadata, is_decode: bool):
         """Read state for the batch, run the layer, write the state back.
 
@@ -671,6 +730,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 f"across {batch} requests"
             )
         x = hidden_states.view(batch, tokens // batch, -1)
+        valid_len = self.valid_len(meta, x.shape[1])
 
         conv_state = self.conv_state_cache[index]
         recurrent_state = self.recurrent_state_cache[index]
@@ -704,6 +764,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             conv_state=conv_state,
             recurrent_state=recurrent_state,
             use_recurrent=is_decode,
+            valid_len=valid_len,
         )
 
         self.conv_state_cache.index_copy_(

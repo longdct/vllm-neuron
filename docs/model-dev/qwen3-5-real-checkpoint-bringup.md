@@ -150,8 +150,70 @@ specific doubling scheme, which made a numerically unusable algorithm look load
 bearing. It now constrains the graph shape -- logarithmic bound, no per-row scan,
 no power of the input formed -- and leaves numerics to the accuracy tests.
 
+## Bucket padding poisons the recurrence
+
+The NaN fix above was necessary and not sufficient. With finite logits the 0.8B
+still emitted `"^^^^..."` on device and, on CPU, 3 of 32 tokens against
+HuggingFace -- wrong from the very first generated token.
+
+The measurement that isolated it: run the same prompt twice, once padded to the
+2048 bucket exactly as the runner pads it, once as the bare 12 real tokens.
+
+| prefill | tokens matching HF |
+|---|---|
+| 12 real rows, no padding | 32 / 32 |
+| padded to 2048, no mask | 3 / 32, diverges at token 1 |
+| padded to 2048, masked | 12 / 32, diverges at token 12 |
+
+Unpadded parity was already passing, which is why this survived: **every CPU
+probe up to that point fed the model a shape the serving path never produces.**
+`slot_mapping = arange(32)` with no padding is not a bucketed prefill, and the
+one difference between the two columns is the entire defect.
+
+Full attention tolerates padding because a padded key is a column the causal
+mask discards. A recurrence has no such mask -- every row it walks over mutates
+the state decode resumes from -- so ~2036 filler rows were being carried into
+the cache. Filler repeats the last position, so those rows share one token,
+their l2-normalised keys are near-identical, and the delta rule's update is at
+its most aggressive exactly where the data is meaningless.
+
+Three things have to happen, and all three, not any two:
+
+1. `beta = 0` on padded rows, so they add nothing to the state;
+2. `g = 0` on padded rows, so `exp(g) == 1` and they do not *decay* the state
+   they pass through either. This is the subtle half: masking only `beta` still
+   applies 2000 steps of decay to a state that should have stopped evolving,
+   and the result looks plausible;
+3. the conv state must be the `kernel-1` columns ending at the last *real*
+   token. `causal_conv1d_with_state` takes them from the end of the sequence,
+   which on a padded bucket is a window over padding, so decode resumed the
+   convolution from tokens the prompt never contained.
+
+The signal is a new `num_valid_tokens` metadata key -- real tokens per request
+row -- present in **both** metadata builders at the same shape, since it is a
+value and never a shape and warmup must trace the identical graph. The conv
+window is a fixed-width `torch.gather` at a tensor-derived offset rather than
+`extended[..., n : n + width]`, which would be a data-dependent shape the
+moment `n` is an int (section 4.2). `torch.compile(fullgraph=True,
+dynamic=True)` captures the padded path as one graph.
+
+### The residual divergence is a bf16 tie, not a defect
+
+Masked padding still diverges from HF at token 12, which looks like an
+incomplete fix. It is not. Against an unpadded prefill the masked padded run
+differs by 2.7e-05 in the conv state, 5.7e-06 in the recurrent state and
+1.7e-05 in the logits, with identical argmax. The top-2 logit gaps across the
+sequence are 0.75 to 7.4 everywhere except step 12, where the gap is **0.125 --
+exactly one bf16 ULP at logit scale**, the floor this project already records
+as unachievable to beat. A tie at the working precision is not a bug to chase.
+
 ## Still open
 
+- **The NKI chunk-scan kernel is wrong.** With kernels enabled the device emits
+  token 61 thirty-two times; with `VLLM_NEURON_DISABLE_NKI_KERNELS=1` it tracks
+  the CPU path. It is the one component CPU never exercises, which is why it
+  survived the oracle and simulator suites -- those check the kernel against the
+  torch form on shapes the serving path does not produce.
 - **Attention propagates padding NaN into real rows.** Through layers 0-2 the 32
   real rows stayed clean while padding rows were NaN (`bad_real = 0`); at layer 3,
   the first attention layer, all 2048 rows went bad including the real ones.
@@ -159,12 +221,6 @@ no power of the input formed -- and leaves numerics to the accuracy tests.
   causal, so a causal-correct attention cannot do that. The inverse fix removes
   the NaN source, but this contamination path is a separate defect and would bite
   again for any other source of non-finite values.
-- **The GDN state absorbs padding tokens.** `forward_paged` has no per-token
-  validity mask, so all 2048 bucket rows enter the recurrence and the final state
-  written to the cache includes padding contributions. Numerically harmless now,
-  but it is not the state a decode continuation should resume from. Any mask must
-  come from a tensor, never a Python int (section 4.2).
-
 ## Where the 27B stands
 
 Downloaded (18 shards, 52 GB, 1199 keys: 850 text, 333 visual, 15 MTP) and all
