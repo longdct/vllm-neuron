@@ -81,7 +81,18 @@ def _simulate_conv(extended, weight):
     return torch.as_tensor(out).squeeze(2)
 
 
-@pytest.mark.parametrize("channels,kernel,tokens", [(8, 4, 6), (16, 4, 12)])
+@pytest.mark.parametrize(
+    "channels,kernel,tokens",
+    [
+        (8, 4, 6),
+        (16, 4, 12),
+        # The 0.8B runs conv_dim = 2*16*128 + 16*128 = 6144 channels over a
+        # 2048 bucket. Both axes used to stop two orders of magnitude short of
+        # that, so "the conv kernel is covered" meant covered at toy size only.
+        (6144, 4, 12),
+        (16, 4, 512),
+    ],
+)
 def test_depthwise_conv_matches_the_torch_reference(channels, kernel, tokens):
     _requires_conv_kernel()
     torch.manual_seed(0)
@@ -230,6 +241,11 @@ def _scan_via_simulator(q, k, v, g, beta, chunk, initial_state=None, lnc=None):
         (1, 1, 3, 16, 16),      # smallest useful case
         (2, 3, 3, 16, 16),      # batch and heads folded into one launch
         (1, 2, 3, 64, 128),     # the shipped geometry: chunk 64, k=v=128
+        # A 2048 bucket at chunk_size 64 is 32 chunks. The scan builds its
+        # chunk index with register arithmetic in the SBUF domain, which is
+        # exactly the kind of thing that is right for three iterations and
+        # wrong for thirty-two -- so the real count is pinned, not assumed.
+        (1, 2, 32, 16, 16),
     ],
 )
 def test_chunk_scan_matches_the_torch_oracle(batch, heads, chunks, chunk, dim):
