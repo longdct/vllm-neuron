@@ -1,8 +1,9 @@
 
-# Real Qwen3.5 checkpoints: what it took to load, and two device NaNs
+# Real Qwen3.5 checkpoints: loading, two device NaNs, and two accuracy defects
 
-Date: 2026-08-29. Checkpoints: `Qwen/Qwen3.5-0.8B` (24 layers, 18 GDN + 6 full,
-hidden 1024, head_dim 256, 16 K / 16 V heads, vocab 248320) and
+Date: 2026-08-29, revised 2026-08-31. Checkpoints: `Qwen/Qwen3.5-0.8B`
+(24 layers, 18 GDN + 6 full, hidden 1024, head_dim 256, 16 K / 16 V heads,
+vocab 248320) and
 `Qwen/Qwen3.8-27B` (64 layers, hidden 5120, 16 K / 48 V heads, 18 shards).
 
 The 0.8B is the useful one for bring-up: it is 1.8 GB but carries every
@@ -247,56 +248,124 @@ is ~2045 padding rows -- the most padding-dominated case in the set -- and they
 come back exactly right. A mask taking one length for the whole batch would have
 destroyed those two first.
 
-The divergences are late and into coherent, factually correct text. The one at
-step 12 is the bf16 tie measured above. The one at 19 was not measured; it fits
-the same pattern but that is an inference, not a result.
-
 **TP=8 returns byte-identical output to TP=2** on all four prompts -- same
-tokens, same divergence points, same text. That is the TP-invariance section 7.5
-asks for, and it is not a weak check here: TP=8 gives each rank 2 value heads
+tokens, same divergence points, same text. TP=8 gives each rank 2 value heads
 instead of 8, a different `conv_dim_per_rank`, and a different collective
-pattern, so agreeing token for token means the GDN sharding and the sequence-
-parallel gather/reduce-scatter around the recurrence are carrying the same
-state at both degrees.
+pattern, so agreeing token for token does mean the GDN sharding and the
+sequence-parallel gather/reduce-scatter carry the same state at both degrees.
 
-## The chunk-scan kernel is wrong on device
+> **Superseded in part.** This section originally read the 12/32 and 19/32 rows
+> as bf16 drift, and read TP=8 == TP=2 as the TP-invariance section 7.5 asks
+> for. Both readings were wrong, for the same reason: TP=1 had never been run.
+> At TP=1 with the same four prompts the model matches HuggingFace **128/128,
+> exactly**, so the 33 missing tokens here are a TP defect, not arithmetic
+> noise. Invariance among TP>=2 holds; invariance between 1 and 2 does not. See
+> "Two defects, not one" below. The two 32/32 rows still carry their original
+> weight as evidence about the padding mask.
 
-`VLLM_NEURON_DISABLE_NKI_KERNELS` is all-or-nothing, so "kernels off fixes it"
-implicated the depthwise conv exactly as much as the scan. Disabling one at a
-time separates them:
+## Two defects, not one: the scan kernel and tensor parallelism
 
-| configuration | 32 greedy tokens |
+The previous revision of this section was titled "The chunk-scan kernel is wrong
+on device" and blamed the kernel for everything. That was wrong twice over. The
+kernel is **not** wrong on device, and the larger defect has nothing to do with
+it.
+
+### The four-way table
+
+Every earlier comparison held TP fixed at 2 and varied only the kernel, so the
+TP axis was never a variable. Running all four corners, same four prompts, same
+`max_num_seqs=4`, greedy, against HuggingFace:
+
+| configuration | tokens matching HF |
 |---|---|
-| torch conv + **NKI scan** | `" a..............."` |
-| **NKI conv** + torch scan | `" Rome. The capital of Spain is Madrid. ..."` |
-| both off | matches HuggingFace 32/32 |
+| TP=1, scan kernel **off** | **128 / 128 -- exact** |
+| TP=1, scan kernel on | 77 / 128 |
+| TP=2, scan kernel off | 95 / 128 |
+| TP=2, scan kernel on | 1 / 128 |
 
-So the conv kernel is fine and the scan kernel alone is the defect. It is not
-the sharding either: the fault survives at TP 2, 4 and 8, and at TP=8 each LNC
-program handles a single row, which leaves the per-program row loop with nothing
-to get wrong.
+Two independent defects, which compound:
 
-Meanwhile the same kernel is **bit-exact against the torch oracle in the NKI
-simulator** at the shipped geometry, at the real 32-chunk count, and with the
-LNC grid genuinely emulated (`nl.num_programs()` returns 2 and both programs
-run). Simulator-exact and device-wrong is a lowering divergence, not an
-algorithm bug, and none of the coverage that now exists can see it.
+1. **The scan kernel costs accuracy even at TP=1** (128 -> 77).
+2. **TP>1 costs accuracy with no NKI kernel anywhere in the graph** (128 -> 95).
 
-It is therefore **off by default**, behind
-`VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`. The torch chunk rule is slower and
-right; shipping the kernel enabled would be fast and wrong. The flag is for
-debugging the kernel, not for serving.
+The second one is the more serious, and it was invisible until TP=1 was run. An
+earlier note in this file recorded that TP=2 and TP=8 produce byte-identical
+output and called that TP-invariance confirmed. They *are* identical to each
+other -- but both are wrong, and TP=1 is right. Invariance among TP>=2 held;
+invariance between 1 and 2 was never tested and does not hold. 95/128 was
+previously read as bf16 drift. It is not drift: at TP=1 the model reproduces
+HuggingFace exactly, so the 33 missing tokens are a real TP defect.
 
-Running it in isolation on device would be the next step and is currently
-blocked: NKI's standalone numpy path fails in its own harness before reaching
-the compiler, re-invoking python on a path that is literally `None`
-(`can't open file '/tmp/nki_XXXXXXXX/None'`).
+The GDN sharding *arithmetic* is not the cause -- the 21 CPU shard-invariance
+tests in `test_qwen3_5_gdn_tp.py` pass, including the partition-coverage and
+reassembly properties. That points at the attention sharding or at the
+device-side collectives rather than at the GDN partition.
+
+### Running the kernel on device, at last
+
+The kernel could never be judged on its own because NKI's standalone path is
+broken in this install: `nki.baremetal` shells out to
+`python /tmp/nki_XXXXXXXX/None` and dies with `[Errno 2] No such file or
+directory` before reaching the compiler. So "the kernel is wrong on device" had
+only ever been inferred from whole-model output.
+
+There is a way around it. `wrap_nki` produces a torch-callable HOP, so compiling
+a one-op module with `torch.compile(backend="neuron")` drives the kernel through
+*exactly* the lowering production uses. That is a better harness than baremetal
+would have been, not a worse one: a bug that only shows up under the real
+lowering is still in scope, while the rest of the model is not.
+`tools/qwen3_5/run_scan_device.py` is that harness.
+
+With it, the kernel is exact on device everywhere it was put:
+
+| what was run on device | worst relative error |
+|---|---|
+| raw kernel, 7 geometries up to `b1 h16 c32 w64 d128` | 2e-7 |
+| `chunk_gated_delta_rule_nki` wrapper, fp32 and bf16, carried state, pad branch | 1.5e-3 (bf16) |
+| whole GDN layer including the paged-state seam | 2.2e-7 |
+| the same layer in bf16 | 7.2e-3 |
+| decay sweep from `exp(-32)` to no decay at all | 2e-7 |
+| four stacked GDN layers | 1.9e-7 |
+| state caches as **aliased** graph inputs | 1.9e-7 |
+| TP=2, two ranks, real all-gather and reduce-scatter | 2.3e-7 |
+| TP=2 with a padded bucket (12 real tokens in 2048) | 2.1e-7 |
+| real 0.8B layer-0 weights from the checkpoint | 1.7e-7 |
+
+Each run asserts `can_use_chunk_scan_kernel` actually returned the intended
+value, so a silent fallback cannot masquerade as a match.
+
+Two of those rows exist because of mistakes worth recording. **The decay sweep**:
+with `g = -rand(0,1)` the cumulative decay over a 64-token chunk is `exp(-32)`,
+so the carried state is annihilated as soon as it is written and the sequential
+recurrence is very nearly a no-op -- a bug in the inter-chunk carry would have
+been invisible. Every probe before that one had this flaw. **The aliasing row**:
+the real model compiles with 48 input->output aliases (18 GDN layers x 2 states
+plus 6 attention layers x 2 KV tensors) and reports `Mutated inputs: [7, 8, 26,
+...]`, whereas the early probes reported `Mutated inputs: []` -- no aliasing at
+all, because the state caches were module attributes rather than mutated graph
+inputs. Since Neuron's alias-output rewrite is a known clobber hazard here
+(`requires_independent_kv_cache_tensors` exists for it), that gap had to be
+closed before the kernel could be cleared.
+
+So the kernel's own numerics are sound, and whatever costs 51 tokens at TP=1
+lives in how it is scheduled or composed at model scale, not in what it computes.
+It stays **off by default** behind `VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`.
 
 ## Still open
 
-- **Root-cause the chunk-scan lowering divergence** (above). Until then the GDN
-  prefill runs the torch chunk rule, which is a performance gap, not a
-  correctness one.
+- **TP>1 loses accuracy on its own** -- 95/128 at TP=2 against 128/128 at TP=1,
+  with no NKI kernel in the graph. This is the biggest open correctness defect
+  and it is not the GDN partition arithmetic, which is covered by 21 passing CPU
+  shard-invariance tests. The next cut is attention sharding (the Q-head padding
+  and KV replication of section 2.2) against the device-side collectives; the
+  cheapest probe is a single sharded attention layer at TP=1 vs TP=2 on the same
+  real weights, the way `run_scan_device.py` does it for the scan.
+- **The scan kernel costs 51 tokens at TP=1** (128 -> 77) even though it is exact
+  on device in isolation at every geometry, dtype, decay regime, padding, alias
+  structure and TP degree tried (see the table above). What is left is scale and
+  scheduling: 18 GDN call sites in one graph rather than the 1-8 that have been
+  reproduced. Until it is understood the GDN prefill runs the torch chunk rule,
+  which is a performance gap, not a correctness one.
 - **TP=16 and TP=32 are unverified on hardware, and cannot be checked on the
   0.8B at all**: vLLM requires `num_attention_heads % tp == 0` and this
   checkpoint has 8, so TP=16 is rejected at config validation before reaching a
@@ -309,6 +378,7 @@ the compiler, re-invoking python on a path that is literally `None`
   causal, so a causal-correct attention cannot do that. The inverse fix removes
   the NaN source, but this contamination path is a separate defect and would bite
   again for any other source of non-finite values.
+
 ## Where the 27B stands
 
 Downloaded (18 shards, 52 GB, 1199 keys: 850 text, 333 visual, 15 MTP) and all
