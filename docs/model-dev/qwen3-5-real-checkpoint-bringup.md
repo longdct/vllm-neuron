@@ -329,6 +329,7 @@ With it, the kernel is exact on device everywhere it was put:
 | state caches as **aliased** graph inputs | 1.9e-7 |
 | TP=2, two ranks, real all-gather and reduce-scatter | 2.3e-7 |
 | TP=2 with a padded bucket (12 real tokens in 2048) | 2.1e-7 |
+| eight stacked GDN layers at TP=2, padded bucket | 3.2e-7 |
 | real 0.8B layer-0 weights from the checkpoint | 1.7e-7 |
 
 Each run asserts `can_use_chunk_scan_kernel` actually returned the intended
@@ -363,8 +364,8 @@ It stays **off by default** behind `VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`.
 - **The scan kernel costs 51 tokens at TP=1** (128 -> 77) even though it is exact
   on device in isolation at every geometry, dtype, decay regime, padding, alias
   structure and TP degree tried (see the table above). What is left is scale and
-  scheduling: 18 GDN call sites in one graph rather than the 1-8 that have been
-  reproduced. Until it is understood the GDN prefill runs the torch chunk rule,
+  scheduling: 18 GDN call sites in one graph rather than the 8 that have been
+  reproduced clean, plus the interleaved attention layers. Until it is understood the GDN prefill runs the torch chunk rule,
   which is a performance gap, not a correctness one.
 - **TP=16 and TP=32 are unverified on hardware, and cannot be checked on the
   0.8B at all**: vLLM requires `num_attention_heads % tp == 0` and this
