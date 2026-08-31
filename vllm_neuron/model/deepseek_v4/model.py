@@ -95,7 +95,10 @@ from .moe import dense_expert_affinities, hash_topk, routed_topk
 from .nki_compressor import paged_gated_compressor
 from .nki_indexer import paged_projected_bf16_indexer
 from .nki_mla import _HCA_COUNT_BUCKETS, paged_shared_latent_mla
-from .parallel import resolve_parallel_topology
+from .parallel import (
+    resolve_output_projection_partition,
+    resolve_parallel_topology,
+)
 from .weight_loaders import ExpertDType, load_checkpoint_weights
 
 
@@ -758,15 +761,10 @@ class DeepseekV4Attention(nn.Module):
     (the shared latent must be identical on every rank -- it feeds the
     compressed cache). ``q_b_proj``'s output and ``o_a_proj``'s input are
     head-sharded (``num_heads // world_size`` heads per rank, the standard
-    MLA TP split); ``o_groups`` is sharded the same way
-    (``o_groups // world_size`` groups per rank, each covering exactly the
-    same ``num_heads*head_dim // o_groups``-wide input the unsharded real
-    architecture would, since both numerator and denominator scale down by
-    ``world_size`` together), with an all-reduce after ``o_b_proj`` (a
-    row-parallel linear over the local group slice, same pattern as the
-    existing dense ``o_proj`` all-reduce). Not exercised at ``world_size >
-    1`` on real hardware -- see
-    ``docs/model-dev/deepseek-v4-serving-roadmap.md``.
+    MLA TP split). Up through TP8, whole ``o_groups`` are assigned to ranks.
+    Above TP8, consecutive ranks split one group's input columns and replicate
+    that group's ``o_b_proj`` columns. The all-reduce after ``o_b_proj`` then
+    reconstructs both the within-group column sum and the sum across groups.
     """
 
     def __init__(
@@ -823,24 +821,28 @@ class DeepseekV4Attention(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         o_groups = int(getattr(hf_config, "o_groups", 8))
-        o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
-        if o_groups % self.world_size:
-            raise ValueError(
-                f"o_groups={o_groups} must be divisible by TP "
-                f"world_size={self.world_size}"
-            )
-        self.o_groups = o_groups // self.world_size
+        self.o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
+        self.output_partition = resolve_output_projection_partition(
+            tp_degree=self.world_size,
+            tp_rank=self.topology.tp_rank if self.world_size > 1 else 0,
+            output_groups=o_groups,
+            total_input_width=num_heads * self.head_dim,
+        )
+        self.o_groups = self.output_partition.group_count
         local_width = self.heads_per_rank * self.head_dim
-        if local_width % self.o_groups:
+        expected_local_width = self.o_groups * self.output_partition.input_width
+        if local_width != expected_local_width:
             raise ValueError(
-                f"heads_per_rank*head_dim={local_width} must be divisible by "
-                f"o_groups (post-TP-shard)={self.o_groups}"
+                f"heads_per_rank*head_dim={local_width} does not match grouped "
+                f"output projection width={expected_local_width}"
             )
         self.o_a_proj = DeepseekV4GroupedLinear(
-            local_width // self.o_groups, self.o_groups * o_lora_rank, self.o_groups
+            self.output_partition.input_width,
+            self.o_groups * self.o_lora_rank,
+            self.o_groups,
         )
         self.o_b_proj = nn.Linear(
-            self.o_groups * o_lora_rank, config.hidden_size, bias=False
+            self.o_groups * self.o_lora_rank, config.hidden_size, bias=False
         )
         self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
         # Hookable no-op boundaries for focused CPU/Neuron accuracy capture.
@@ -871,6 +873,7 @@ class DeepseekV4Attention(nn.Module):
         """Attach rank-aware loaders (also called after ``to_empty``)."""
         if self.world_size > 1:
             from vllm_neuron.utils.weight_loader import (
+                SafetensorsWeightLoader,
                 set_weight_loader,
                 sharding_weight_loader,
                 with_rank_override,
@@ -888,13 +891,24 @@ class DeepseekV4Attention(nn.Module):
                 self.q_b_proj.weight,
                 loader(0, self.q_b_proj.out_features),
             )
+            partition = self.output_partition
+            row_start = partition.group_start * self.o_lora_rank
+            row_end = row_start + partition.group_count * self.o_lora_rank
+            input_start = partition.input_offset
+            input_end = input_start + partition.input_width
             set_weight_loader(
                 self.o_a_proj.weight,
-                loader(0, self.o_a_proj.out_features),
+                SafetensorsWeightLoader(
+                    transform=lambda slices, _: slices[0][
+                        row_start:row_end, input_start:input_end
+                    ]
+                ),
             )
             set_weight_loader(
                 self.o_b_proj.weight,
-                loader(1, self.o_b_proj.in_features),
+                SafetensorsWeightLoader(
+                    transform=lambda slices, _: slices[0][:, row_start:row_end]
+                ),
             )
             set_weight_loader(
                 self.sinks,

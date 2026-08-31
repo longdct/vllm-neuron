@@ -7,6 +7,88 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class OutputProjectionPartition:
+    """One TP rank's slice of the grouped low-rank output projection.
+
+    At TP degrees up to the number of output groups, ranks own whole groups.
+    Above that point, several consecutive ranks split the input columns of one
+    group and replicate that group's ``o_b`` columns.  The ordinary TP
+    all-reduce then sums both the within-group column partials and the
+    contributions from distinct groups.
+    """
+
+    group_start: int
+    group_count: int
+    ranks_per_group: int
+    input_offset: int
+    input_width: int
+
+
+def resolve_output_projection_partition(
+    *,
+    tp_degree: int,
+    tp_rank: int,
+    output_groups: int,
+    total_input_width: int,
+) -> OutputProjectionPartition:
+    """Resolve a grouped output-projection shard for one TP rank.
+
+    ``total_input_width`` is ``num_attention_heads * head_dim``.  The official
+    checkpoint stores ``o_a`` as ``output_groups`` row blocks, each with the
+    full input width for one group.  Consequently TP can either divide the
+    groups (TP <= groups) or divide each group's input columns (TP > groups).
+    """
+    if tp_degree < 1 or output_groups < 1:
+        raise ValueError(
+            "tp_degree and output_groups must be positive, got "
+            f"tp_degree={tp_degree}, output_groups={output_groups}"
+        )
+    if not 0 <= tp_rank < tp_degree:
+        raise ValueError(f"tp_rank={tp_rank} is outside tp_degree={tp_degree}")
+    if total_input_width % output_groups:
+        raise ValueError(
+            f"total_input_width={total_input_width} must be divisible by "
+            f"output_groups={output_groups}"
+        )
+
+    group_input_width = total_input_width // output_groups
+    if tp_degree <= output_groups:
+        if output_groups % tp_degree:
+            raise ValueError(
+                f"output_groups={output_groups} must be divisible by "
+                f"tp_degree={tp_degree} when tp_degree <= output_groups"
+            )
+        group_count = output_groups // tp_degree
+        return OutputProjectionPartition(
+            group_start=tp_rank * group_count,
+            group_count=group_count,
+            ranks_per_group=1,
+            input_offset=0,
+            input_width=group_input_width,
+        )
+
+    if tp_degree % output_groups:
+        raise ValueError(
+            f"tp_degree={tp_degree} must be divisible by "
+            f"output_groups={output_groups} when tp_degree > output_groups"
+        )
+    ranks_per_group = tp_degree // output_groups
+    if group_input_width % ranks_per_group:
+        raise ValueError(
+            f"input width per output group={group_input_width} must be divisible "
+            f"by ranks_per_group={ranks_per_group}"
+        )
+    input_width = group_input_width // ranks_per_group
+    return OutputProjectionPartition(
+        group_start=tp_rank // ranks_per_group,
+        group_count=1,
+        ranks_per_group=ranks_per_group,
+        input_offset=(tp_rank % ranks_per_group) * input_width,
+        input_width=input_width,
+    )
+
+
+@dataclass(frozen=True)
 class DeepseekV4ParallelTopology:
     """Resolved TP/DP/EP placement for one rank.
 
@@ -58,7 +140,6 @@ class DeepseekV4ParallelTopology:
             )
         checks = (
             (num_heads, self.tp_degree, "num_attention_heads", "tp_degree"),
-            (output_groups, self.tp_degree, "o_groups", "tp_degree"),
             (num_experts, self.ep_degree, "num_experts", "ep_degree"),
             (expert_intermediate_size, self.expert_tp_degree,
              "expert_intermediate_size", "expert_tp_degree"),
@@ -68,6 +149,20 @@ class DeepseekV4ParallelTopology:
                 raise ValueError(
                     f"{size_name}={size} must be divisible by {degree_name}={degree}"
                 )
+        # Above ``output_groups`` the groups are replicated across rank subsets
+        # while their input columns are split. The attention constructor, which
+        # also knows ``head_dim``, validates the resulting input width.
+        if self.tp_degree <= output_groups:
+            output_size, degree = output_groups, self.tp_degree
+            size_name, degree_name = "o_groups", "tp_degree"
+        else:
+            output_size, degree = self.tp_degree, output_groups
+            size_name, degree_name = "tp_degree", "o_groups"
+        if output_size % degree:
+            raise ValueError(
+                f"{size_name}={output_size} must be divisible by "
+                f"{degree_name}={degree}"
+            )
         if not 0 <= self.ep_rank < self.ep_degree:
             raise ValueError(f"ep_rank={self.ep_rank} is outside ep_degree={self.ep_degree}")
         if not 0 <= self.expert_tp_rank < self.expert_tp_degree:

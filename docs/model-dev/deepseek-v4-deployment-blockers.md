@@ -1,9 +1,50 @@
-# DeepSeek-V4: blockers between a correct TP=8 and a deployable model
+# DeepSeek-V4: blockers between a correct scaled-TP model and deployment
 
-> **Status:** TP=8 is numerically correct and validated on device at 2K and 32K
-> context. Four issues block real deployment: single-request-only serving,
-> depth validated at 3 of 43 layers, compile cost, and a TP ceiling of 8.
-> This document records the evidence for each and the plan to resolve them.
+> **Status (2026-08-31):** Q8192 prefill and decode are validated at TP=8.
+> The grouped output projection now supports TP=16/32/64, TP=16 has run at
+> Q8192, and TP=32/EP=2 has run on device. TP=64 is structurally covered but
+> was not run because only 32 logical cores were available without disturbing
+> another workload. Remaining deployment work includes production depth,
+> compile cost, and multi-request serving.
+
+## 2026-08-31 scale-first implementation update
+
+This pass deliberately stays on the model's 16-bit BF16 path. FP8/FP4,
+continuous batching, compile-bucket policy, and speculative-serving work are
+outside its scope.
+
+The first gate was an unchanged-code TP=8 run with an 8192-token prompt. A cold
+compile and a warm-cache repeat both completed a Q8192 prefill, Q8192 and Q32768
+decode graphs, a first-token probe, and 32 generated tokens. The warm run
+reproduced all 32 cold-run token IDs exactly.
+
+| gate | result |
+|---|---|
+| TP=8, 3 layers / 32 experts, Q8192, cold | pass; 629.72 s compiler time; 3.17 tokens/s |
+| TP=8, same cache and workload, warm | pass; identical 32 tokens; 3.97 tokens/s |
+| TP=8, post-change Q8192 recompile | pass; exact same probe and 32 tokens; 3.98 tokens/s |
+| TP=16, 3 layers / 32 experts, Q8192, cold + warm | pass; deterministic across cold/warm; 3.97 tokens/s warm |
+| TP=32/EP=2, 3 layers / 32 experts, Q512 | pass; tokens exactly match the TP=16 Q512 control |
+| TP=32/EP=2, 3 layers / **256 experts**, Q512 | pass; 1.315 GiB parameters and 1.35 GiB HBM used per rank; 2.60 tokens/s |
+
+The TP>8 implementation splits each output group's `o_a` input columns among
+consecutive ranks and replicates the matching `o_b` columns. The existing TP
+all-reduce reconstructs the within-group partial sums. Unit tests cover the
+partition map, checkpoint row/column slices, and numerical reconstruction at
+TP=1/8/16/32/64. TP=32 uses EP=2 so the expert-TP degree remains 16; TP=64 is
+validated with EP=4 by topology, loader, and numerical tests.
+
+The TP=16 Q8192 sequence shares the first-token probe and first 10 generated
+tokens with TP=8, then differs at BF16 router-sensitive positions. It is exactly
+repeatable on a warm run. The stronger EP-specific check uses identical Q512
+geometry: TP=32/EP=2 and TP=16 produced the same eight token IDs.
+
+Expert-count scaling was checked with an official-derived 3-layer checkpoint
+containing all 256 experts. The checkpoint verifier found all expected experts
+in each layer and exact sampled dequantization against the official converter.
+The TP=32/EP=2 cold run compiled Q512 prefill/decode in 248.65 s and completed
+generation. This isolates the dominant checkpoint-width scaling axis; depth is
+still limited to 3 of 43 layers by the locally available official shards.
 
 ## Where the model actually is
 
@@ -129,9 +170,9 @@ Compile is host-CPU-bound and already saturated (~28 concurrent `neuronx-cc`,
 `walrus_driver` at ~700% CPU on 192 vCPUs), so more host parallelism is not
 available as a lever.
 
-### 5. TP is capped at 8, and again at 16
+### 5. TP ceiling — resolved in code through TP=64
 
-Two independent ceilings:
+There were two independent ceilings:
 
 **`o_groups`** — `parallel.py` `validate()` rejects `output_groups % tp_degree`.
 With `o_groups = 8`, TP=16 fails outright.
@@ -141,6 +182,11 @@ intermediate `>= 128`. With `moe_intermediate_size = 2048` that means
 **`expert_tp_degree <= 16`**. Since `expert_tp_degree = world_size // ep_degree`,
 TP=32 requires `ep_degree >= 2` and TP=64 requires `ep_degree >= 4`.
 **Expert parallelism is a prerequisite for TP>16, not an independent feature.**
+
+The output projection ceiling is now removed by sharding within each output
+group when TP exceeds `o_groups`. TP=16 and TP=32/EP=2 have passed device
+generation; TP=64/EP=4 passes topology, loader-slicing, and numerical tests.
+TP=64 still needs a device run when all 64 logical cores are available.
 
 ---
 
@@ -156,17 +202,18 @@ python tools/deepseek_v4/fetch_official_shards.py /home/ubuntu/dsv4-official-sha
 ~36 GB. `fetch_official_shards.py` already resolves which shards a layer list
 needs. Independent of all code work.
 
-### Step 1 — Lift the TP ceiling
+### Step 1 — Lift the TP ceiling (implemented 2026-08-31)
 
-**Files:** `model/deepseek_v4/parallel.py`, `model.py`, `weight_loaders.py`
+**Files:** `model/deepseek_v4/parallel.py`, `model.py`,
+`test_parallelism.py`
 
-1. **Relax the `o_groups` guard** to permit both regimes:
+1. **Relax the `o_groups` guard** to permit both regimes: **done**
    - `world_size <= o_groups`: whole groups per rank (today), `o_groups % world_size == 0`
    - `world_size > o_groups`: one group split across `world_size // o_groups`
      ranks, requiring `world_size % o_groups == 0` and per-rank input width above
      the NKI partition floor.
 
-2. **Generalise the output projection** (`model.py:827-843`, forward `:1265-1271`).
+2. **Generalise the output projection** (`model.py:827-843`, forward `:1265-1271`): **done**.
    `DeepseekV4GroupedLinear` (`model.py:717-732`) applies `F.linear` per group with
    **no bias**, and the forward already ends in `tp_group.all_reduce(out)`.
    Splitting a group's *input* across ranks is therefore exactly summable by that
@@ -175,11 +222,13 @@ needs. Independent of all code work.
 
 3. **Extend the `o_a_proj` weight loader** to slice dim 1 (within-group input) by
    the rank's position inside its group, alongside existing dim-0 group slicing.
+   **Done**, with TP=16/32/64 checkpoint-slice tests.
 
-4. **Wire EP for TP>16.** The machinery exists (`parallel.py:89-153` EP branch,
-   `get_neuron_ep_tp_group`, `wide_ep_group`) but has never run on device.
-   Validate `ep_degree=2` at TP=32 and `ep_degree=4` at TP=64; confirm
+4. **Wire EP for TP>16.** The existing machinery (`parallel.py` EP branch,
+   `get_neuron_ep_tp_group`, `wide_ep_group`) now runs at `ep_degree=2` on
+   device. Validate `ep_degree=4` at TP=64 when the full host is available; confirm
    `num_experts=256 % ep_degree == 0` and per-rank expert intermediate stays >=128.
+   TP=32/EP=2 is now device-validated; TP=64/EP=4 remains a device-only follow-up.
 
 Every new sharding path needs a test driving `resolve_parallel_topology` end to
 end, asserting per-rank shards **tile the checkpoint exactly once**. See the note
@@ -256,12 +305,21 @@ The deliverable is a defensible extrapolation to 43 layers / 256 experts.
     test/unit/test_deepseek_v4_small_context_buckets.py -q
 ```
 
-Baseline **277 passed / 4 skipped**.
+Current result after the scale-first changes: **305 passed / 4 skipped**.
 
 **Device, per step** — greedy token comparison plus per-module activation diffing,
 judged on median-row relative RMS and token equality (see the router-tie note):
 
-- **Step 1:** TP=16 matches the TP=8 reference tokens; then TP=32/EP=2, TP=64/EP=4.
+`generate_tiny.py --capture-modules <comma-separated names>` limits capture to
+the full-width boundaries relevant to a comparison. Compare two runs with
+`tools/deepseek_v4/compare_tp_captures.py <reference> <actual>`; it fails when
+capture sets/shapes differ or any module exceeds the median-row relative-RMS
+threshold.
+
+- **Step 1:** TP=8 post-change regression matches its reference exactly; TP=16
+  Q8192 is deterministic and agrees through the first router-sensitive
+  divergence; TP=32/EP=2 matches the TP=16 Q512 control exactly. TP=64/EP=4
+  remains pending device availability.
 - **Step 2:** compile wall-clock and instruction count fall with tokens unchanged.
 - **Step 3:** batch=1 still matches the batch=1 reference exactly (strongest
   available regression check), then ragged batch=8 against the portable oracle.

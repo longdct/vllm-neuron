@@ -47,6 +47,13 @@ def main() -> None:
         help="Capture decoder-layer and lm-head outputs for accuracy diagnosis.",
     )
     parser.add_argument(
+        "--capture-modules",
+        help=(
+            "Comma-separated module names to capture. Requires --capture-dir; "
+            "useful for focused TP comparisons without capturing every layer."
+        ),
+    )
+    parser.add_argument(
         "--capture-attention-internals-layer",
         type=int,
         choices=range(3),
@@ -154,6 +161,13 @@ def main() -> None:
             parser.error("--ep-degree requires --enable-expert-parallel")
         if args.ep_degree < 1:
             parser.error("--ep-degree must be positive")
+    if args.capture_modules and args.capture_dir is None:
+        parser.error("--capture-modules requires --capture-dir")
+    if args.capture_modules and args.capture_attention_internals_layer is not None:
+        parser.error(
+            "--capture-modules and --capture-attention-internals-layer are "
+            "mutually exclusive"
+        )
     if args.prompt and (args.prompt_length or args.workload_lengths):
         parser.error("--prompt cannot be combined with synthetic prompt lengths")
     if args.prompt_length is not None and args.workload_lengths:
@@ -207,7 +221,15 @@ def main() -> None:
     if explicit_decode_buckets:
         neuron_config["decode_context_length_buckets"] = explicit_decode_buckets
     if args.capture_dir is not None:
-        if args.capture_attention_internals_layer is None:
+        if args.capture_modules:
+            capture_modules = [
+                module.strip() for module in args.capture_modules.split(",")
+            ]
+            if any(not module for module in capture_modules):
+                parser.error("--capture-modules cannot contain empty names")
+            if len(capture_modules) != len(set(capture_modules)):
+                parser.error("--capture-modules cannot contain duplicates")
+        elif args.capture_attention_internals_layer is None:
             capture_modules = [
                 "model.embed_tokens",
                 *[
