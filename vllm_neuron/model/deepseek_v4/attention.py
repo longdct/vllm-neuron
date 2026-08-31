@@ -29,13 +29,19 @@ class SharedLatentAttentionContract:
 class SharedLatentMLAInputs:
     """Bounded physical-address inputs for the opaque shared-latent kernel.
 
+    ``sliding_contiguous`` states that adjacent query rows belong to one
+    request and therefore advance through overlapping sliding windows. Decode
+    batches contain one row from each request and must set it false so the NKI
+    kernel gathers each row independently.
+
     ``compressed_uniform`` states that every query in the call requests the
     *same* compressed logical entries, differing only in which of them are
-    valid. HCA sets it: its suffix is sized from the addressable entry capacity,
-    so ``recent_compressed_logical_indices`` returns ``start == 0`` for every
-    query and the rows repeat. CSA never can -- its rows come from a per-query
-    top-k. The kernel uses it to gather the compressed stream once per launch
-    instead of once per query; see ``nki_mla._build_uniform_span``.
+    valid *and maps them through the same request's block table*. Single-request
+    HCA sets it: its suffix is sized from the addressable entry capacity, so
+    ``recent_compressed_logical_indices`` returns ``start == 0`` for every
+    query and the physical rows repeat. CSA and multi-request HCA cannot set it.
+    The kernel uses it to gather the compressed stream once per launch instead
+    of once per query; see ``nki_mla._build_uniform_span``.
     """
 
     query: torch.Tensor
@@ -46,6 +52,7 @@ class SharedLatentMLAInputs:
     compressed_slots: torch.Tensor | None
     compressed_valid: torch.Tensor | None
     sinks: torch.Tensor
+    sliding_contiguous: bool = True
     compressed_uniform: bool = False
 
 

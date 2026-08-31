@@ -29,6 +29,7 @@ from vllm_neuron.model.deepseek_v4.nki_indexer import (
     _query_tiles,
     _use_static_decode_kernel,
     _visible_page_counts,
+    paged_projected_bf16_indexer,
 )
 
 
@@ -54,6 +55,8 @@ def test_q1_indexer_is_padded_to_q8_with_masked_rows():
 
 
 def test_decode_bucket_routes_to_the_static_kernel_and_prefill_does_not():
+    assert _use_static_decode_kernel(2)
+    assert _use_static_decode_kernel(4)
     assert _use_static_decode_kernel(8)
     assert not _use_static_decode_kernel(16)
     assert not _use_static_decode_kernel(8192)
@@ -64,6 +67,57 @@ def test_dynamic_page_loop_env_flag_restores_the_runtime_kernel(monkeypatch):
     assert not _use_static_decode_kernel(8)
     monkeypatch.setenv("VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP", "0")
     assert _use_static_decode_kernel(8)
+
+
+def test_paged_indexer_passes_owner_aware_tables_to_decode_kernel(monkeypatch):
+    captured = {}
+
+    class FakeKernel:
+        def __getitem__(self, grid):
+            assert grid == 2
+
+            def launch(
+                query,
+                _keys,
+                _gate,
+                visible,
+                _topk,
+                _max_pages,
+                block_tables,
+                block_valid,
+                owners,
+                _physical_stride,
+                _logical_slots,
+            ):
+                captured["tables"] = block_tables
+                captured["block_valid"] = block_valid
+                captured["owners"] = owners
+                captured["visible"] = visible
+                return (
+                    torch.zeros(query.shape[0], 512, dtype=torch.int32),
+                    visible,
+                )
+
+            return launch
+
+    monkeypatch.setattr(nki_indexer, "can_run_kernel", lambda _: True)
+    monkeypatch.setattr(nki_indexer, "_wrapped_decode_indexer", FakeKernel())
+    tables = torch.stack((torch.arange(16), torch.arange(16, 32)))
+    selection = paged_projected_bf16_indexer(
+        torch.zeros(4, 1, 64, 128, dtype=torch.bfloat16),
+        torch.zeros(4, 1, 64, dtype=torch.bfloat16),
+        torch.zeros(40, 1, 32, 128, dtype=torch.bfloat16),
+        tables,
+        torch.tensor([1, 0, -1, 2]),
+        torch.tensor([7, 8, 9, 10]),
+        logical_slots_per_block=32,
+    )
+
+    assert captured["tables"].shape == (2, 16)
+    assert captured["block_valid"].all()
+    assert captured["owners"].tolist() == [1, 0, 0, 1]
+    assert captured["visible"].tolist() == [7, 8, 0, 0]
+    assert selection.valid.sum(dim=1).tolist() == [7, 8, 0, 0]
 
 
 def test_decode_indexer_kernel_has_no_runtime_control_flow():

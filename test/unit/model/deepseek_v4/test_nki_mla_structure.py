@@ -44,6 +44,7 @@ def test_paged_mla_gathers_the_sliding_run_once_not_per_query():
         nki_mla._paged_sliding_latent_mla_kernel,
     ):
         source = inspect.getsource(kernel)
+        assert "_SPAN_GATHER and sliding_contiguous" in source
         assert "_build_sliding_span(" in source
         # Built once per query run, outside the per-query loop.
         assert source.index("_build_sliding_span(") < source.index(
@@ -144,3 +145,44 @@ def test_paged_dispatch_preserves_microchunk_and_tile_order(monkeypatch, query_c
 
     assert output.shape == query.shape
     assert launches == [(0, query_count)]
+
+
+def test_batched_decode_disables_cross_request_span_reuse(monkeypatch):
+    captured = {}
+
+    class Wrapped:
+        def __getitem__(self, grid):
+            assert grid == 2
+
+            def invoke(query, *args):
+                captured["sliding_contiguous"] = args[-2]
+                captured["compressed_uniform"] = args[-1]
+                return query
+
+            return invoke
+
+    monkeypatch.setattr(nki_mla, "can_run_kernel", lambda _: True)
+    monkeypatch.setattr(nki_mla, "_wrapped_paged_shared_latent_mla", Wrapped())
+    query = torch.zeros(4, 1, 1, 512, dtype=torch.bfloat16)
+    sliding_slots = torch.zeros(4, 128, dtype=torch.int32)
+    compressed_slots = torch.zeros(4, 32, dtype=torch.int32)
+    output = nki_mla.paged_shared_latent_mla(
+        SharedLatentMLAInputs(
+            query=query,
+            sliding_cache=torch.zeros(1, 1, 128, 512, dtype=torch.bfloat16),
+            sliding_slots=sliding_slots,
+            sliding_valid=torch.ones_like(sliding_slots, dtype=torch.bool),
+            compressed_cache=torch.zeros(1, 1, 32, 512, dtype=torch.bfloat16),
+            compressed_slots=compressed_slots,
+            compressed_valid=torch.ones_like(compressed_slots, dtype=torch.bool),
+            sinks=torch.zeros(1),
+            sliding_contiguous=False,
+            compressed_uniform=False,
+        )
+    )
+
+    assert output.shape == query.shape
+    assert captured == {
+        "sliding_contiguous": False,
+        "compressed_uniform": False,
+    }

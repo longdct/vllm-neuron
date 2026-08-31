@@ -53,6 +53,7 @@ class RuntimeIndexerMLA(torch.nn.Module):
             index_gate,
             index_cache,
             index_block_table,
+            owners,
             visible,
             logical_slots_per_block=self.logical_slots_per_block,
         )
@@ -109,7 +110,7 @@ def main() -> None:
         1, 1, physical_stride, 128, dtype=torch.bfloat16, device=device
     )
     index_block_table = torch.zeros(
-        args.block_columns, dtype=torch.int32, device=device
+        1, args.block_columns, dtype=torch.int32, device=device
     )
     if args.prefill_visibility:
         visible = torch.div(

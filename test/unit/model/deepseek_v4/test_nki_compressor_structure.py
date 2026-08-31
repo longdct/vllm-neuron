@@ -126,6 +126,79 @@ def test_candidate_count_is_one_for_q1_and_ceil_query_over_ratio_otherwise():
         assert indices.shape == (expected,)
 
 
+def test_completion_candidates_are_partitioned_per_padded_request():
+    ratio = 4
+    positions = torch.tensor(
+        [
+            0,
+            1,
+            2,
+            3,
+            3,
+            3,
+            3,
+            3,  # request 0: four real rows, then padding
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,  # request 1: full segment
+            *([0] * 8),  # request 2: decode-bucket padding row
+            *([20] * 8),  # request 3: just admitted, no completed window
+        ]
+    )
+    owners = torch.arange(4).repeat_interleave(8)
+    slots = torch.full((32,), -1, dtype=torch.long)
+    slots[3], slots[9], slots[13] = 103, 201, 205
+
+    indices, rope_positions, selected_slots, valid = _completion_candidates(
+        positions, owners, slots, ratio, num_requests=4
+    )
+
+    assert indices.tolist() == [3, 7, 9, 13, 19, 23, 27, 31]
+    assert rope_positions.tolist() == [0, 4, 8, 12, 0, 4, 20, 24]
+    assert valid.tolist() == [True, False, True, True, False, False, False, False]
+    assert selected_slots[valid].tolist() == [103, 201, 205]
+
+
+def test_candidate_windows_use_each_candidates_request_block_table():
+    ratio = 4
+    page = 4
+    width = 256
+    positions = torch.tensor(
+        [0, 1, 2, 3, 3, 3, 3, 3, 10, 11, 12, 13, 14, 15, 16, 17]
+    )
+    owners = torch.tensor([0] * 8 + [1] * 8)
+    output_slots = torch.full((16,), -1, dtype=torch.long)
+    output_slots[3], output_slots[9], output_slots[13] = 3, 9, 13
+    block_tables = torch.tensor(
+        [
+            [1, 2, 3, 4, 5],
+            [10, 11, 12, 13, 14],
+        ]
+    )
+    state_cache = torch.zeros(20, 1, page, 2 * width, dtype=torch.bfloat16)
+
+    slots, _, _, _, valid = _paged_candidate_windows(
+        state_cache,
+        positions,
+        owners,
+        block_tables,
+        output_slots,
+        ratio=ratio,
+        overlap=True,
+    )
+
+    assert valid.tolist() == [True, False, True, True]
+    # Request 1's two windows cover logical 4..11 and 8..15. They must use
+    # physical blocks 11/12 and 12/13 from row 1, never row 0's 2/3 and 3/4.
+    assert slots[2].tolist() == list(range(44, 52))
+    assert slots[3].tolist() == list(range(48, 56))
+
+
 def test_two_candidate_kernel_launch_is_padded_to_four(monkeypatch):
     captured = {}
 

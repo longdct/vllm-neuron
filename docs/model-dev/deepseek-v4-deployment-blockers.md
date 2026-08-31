@@ -4,14 +4,15 @@
 > The grouped output projection now supports TP=16/32/64, TP=16 has run at
 > Q8192, and TP=32/EP=2 has run on device. TP=64 is structurally covered but
 > was not run because only 32 logical cores were available without disturbing
-> another workload. Remaining deployment work includes production depth,
-> compile cost, and multi-request serving.
+> another workload. Multi-request decode is now validated at TP=8 with a live
+> ragged batch of eight requests. Remaining deployment work includes production
+> depth, compile cost, and the Neuron scheduler's existing single-prefill / no
+> mixed-prefill-and-decode limitation.
 
 ## 2026-08-31 scale-first implementation update
 
 This pass deliberately stays on the model's 16-bit BF16 path. FP8/FP4,
-continuous batching, compile-bucket policy, and speculative-serving work are
-outside its scope.
+compile-bucket policy, and speculative-serving work are outside its scope.
 
 The first gate was an unchanged-code TP=8 run with an 8192-token prompt. A cold
 compile and a warm-cache repeat both completed a Q8192 prefill, Q8192 and Q32768
@@ -104,35 +105,46 @@ requirement, not an optimisation.**
 
 ## The four blockers
 
-### 1. Only one request can be served at a time
+### 1. Multi-request model execution — resolved for decode
 
-Two live guards raise on any batch:
+The original implementation had two live guards that raised on any batch:
 
 ```
 model.py:605   "DeepSeek-V4 NKI CSA milestone supports one TP1 request"
 model.py:1409  "DeepSeek-V4 NKI HCA milestone supports one TP1 request"
 ```
 
-Both trigger on `block_tables.shape[0] != 1` or a non-zero `token_to_request`.
-Despite the message text the check is on batch shape, so TP=8 does not lift it.
-Every run to date used `--max-num-seqs 1` because anything else raises.
+Both triggered on `block_tables.shape[0] != 1` or a non-zero
+`token_to_request`. They are now removed. CSA and HCA retain the full 2-D block
+table, and the indexer receives one owner per query so each query resolves its
+own physical pages.
 
-**Mitigating discovery — most of the work is already done.** The portable paths
-are already batch-aware and serve as a ready-made CPU oracle:
+The portable batch-aware paths were used as the CPU oracle:
 
 - `model.py:617-623` — `read_compressed_history_batched(mla_cache, block_tables, token_to_request, ...)`
 - `model.py:1417-1424` — `logical_to_physical_slots_batched(..., owners, ...)`
 - `nki_compressor.py:308` — already validates `token_to_request.shape == positions.shape`
 
-There is exactly **one hard kernel assert**: `nki_indexer.py:806-807`,
-`if block_table.ndim != 1`. The call site passes `block_tables[0]` and
-`visible[:, 0]`.
+The NKI indexer now accepts `[num_requests, num_blocks]` tables and a
+`token_to_request` owner vector for both the static decode and runtime prefill
+kernels. The compressor builds fixed candidate segments per request, preventing
+one request from selecting another request's candidates. Cross-request MLA span
+reuse and uniform compressed-history shortcuts are disabled when multiple block
+table rows are present. Decode buckets 2 and 4 are accepted in addition to the
+existing 1/8-and-larger buckets, and padded owner rows are masked inert.
 
-**The landed static decode kernel makes this cheap.** `_decode_indexer_kernel`
-unrolls queries with `nl.affine_range`, so `q_idx` is a Python int and a
-per-query block table row is a **static slice** `block_table[q_idx]` — no
-register-indirect gather and no new dynamic control flow. Against the old
-`fori_loop` kernel this would have been substantially harder.
+The Neuron scheduler is a separate boundary. It still explicitly permits only
+one prefill request at a time and does not mix prefill and decode in the same
+step. The kernel interfaces are owner-aware for prefill, but this change does
+not claim mixed-prefill scheduling support.
+
+**Device result:** a TP=8 Q8 graph served a ragged batch of eight requests with
+prompt lengths `[4,3,3,2,2,1,1,1]`, producing four tokens each. With the KV GMU
+budget cap set to 1.0, the batched generation took 0.932 s (34.33 aggregate
+tokens/s), and every output exactly matched an individual sequential run. The
+same graph was also exercised under the default cap, where only two requests
+were live and six graph rows were padding. A standalone real-Neuron B2/Q16
+indexer trace additionally passed page-range and candidate-count checks.
 
 ### 2. Depth validated at 3 of 43 layers
 
@@ -250,29 +262,30 @@ Before batching, because batching multiplies it by 4x.
 4. **Check compiler flags** (`NEURON_CC_FLAGS`, optlevel) for a compile/runtime
    trade-off acceptable during bring-up.
 
-### Step 3 — Continuous batching
+### Step 3 — Continuous decode batching (implemented 2026-08-31)
 
 **Files:** `model.py`, `nki_indexer.py`, `nki_mla.py`
 
-1. **Give the indexer a batch dimension.** Replace the `block_table.ndim != 1`
-   assert with a `[num_seqs, num_blocks]` table plus a per-query owner vector; in
-   `_decode_indexer_kernel`, index it by the already-static `q_idx`.
+1. **Give the indexer a batch dimension: done.** Replaced the 1-D block-table
+   contract with a `[num_seqs, num_blocks]` table plus a per-query owner vector
+   in both decode and runtime-prefill kernels.
 
-   *Verify first:* whether vLLM's chunked-prefill scheduler can place tokens from
-   two requests in one prefill step. If it can, prefill needs owners too; if not,
-   the 1-D prefill table is sound and should be **asserted rather than assumed**.
+   The scheduler inspection confirmed that Neuron currently restricts prefill
+   batches to one request and forbids mixed prefill/decode. Prefill nevertheless
+   receives owners so the kernel boundary does not encode that scheduler limit.
 
-2. **Lift the two guards** (`model.py:605`, `:1409`), passing `block_tables` and
-   `token_to_request` / `owners` through instead of `[0]`.
+2. **Lift the two guards: done.** CSA and HCA pass complete block tables and
+   owner vectors instead of row zero.
 
-3. **Test against the portable oracle.** Assert the NKI batched path matches
+3. **Test against the portable oracle: done.** The batched paths match
    `read_compressed_history_batched` / `logical_to_physical_slots_batched` for
    ragged batches — differing lengths, a zero-length request, a just-admitted
-   request. Available without device time.
+   request — in CPU unit tests and NKI simulator tests.
 
-4. **Bucket machinery already exists** — `num_seqs_buckets`,
-   `get_decode_padded_batch_size` (`bucket_utils.py:618-653`). Confirm padded rows
-   stay inert, as `_pad_single_query_bucket` already ensures for Q1→Q8.
+4. **Bucket integration: done.** The tool accepts explicit sequence buckets,
+   decoder buckets 2 and 4 are legal, and tests confirm invalid padded owners
+   stay inert. The TP=8 device run exercised both eight live rows and the
+   default-budget case with six padded rows.
 
 ### Step 4 — Depth ladder
 
@@ -305,7 +318,8 @@ The deliverable is a defensible extrapolation to 43 layers / 256 experts.
     test/unit/test_deepseek_v4_small_context_buckets.py -q
 ```
 
-Current result after the scale-first changes: **305 passed / 4 skipped**.
+Current result after the continuous-batching changes: **322 passed / 4 skipped**.
+The full DeepSeek-V4 NKI simulator suite is **43 passed**.
 
 **Device, per step** — greedy token comparison plus per-module activation diffing,
 judged on median-row relative RMS and token equality (see the router-tie note):
@@ -321,8 +335,9 @@ threshold.
   divergence; TP=32/EP=2 matches the TP=16 Q512 control exactly. TP=64/EP=4
   remains pending device availability.
 - **Step 2:** compile wall-clock and instruction count fall with tokens unchanged.
-- **Step 3:** batch=1 still matches the batch=1 reference exactly (strongest
-  available regression check), then ragged batch=8 against the portable oracle.
+- **Step 3:** complete for multi-request decode. Ragged batch=8 matches eight
+  sequential runs exactly on TP=8 hardware; unit and simulator tests cover
+  per-request pages, empty/new requests, candidate boundaries, and padded rows.
 - **Step 4:** each rung generates coherent tokens; record the scaling curve.
 
 ### Known-good long-context invocation
@@ -358,9 +373,9 @@ worthwhile papercut cleanup (tracked below).
 - **Compile cost may not fall enough.** If per-layer dedup is impossible and 43
   layers extrapolates to many hours, iterating on the real model becomes
   impractical and the ladder becomes the primary test vehicle. Decide after Step 2.
-- **Continuous batching may exceed the indexer.** Per-request *admission*
-  mid-flight touches the scheduler and may surface work not visible from the
-  kernel side.
+- **Mixed prefill/decode is still unsupported by the Neuron scheduler.** Decode
+  continuously batches admitted requests, but prefills remain serialized. This
+  is a throughput limitation rather than an indexer correctness blocker.
 - **Disk.** The mid-depth fetch leaves ~116 GB free; NEFF artifacts and compile
   caches ran to hundreds of MB per configuration, and the ladder multiplies
   configurations.

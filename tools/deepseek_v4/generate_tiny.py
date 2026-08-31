@@ -29,6 +29,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument(
+        "--num-seqs-buckets",
+        help=(
+            "Comma-separated compiled decode batch buckets. The last value "
+            "must equal --max-num-seqs; e.g. 8 compiles only batch 8."
+        ),
+    )
     parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument(
@@ -128,6 +135,21 @@ def main() -> None:
         "--workload-lengths",
         help="Comma-separated synthetic prompt lengths to execute sequentially.",
     )
+    parser.add_argument(
+        "--batch-prompt-lengths",
+        help=(
+            "Comma-separated synthetic prompt lengths to submit in one batched "
+            "generate call, e.g. 8,5,1."
+        ),
+    )
+    parser.add_argument(
+        "--verify-batch-against-sequential",
+        action="store_true",
+        help=(
+            "After a batched workload, rerun each prompt separately through "
+            "the same engine and require identical greedy token ids."
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument(
         "--first-token-probe",
@@ -168,14 +190,28 @@ def main() -> None:
             "--capture-modules and --capture-attention-internals-layer are "
             "mutually exclusive"
         )
-    if args.prompt and (args.prompt_length or args.workload_lengths):
-        parser.error("--prompt cannot be combined with synthetic prompt lengths")
-    if args.prompt_length is not None and args.workload_lengths:
-        parser.error("--prompt-length and --workload-lengths are mutually exclusive")
+    prompt_modes = sum(
+        value is not None
+        for value in (
+            args.prompt,
+            args.prompt_length,
+            args.workload_lengths,
+            args.batch_prompt_lengths,
+        )
+    )
+    if prompt_modes > 1:
+        parser.error(
+            "--prompt, --prompt-length, --workload-lengths, and "
+            "--batch-prompt-lengths are mutually exclusive"
+        )
+    if args.verify_batch_against_sequential and args.batch_prompt_lengths is None:
+        parser.error(
+            "--verify-batch-against-sequential requires --batch-prompt-lengths"
+        )
     if args.max_tokens < 1:
         parser.error("--max-tokens must be positive")
-    if args.max_model_len < 12:
-        parser.error("--max-model-len must fit the 8-token prompt and 4 outputs")
+    if args.max_model_len < 1:
+        parser.error("--max-model-len must be positive")
     if args.num_gpu_blocks_override < 32:
         parser.error("--num-gpu-blocks-override must be at least 32")
 
@@ -199,17 +235,22 @@ def main() -> None:
     decode_buckets = parse_buckets(
         args.decode_context_buckets, "--decode-context-buckets"
     )
+    num_seqs_buckets = parse_buckets(args.num_seqs_buckets, "--num-seqs-buckets")
     if prefill_buckets[-1] != max_num_batched_tokens:
         parser.error("the largest prefill segment bucket must equal --max-num-batched-tokens")
     if max_num_batched_tokens > args.max_model_len:
         parser.error("--max-num-batched-tokens cannot exceed --max-model-len")
     if decode_buckets and decode_buckets[-1] > args.max_model_len:
         parser.error("decode context buckets cannot exceed --max-model-len")
+    if num_seqs_buckets and num_seqs_buckets[-1] != args.max_num_seqs:
+        parser.error("the last --num-seqs-buckets value must equal --max-num-seqs")
 
     neuron_config = {
         "num_batched_tokens_buckets": prefill_buckets,
         "on_device_sampling_config": None,
     }
+    if num_seqs_buckets:
+        neuron_config["num_seqs_buckets"] = num_seqs_buckets
     if args.ep_degree is not None:
         neuron_config["ep_degree"] = args.ep_degree
     # The runner always compiles max_model_len as an implicit final decode
@@ -306,17 +347,33 @@ def main() -> None:
     vocab_size = json.loads(
         (args.checkpoint / "config.json").read_text()
     )["vocab_size"]
-    if args.workload_lengths:
+    batch_workload = args.batch_prompt_lengths is not None
+    length_spec = args.batch_prompt_lengths or args.workload_lengths
+    if length_spec:
         try:
-            lengths = [int(item) for item in args.workload_lengths.split(",")]
+            lengths = [int(item) for item in length_spec.split(",")]
         except ValueError:
-            parser.error("--workload-lengths must be comma-separated integers")
+            option = (
+                "--batch-prompt-lengths"
+                if batch_workload
+                else "--workload-lengths"
+            )
+            parser.error(f"{option} must be comma-separated integers")
         if not lengths or any(length <= 0 for length in lengths):
-            parser.error("--workload-lengths entries must be positive")
+            option = (
+                "--batch-prompt-lengths"
+                if batch_workload
+                else "--workload-lengths"
+            )
+            parser.error(f"{option} entries must be positive")
     elif args.prompt_length is not None:
         lengths = [args.prompt_length]
     else:
         lengths = []
+    if batch_workload and len(lengths) > args.max_num_seqs:
+        parser.error(
+            "--batch-prompt-lengths contains more prompts than --max-num-seqs"
+        )
     prompts = (
         [[int(x) for x in args.prompt.split(",")]]
         if args.prompt
@@ -345,31 +402,76 @@ def main() -> None:
             "seconds": probe_seconds,
         }
 
+    def validate_output(prompt_ids, output, generation_seconds):
+        token_ids = list(output.outputs[0].token_ids)
+        if len(token_ids) != args.max_tokens or any(
+            token < 0 or token >= vocab_size for token in token_ids
+        ):
+            raise SystemExit(f"invalid generated tokens: {token_ids}")
+        return {
+            "prompt_length": len(prompt_ids),
+            "token_ids": token_ids,
+            "generation_seconds": generation_seconds,
+            "tokens_per_second": len(token_ids) / generation_seconds,
+        }
+
     workload_results = []
-    for prompt_ids in prompts:
+    batch_generation_seconds = None
+    batch_matches_sequential = None
+    if batch_workload:
         generation_started = time.perf_counter()
         outputs = llm.generate(
-            [{"prompt_token_ids": prompt_ids}],
+            [{"prompt_token_ids": prompt_ids} for prompt_ids in prompts],
             SamplingParams(
                 temperature=0.0,
                 max_tokens=args.max_tokens,
                 ignore_eos=args.ignore_eos,
             ),
         )
-        generation_seconds = time.perf_counter() - generation_started
-        token_ids = list(outputs[0].outputs[0].token_ids)
-        if len(token_ids) != args.max_tokens or any(
-            token < 0 or token >= vocab_size for token in token_ids
-        ):
-            raise SystemExit(f"invalid generated tokens: {token_ids}")
-        workload_results.append(
-            {
-                "prompt_length": len(prompt_ids),
-                "token_ids": token_ids,
-                "generation_seconds": generation_seconds,
-                "tokens_per_second": len(token_ids) / generation_seconds,
-            }
-        )
+        batch_generation_seconds = time.perf_counter() - generation_started
+        if len(outputs) != len(prompts):
+            raise SystemExit(
+                f"batched generation returned {len(outputs)} outputs for "
+                f"{len(prompts)} prompts"
+            )
+        workload_results = [
+            validate_output(prompt_ids, output, batch_generation_seconds)
+            for prompt_ids, output in zip(prompts, outputs, strict=True)
+        ]
+        if args.verify_batch_against_sequential:
+            sequential_tokens = []
+            for prompt_ids in prompts:
+                sequential = llm.generate(
+                    [{"prompt_token_ids": prompt_ids}],
+                    SamplingParams(
+                        temperature=0.0,
+                        max_tokens=args.max_tokens,
+                        ignore_eos=args.ignore_eos,
+                    ),
+                )[0]
+                sequential_tokens.append(list(sequential.outputs[0].token_ids))
+            batched_tokens = [item["token_ids"] for item in workload_results]
+            batch_matches_sequential = sequential_tokens == batched_tokens
+            if not batch_matches_sequential:
+                raise SystemExit(
+                    "batched greedy tokens differ from same-engine sequential tokens: "
+                    f"batch={batched_tokens}, sequential={sequential_tokens}"
+                )
+    else:
+        for prompt_ids in prompts:
+            generation_started = time.perf_counter()
+            outputs = llm.generate(
+                [{"prompt_token_ids": prompt_ids}],
+                SamplingParams(
+                    temperature=0.0,
+                    max_tokens=args.max_tokens,
+                    ignore_eos=args.ignore_eos,
+                ),
+            )
+            generation_seconds = time.perf_counter() - generation_started
+            workload_results.append(
+                validate_output(prompt_ids, outputs[0], generation_seconds)
+            )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "token_ids": workload_results[-1]["token_ids"],
@@ -381,6 +483,13 @@ def main() -> None:
         result["first_token_probe"] = first_token_result
     if len(workload_results) > 1 or lengths:
         result["workloads"] = workload_results
+    if batch_generation_seconds is not None:
+        result["batch_generation_seconds"] = batch_generation_seconds
+        result["batch_tokens_per_second"] = (
+            len(prompts) * args.max_tokens / batch_generation_seconds
+        )
+    if batch_matches_sequential is not None:
+        result["batch_matches_sequential"] = batch_matches_sequential
     args.output.write_text(json.dumps(result, indent=2) + "\n")
 
 

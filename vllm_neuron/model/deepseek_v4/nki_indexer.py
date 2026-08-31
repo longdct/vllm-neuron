@@ -19,7 +19,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 from .indexer import IndexerSelection, streaming_topk_compressed_entries
 
 _SCHEDULER_QUERY_BUCKETS = frozenset(
-    (1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
+    (1, 2, 4, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 )
 _MAX_RUNTIME_LOOP_TRIPS = 2048
 _INDEXER_QUERIES_PER_LNC = 8
@@ -65,6 +65,7 @@ def _emit_scan_page(
     static_page,
     block_table,
     block_valid,
+    block_table_row_base,
     physical_page_stride,
     logical_slots_per_block,
 ):
@@ -111,6 +112,12 @@ def _emit_scan_page(
                 operand0=blocks_per_score_page,
                 op1=nl.add,
                 operand1=page_block,
+            )
+            nisa.tensor_tensor(
+                dst=column_sb,
+                data1=column_sb,
+                data2=block_table_row_base,
+                op=nl.add,
             )
             column_reg = nisa.register_alloc()
             nisa.register_load(column_reg, column_sb)
@@ -187,6 +194,12 @@ def _emit_scan_page(
                 operand0=blocks_per_score_page,
                 op1=nl.add,
                 operand1=page_block,
+            )
+            nisa.tensor_tensor(
+                dst=column_sb,
+                data1=column_sb,
+                data2=block_table_row_base,
+                op=nl.add,
             )
             column_reg = nisa.register_alloc()
             nisa.register_load(column_reg, column_sb)
@@ -329,6 +342,7 @@ def _projected_bf16_indexer_kernel(
     topk: int,
     block_table=None,
     block_valid=None,
+    token_to_request=None,
     physical_page_stride: int = 0,
     logical_slots_per_block: int = 0,
 ):
@@ -350,7 +364,13 @@ def _projected_bf16_indexer_kernel(
     entries, key_dim = keys.shape
     paged = block_table is not None
     if paged:
-        entries = block_table.shape[0] * logical_slots_per_block
+        assert block_table.shape == block_valid.shape
+        assert token_to_request.shape == (q_count,)
+        block_columns = block_table.shape[1]
+        entries = block_columns * logical_slots_per_block
+        flat_table_size = block_table.shape[0] * block_columns
+        block_table = block_table.reshape((flat_table_size,))
+        block_valid = block_valid.reshape((flat_table_size,))
     assert one == 1 and heads == 64 and head_dim == key_dim == 128
     assert entries % 512 == 0 and topk == 512
     one_page = entries == 512
@@ -431,6 +451,30 @@ def _projected_bf16_indexer_kernel(
             nisa.dma_transpose(dst=q_t, src=query_row)
             nisa.dma_transpose(dst=gate_t, src=gate_row)
 
+        block_table_row_base = None
+        if paged:
+            owner_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            if q_count == 1:
+                nisa.dma_copy(dst=owner_sb, src=token_to_request[0:1])
+            else:
+                nisa.dma_copy(
+                    dst=owner_sb,
+                    src=token_to_request.ap(
+                        pattern=[[1, 1]],
+                        scalar_offset=q_idx_reg,
+                        indirect_dim=0,
+                    ),
+                )
+            block_table_row_base = nl.ndarray(
+                (1, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=block_table_row_base,
+                data=owner_sb,
+                op0=nl.multiply,
+                operand0=block_columns,
+            )
+
         running_scores = nl.ndarray((1, topk), dtype=nl.float32, buffer=nl.sbuf)
         running_indices = nl.ndarray((1, topk), dtype=nl.int32, buffer=nl.sbuf)
         nisa.memset(running_scores, value=float("-inf"))
@@ -490,6 +534,7 @@ def _projected_bf16_indexer_kernel(
                 one_page,
                 block_table,
                 block_valid,
+                block_table_row_base,
                 physical_page_stride,
                 logical_slots_per_block,
             )
@@ -565,10 +610,11 @@ def _decode_indexer_kernel(
     max_pages: int,
     block_table=None,
     block_valid=None,
+    token_to_request=None,
     physical_page_stride: int = 0,
     logical_slots_per_block: int = 0,
 ):
-    """Fully static small-query indexer for batch-1 decode.
+    """Fully static small-query indexer for batched decode.
 
     ``_projected_bf16_indexer_kernel`` bounds its page loop with a runtime
     register, which forces every launch to hold the two LNC programs in
@@ -586,7 +632,13 @@ def _decode_indexer_kernel(
     entries, key_dim = keys.shape
     paged = block_table is not None
     if paged:
-        entries = block_table.shape[0] * logical_slots_per_block
+        assert block_table.shape == block_valid.shape
+        assert token_to_request.shape == (q_count,)
+        block_columns = block_table.shape[1]
+        entries = block_columns * logical_slots_per_block
+        flat_table_size = block_table.shape[0] * block_columns
+        block_table = block_table.reshape((flat_table_size,))
+        block_valid = block_valid.reshape((flat_table_size,))
     assert one == 1 and heads == 64 and head_dim == key_dim == 128
     assert entries % 512 == 0 and topk == 512
     assert max_pages == entries // 512
@@ -605,6 +657,23 @@ def _decode_indexer_kernel(
         gate_t = nl.ndarray((heads, 1), dtype=gate.dtype, buffer=nl.sbuf)
         nisa.dma_transpose(dst=q_t, src=query[q_idx, 0, :, :])
         nisa.dma_transpose(dst=gate_t, src=gate[q_idx, 0, :].reshape((1, heads)))
+
+        block_table_row_base = None
+        if paged:
+            owner_sb = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(
+                dst=owner_sb,
+                src=token_to_request[q_idx : q_idx + 1],
+            )
+            block_table_row_base = nl.ndarray(
+                (1, 1), dtype=nl.int32, buffer=nl.sbuf
+            )
+            nisa.tensor_scalar(
+                dst=block_table_row_base,
+                data=owner_sb,
+                op0=nl.multiply,
+                operand0=block_columns,
+            )
 
         running_scores = nl.ndarray((1, topk), dtype=nl.float32, buffer=nl.sbuf)
         running_indices = nl.ndarray((1, topk), dtype=nl.int32, buffer=nl.sbuf)
@@ -634,6 +703,7 @@ def _decode_indexer_kernel(
                 True,
                 block_table,
                 block_valid,
+                block_table_row_base,
                 physical_page_stride,
                 logical_slots_per_block,
             )
@@ -784,12 +854,13 @@ def paged_projected_bf16_indexer(
     query: torch.Tensor,
     gate: torch.Tensor,
     key_cache: torch.Tensor,
-    block_table: torch.Tensor,
+    block_tables: torch.Tensor,
+    token_to_request: torch.Tensor,
     visible: torch.Tensor,
     *,
     logical_slots_per_block: int,
 ) -> IndexerSelection:
-    """Opaque single-request paged indexer with safe indirect DMA targets."""
+    """Opaque batched paged indexer with explicit request ownership."""
     if (
         query.shape[0] not in _SCHEDULER_QUERY_BUCKETS
         and query.shape[0] != _INDEXER_QUERY_TILE
@@ -803,8 +874,14 @@ def paged_projected_bf16_indexer(
         raise RuntimeError("DeepSeek-V4 NKI indexer requires [Q,1,64,128] query")
     if key_cache.ndim != 4 or key_cache.shape[1] != 1 or key_cache.shape[-1] != 128:
         raise RuntimeError("DeepSeek-V4 NKI indexer cache must be [blocks,1,page,128]")
-    if block_table.ndim != 1:
-        raise RuntimeError("DeepSeek-V4 NKI indexer milestone requires one request")
+    if block_tables.ndim != 2 or block_tables.shape[0] < 1:
+        raise RuntimeError(
+            "DeepSeek-V4 NKI indexer block tables must be [requests,blocks]"
+        )
+    if token_to_request.shape != (query.shape[0],):
+        raise RuntimeError(
+            "DeepSeek-V4 NKI indexer requires one request id per query"
+        )
     if visible.shape != (query.shape[0],):
         raise RuntimeError("DeepSeek-V4 NKI indexer visible counts must be [Q]")
     if logical_slots_per_block < 1 or 512 % logical_slots_per_block:
@@ -816,25 +893,37 @@ def paged_projected_bf16_indexer(
     if any(t.dtype != torch.bfloat16 for t in (query, gate, key_cache)):
         raise RuntimeError("DeepSeek-V4 NKI indexer requires BF16 inputs")
 
-    capacity = block_table.numel() * logical_slots_per_block
+    capacity = block_tables.shape[1] * logical_slots_per_block
     score_page_columns = 512 // logical_slots_per_block
-    padded_columns = math.ceil(block_table.numel() / score_page_columns) * score_page_columns
-    if padded_columns != block_table.numel():
+    padded_columns = (
+        math.ceil(block_tables.shape[1] / score_page_columns) * score_page_columns
+    )
+    if padded_columns != block_tables.shape[1]:
         padding = torch.full(
-            (padded_columns - block_table.numel(),),
+            (block_tables.shape[0], padded_columns - block_tables.shape[1]),
             -1,
-            dtype=block_table.dtype,
-            device=block_table.device,
+            dtype=block_tables.dtype,
+            device=block_tables.device,
         )
-        kernel_block_table = torch.cat((block_table, padding), dim=0)
+        kernel_block_table = torch.cat((block_tables, padding), dim=1)
     else:
-        kernel_block_table = block_table
+        kernel_block_table = block_tables
     block_valid = (kernel_block_table >= 0) & (
         kernel_block_table < key_cache.shape[0]
     )
     safe_table = kernel_block_table.clamp(0, key_cache.shape[0] - 1).to(torch.int32)
     flat_cache = key_cache[:, 0].reshape(-1, 128)
-    visible_i32 = visible.to(torch.int32).clamp(min=0, max=capacity)
+    owner_valid = (token_to_request >= 0) & (
+        token_to_request < block_tables.shape[0]
+    )
+    safe_owners = token_to_request.clamp(0, block_tables.shape[0] - 1).to(
+        torch.int32
+    )
+    visible_i32 = torch.where(
+        owner_valid,
+        visible.to(torch.int32).clamp(min=0, max=capacity),
+        torch.zeros((), dtype=torch.int32, device=visible.device),
+    )
     block_valid_i32 = block_valid.to(torch.int32)
     # The kernel derives ``entries`` from the padded table, so the static page
     # bound must be derived the same way rather than from ``capacity``.
@@ -846,6 +935,18 @@ def paged_projected_bf16_indexer(
             gate[start:stop],
             visible_i32[start:stop],
         )
+        owners_part = safe_owners[start:stop]
+        if owners_part.shape[0] != query_part.shape[0]:
+            owners_part = torch.cat(
+                (
+                    owners_part,
+                    torch.zeros(
+                        query_part.shape[0] - owners_part.shape[0],
+                        dtype=torch.int32,
+                        device=owners_part.device,
+                    ),
+                )
+            )
         if _use_static_decode_kernel(query_part.shape[0]):
             part = _wrapped_decode_indexer[2](
                 query_part,
@@ -856,6 +957,7 @@ def paged_projected_bf16_indexer(
                 max_pages,
                 safe_table,
                 block_valid_i32,
+                owners_part,
                 key_cache.shape[2],
                 logical_slots_per_block,
             )
@@ -870,6 +972,7 @@ def paged_projected_bf16_indexer(
                 512,
                 safe_table,
                 block_valid_i32,
+                owners_part,
                 key_cache.shape[2],
                 logical_slots_per_block,
             )

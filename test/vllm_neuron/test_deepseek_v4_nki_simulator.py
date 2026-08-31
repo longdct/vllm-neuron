@@ -423,6 +423,7 @@ def _uniform_paged_tile(compressed_count, *, partial, seed):
         compressed_slots,
         torch.where(compressed_valid, zero, neg_inf),
         torch.randn(64, dtype=torch.bfloat16),
+        True,  # sliding_contiguous
         True,  # compressed_uniform
     ]
     return inputs, compressed_valid, sliding_valid
@@ -514,6 +515,7 @@ def test_uniform_compressed_span_handles_the_q1_decode_launch(compressed_count):
         compressed_slots,
         torch.where(compressed_valid, zero, neg_inf),
         torch.zeros(64, dtype=torch.bfloat16),
+        True,  # sliding_contiguous
         True,  # compressed_uniform
     )
 
@@ -651,11 +653,12 @@ def test_projected_indexer_paged_indirection_and_null_block():
     query = torch.randn(1, 1, 64, 128, dtype=torch.bfloat16)
     gate = torch.randn(1, 1, 64, dtype=torch.bfloat16)
     cache = torch.randn(blocks, stride, 128, dtype=torch.bfloat16)
-    table = torch.arange(blocks - 1, -1, -1, dtype=torch.int32)
-    block_valid = torch.ones(blocks, dtype=torch.int32)
-    block_valid[3] = 0
+    table = torch.arange(blocks - 1, -1, -1, dtype=torch.int32).unsqueeze(0)
+    block_valid = torch.ones((1, blocks), dtype=torch.int32)
+    block_valid[0, 3] = 0
     safe_table = table.clone()
-    safe_table[3] = 0
+    safe_table[0, 3] = 0
+    owners = torch.zeros(1, dtype=torch.int32)
     visible = torch.tensor([377], dtype=torch.int32)
     visible_pages = torch.tensor([1], dtype=torch.int32)
     indices, used = nki.simulate(_projected_bf16_indexer_kernel[1])(
@@ -667,6 +670,7 @@ def test_projected_indexer_paged_indirection_and_null_block():
         512,
         safe_table,
         block_valid,
+        owners,
         stride,
         logical,
     )
@@ -694,6 +698,42 @@ def test_projected_indexer_q16_tile_handles_runtime_visible_page_counts():
     for q_idx, count in enumerate(visible.tolist()):
         if count:
             assert set(indices[q_idx, :count].tolist()) == set(range(count))
+
+
+def test_projected_indexer_prefill_uses_dynamic_request_owners():
+    requests, columns, stride, logical = 2, 32, 32, 32
+    query = torch.ones(16, 1, 64, 128, dtype=torch.bfloat16)
+    gate = torch.ones(16, 1, 64, dtype=torch.bfloat16)
+    cache = torch.empty(64, stride, 128, dtype=torch.bfloat16)
+    cache[:16].fill_(0.125)
+    cache[16:32].fill_(1.0)
+    cache[32:48].fill_(1.0)
+    cache[48:].fill_(0.125)
+    tables = torch.arange(64, dtype=torch.int32).reshape(requests, columns)
+    block_valid = torch.ones_like(tables, dtype=torch.int32)
+    owners = torch.tensor([0] * 8 + [1] * 8, dtype=torch.int32)
+    visible = torch.full((16,), 1024, dtype=torch.int32)
+    visible_pages = torch.full((16,), 2, dtype=torch.int32)
+
+    indices, used = nki.simulate(_projected_bf16_indexer_kernel[2])(
+        query,
+        cache.reshape(-1, 128),
+        gate,
+        visible,
+        visible_pages,
+        512,
+        tables,
+        block_valid,
+        owners,
+        stride,
+        logical,
+    )
+
+    assert used.tolist() == [1024] * 16
+    for q_idx in range(8):
+        assert set(indices[q_idx].tolist()) == set(range(512, 1024))
+    for q_idx in range(8, 16):
+        assert set(indices[q_idx].tolist()) == set(range(512))
 
 
 def _decode_batch_of_one(visible_row, q_count=8):
@@ -771,11 +811,12 @@ def test_decode_indexer_paged_indirection_and_null_block():
     query = torch.randn(8, 1, 64, 128, dtype=torch.bfloat16)
     gate = torch.randn(8, 1, 64, dtype=torch.bfloat16)
     cache = torch.randn(blocks, stride, 128, dtype=torch.bfloat16)
-    table = torch.arange(blocks - 1, -1, -1, dtype=torch.int32)
-    block_valid = torch.ones(blocks, dtype=torch.int32)
-    block_valid[3] = 0
+    table = torch.arange(blocks - 1, -1, -1, dtype=torch.int32).unsqueeze(0)
+    block_valid = torch.ones((1, blocks), dtype=torch.int32)
+    block_valid[0, 3] = 0
     safe_table = table.clone()
-    safe_table[3] = 0
+    safe_table[0, 3] = 0
+    owners = torch.zeros(8, dtype=torch.int32)
     visible = _decode_batch_of_one(377)
 
     indices, used = nki.simulate(_decode_indexer_kernel[2])(
@@ -787,6 +828,7 @@ def test_decode_indexer_paged_indirection_and_null_block():
         (blocks * logical) // 512,
         safe_table,
         block_valid,
+        owners,
         stride,
         logical,
     )
@@ -796,6 +838,43 @@ def test_decode_indexer_paged_indirection_and_null_block():
     assert int(used[0]) == eligible.numel()
     assert set(indices[0, : int(used[0])].tolist()) == set(eligible.tolist())
     assert used[1:].tolist() == [0] * 7
+
+
+def test_decode_indexer_uses_each_querys_request_block_table():
+    requests, columns, stride, logical = 2, 32, 32, 32
+    query = torch.ones(4, 1, 64, 128, dtype=torch.bfloat16)
+    gate = torch.ones(4, 1, 64, dtype=torch.bfloat16)
+    cache = torch.empty(64, stride, 128, dtype=torch.bfloat16)
+    # Request 0 ranks its second logical half above its first. Request 1 does
+    # the opposite, so using the wrong table row flips the selected half.
+    cache[:16].fill_(0.125)
+    cache[16:32].fill_(1.0)
+    cache[32:48].fill_(1.0)
+    cache[48:].fill_(0.125)
+    tables = torch.arange(64, dtype=torch.int32).reshape(requests, columns)
+    block_valid = torch.ones_like(tables, dtype=torch.int32)
+    owners = torch.tensor([0, 1, 0, 1], dtype=torch.int32)
+    visible = torch.tensor([1024, 1024, 0, 0], dtype=torch.int32)
+
+    indices, used = nki.simulate(_decode_indexer_kernel[2])(
+        query,
+        cache.reshape(-1, 128),
+        gate,
+        visible,
+        512,
+        2,
+        tables,
+        block_valid,
+        owners,
+        stride,
+        logical,
+    )
+
+    # The paged kernel reports all valid rows; the public wrapper clamps this
+    # to top-k when it builds ``IndexerSelection.valid``.
+    assert used.tolist() == [1024, 1024, 0, 0]
+    assert set(indices[0].tolist()) == set(range(512, 1024))
+    assert set(indices[1].tolist()) == set(range(512))
 
 
 def test_decode_indexer_zero_visible_row_selects_nothing():
@@ -810,6 +889,51 @@ def test_decode_indexer_zero_visible_row_selects_nothing():
         query, keys, gate, visible, 512, 2048 // 512
     )
     assert used.tolist() == [0] * 8
+
+
+def test_batched_mla_does_not_reuse_spans_across_requests():
+    torch.manual_seed(139)
+    q_count = 4
+    zero = torch.tensor(0, dtype=torch.bfloat16)
+    neg_inf = torch.tensor(float("-inf"), dtype=torch.bfloat16)
+    query = torch.randn(q_count, 1, 64, 512, dtype=torch.bfloat16)
+    sliding_cache = torch.randn(12, 1, 64, 512, dtype=torch.bfloat16)
+    compressed_cache = torch.randn(12, 1, 64, 512, dtype=torch.bfloat16)
+    sliding_slots = torch.stack(
+        [torch.randperm(768, dtype=torch.int32)[:128] for _ in range(q_count)]
+    )
+    compressed_slots = torch.stack(
+        [torch.randperm(768, dtype=torch.int32)[:32] for _ in range(q_count)]
+    )
+    sliding_valid = torch.ones_like(sliding_slots, dtype=torch.bool)
+    compressed_valid = torch.ones_like(compressed_slots, dtype=torch.bool)
+    sinks = torch.randn(64, dtype=torch.bfloat16)
+
+    actual = nki.simulate(_paged_shared_latent_mla_kernel[2])(
+        query,
+        sliding_cache,
+        sliding_slots,
+        torch.where(sliding_valid, zero, neg_inf),
+        compressed_cache,
+        compressed_slots,
+        torch.where(compressed_valid, zero, neg_inf),
+        sinks,
+        False,  # sliding_contiguous
+        False,  # compressed_uniform
+    )
+    sliding, sliding_valid = gather_bounded_paged_latent(
+        sliding_cache, sliding_slots, sliding_valid
+    )
+    compressed, compressed_valid = gather_bounded_paged_latent(
+        compressed_cache, compressed_slots, compressed_valid
+    )
+    expected = shared_latent_attention(
+        query,
+        torch.cat((compressed, sliding), dim=1),
+        visibility=torch.cat((compressed_valid, sliding_valid), dim=1),
+        attention_sinks=sinks,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.025, atol=0.025)
 
 
 @pytest.mark.parametrize(

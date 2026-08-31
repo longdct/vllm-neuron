@@ -303,33 +303,53 @@ def _completion_candidates(
     token_to_request: torch.Tensor,
     output_slot_mapping: torch.Tensor,
     ratio: int,
+    num_requests: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return fixed-size completion indices, RoPE positions, slots, validity."""
+    """Return fixed-size per-request completion candidates.
+
+    vLLM packs every request into an equally sized, padded segment. Building a
+    fixed ``ceil(segment / ratio)`` candidate grid per segment preserves the
+    boundary-only kernel size while allowing ragged prefill and one-token
+    decode rows from different requests to share a launch.
+    """
     if positions.ndim != 1 or token_to_request.shape != positions.shape:
         raise ValueError("positions and token_to_request must be one-dimensional")
     if output_slot_mapping.shape != positions.shape:
         raise ValueError("output_slot_mapping must contain one slot per token")
-    if positions.numel() < 1 or ratio < 1:
-        raise ValueError("a non-empty packed query and positive ratio are required")
+    if positions.numel() < 1 or ratio < 1 or num_requests < 1:
+        raise ValueError(
+            "a non-empty packed query, positive ratio, and requests are required"
+        )
 
     query_count = positions.shape[0]
-    max_completed_entries = (
-        1 if query_count == 1 else (query_count + ratio - 1) // ratio
+    if query_count % num_requests:
+        raise ValueError("packed query rows must divide evenly across requests")
+    tokens_per_request = query_count // num_requests
+    candidates_per_request = (tokens_per_request + ratio - 1) // ratio
+    request_starts = (
+        torch.arange(num_requests, device=positions.device, dtype=torch.long)
+        * tokens_per_request
     )
-    first_position = positions[0].long()
-    first_completion = ratio - 1 - (first_position % ratio)
-    candidate_indices = (
-        first_completion
-        + torch.arange(max_completed_entries, device=positions.device, dtype=torch.long)
+    first_positions = positions[request_starts].long()
+    first_completions = ratio - 1 - (first_positions % ratio)
+    local_candidates = first_completions[:, None] + (
+        torch.arange(
+            candidates_per_request, device=positions.device, dtype=torch.long
+        )[None, :]
         * ratio
     )
-    in_range = candidate_indices < query_count
+    candidate_indices = (request_starts[:, None] + local_candidates).reshape(-1)
+    in_range = (local_candidates < tokens_per_request).reshape(-1)
     safe_indices = candidate_indices.clamp(max=query_count - 1)
     actual_positions = positions[safe_indices].long()
-    expected_positions = first_position + candidate_indices
-    owner = token_to_request[0].long()
+    expected_positions = (
+        first_positions[:, None] + local_candidates
+    ).reshape(-1)
+    expected_owners = token_to_request[request_starts].long()[:, None].expand(
+        -1, candidates_per_request
+    ).reshape(-1)
     valid = in_range & (actual_positions == expected_positions)
-    valid &= token_to_request[safe_indices].long() == owner
+    valid &= token_to_request[safe_indices].long() == expected_owners
     slots = output_slot_mapping[safe_indices].long()
     valid &= slots >= 0
     rope_positions = torch.div(expected_positions, ratio, rounding_mode="floor") * ratio
@@ -348,7 +368,13 @@ def _paged_candidate_windows(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build only ``[candidate_count, coff*ratio]`` raw paged windows."""
     candidate_indices, rope_positions, output_slots, candidate_valid = (
-        _completion_candidates(positions, token_to_request, output_slot_mapping, ratio)
+        _completion_candidates(
+            positions,
+            token_to_request,
+            output_slot_mapping,
+            ratio,
+            state_block_tables.shape[0],
+        )
     )
     safe_indices = candidate_indices.clamp(max=positions.shape[0] - 1)
     completion_positions = positions[safe_indices].long()
@@ -398,9 +424,9 @@ def paged_gated_compressor(
     """Reduce packed compressor boundaries without a per-query state gather.
 
     Returns FP32 reduced entries, their compressor-RoPE positions, selected
-    compressed-cache slots, and candidate validity. The optimized contract is
-    one request with contiguous real positions; invalid/padded candidates are
-    retained at the fixed shape and returned as exact zero rows.
+    compressed-cache slots, and candidate validity. Each request occupies an
+    equally sized padded segment; invalid/padded candidates are retained at the
+    fixed shape and returned as exact zero rows.
     """
     head_dim = position_bias.shape[1] // (2 if overlap else 1)
     if (ratio, head_dim) not in _SUPPORTED_GEOMETRIES:

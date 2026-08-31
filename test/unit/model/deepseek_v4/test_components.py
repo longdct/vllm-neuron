@@ -12,10 +12,13 @@ from vllm_neuron.model.deepseek_v4.attention import (
     compressed_entry_slot_mapping,
     gather_bounded_paged_latent,
     gather_paged_latent,
+    gather_recent_window,
+    gather_recent_window_batched,
     logical_to_physical_slots_batched,
     mla_attention_reference,
     recent_compressed_logical_indices,
     recent_sliding_logical_indices,
+    read_compressed_history_batched,
     shared_latent_attention,
     shared_latent_attention_contract_reference,
     visible_compressed_entries,
@@ -115,6 +118,56 @@ def test_bounded_logical_mapping_rejects_invalid_request_ownership():
     )
     assert slots.tolist() == [[-1], [-1]]
     assert not valid.any()
+
+
+def test_ragged_batched_histories_match_per_request_oracles():
+    cache = torch.arange(12 * 1 * 4 * 3, dtype=torch.float32).reshape(12, 1, 4, 3)
+    tables = torch.tensor(
+        [
+            [2, 5, -1],
+            [7, 1, 6],
+            [-1, -1, -1],
+            [9, -1, -1],
+        ]
+    )
+    owners = torch.arange(4)
+    positions = torch.tensor([5, 9, 0, 0])
+
+    recent, recent_valid = gather_recent_window_batched(
+        cache, tables, owners, 4, positions
+    )
+    for request in range(4):
+        expected, expected_valid = gather_recent_window(
+            cache, tables[request], 4, positions[request]
+        )
+        torch.testing.assert_close(recent[request], expected)
+        assert torch.equal(recent_valid[request], expected_valid)
+
+    compressed, compressed_valid = read_compressed_history_batched(
+        cache,
+        tables,
+        owners,
+        positions,
+        compress_ratio=2,
+        raw_block_size=4,
+    )
+    capacity = tables.shape[1] * 2
+    for request in range(4):
+        visible = int((positions[request] + 1) // 2)
+        expected, expected_valid = gather_paged_latent(
+            cache,
+            tables[request],
+            capacity,
+            logical_slots_per_block=2,
+            return_validity=True,
+        )
+        expected = expected.squeeze(1)
+        expected_valid &= torch.arange(capacity) < visible
+        expected = torch.where(
+            expected_valid[:, None], expected, torch.zeros_like(expected)
+        )
+        torch.testing.assert_close(compressed[request], expected)
+        assert torch.equal(compressed_valid[request], expected_valid)
 
 
 def test_bounded_paged_latent_contract_handles_all_sentinels_and_slot_zero():

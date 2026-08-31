@@ -602,18 +602,12 @@ class DeepseekV4Indexer(nn.Module):
         gate = self.weights_proj(hidden).view(-1, 1, self.n_heads)
         visible = visible_compressed_entries(positions.reshape(-1), self.ratio)[:, None]
         if can_run_kernel(query):
-            multiple_requests = not torch.compiler.is_compiling() and bool(
-                (token_to_request != 0).any()
-            )
-            if block_tables.shape[0] != 1 or multiple_requests:
-                raise RuntimeError(
-                    "DeepSeek-V4 NKI CSA milestone supports one TP1 request"
-                )
             return paged_projected_bf16_indexer(
                 query,
                 gate,
                 self.mla_cache,
-                block_tables[0],
+                block_tables,
+                token_to_request,
                 visible[:, 0],
                 logical_slots_per_block=self.mla_raw_block_size // self.ratio,
             )
@@ -1407,22 +1401,12 @@ class DeepseekV4Attention(nn.Module):
                         f"compiled bucket is {max(_HCA_COUNT_BUCKETS)}"
                     )
                 compressed_count = min(eligible)
-                # The span the kernel builds is one request's block table, so a
-                # launch may not mix requests.  The CSA path already refuses
-                # that (IndexerModule.forward_packed); HCA layers have no
-                # indexer, so state it here rather than inherit it silently.
-                if can_run_kernel(hidden):
-                    multiple_requests = not torch.compiler.is_compiling() and bool(
-                        (owners != 0).any()
-                    )
-                    if (
-                        mla_entry["block_table_tensor"].shape[0] != 1
-                        or multiple_requests
-                    ):
-                        raise RuntimeError(
-                            "DeepSeek-V4 NKI HCA milestone supports one TP1 request"
-                        )
-                compressed_uniform = True
+                # Logical rows are identical at this capacity-derived bound,
+                # but physical rows repeat only within one request. Batched HCA
+                # therefore uses the per-query gather path.
+                compressed_uniform = (
+                    mla_entry["block_table_tensor"].shape[0] == 1
+                )
                 logical, requested = recent_compressed_logical_indices(
                     pos, compress_ratio=self.ratio, count=compressed_count
                 )
@@ -1517,6 +1501,7 @@ class DeepseekV4Attention(nn.Module):
                 compressed_slots=compressed_slots,
                 compressed_valid=compressed_valid,
                 sinks=self.sinks,
+                sliding_contiguous=entry["block_table_tensor"].shape[0] == 1,
                 compressed_uniform=compressed_uniform,
             )
         )

@@ -20,12 +20,13 @@ class RuntimeIndexer(torch.nn.Module):
         super().__init__()
         self.logical_slots_per_block = logical_slots_per_block
 
-    def forward(self, query, gate, key_cache, block_table, visible):
+    def forward(self, query, gate, key_cache, block_table, owners, visible):
         selected = paged_projected_bf16_indexer(
             query,
             gate,
             key_cache,
             block_table,
+            owners,
             visible,
             logical_slots_per_block=self.logical_slots_per_block,
         )
@@ -37,10 +38,11 @@ def main() -> None:
     parser.add_argument(
         "--query",
         type=int,
-        choices=(1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        choices=(1, 2, 4, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
         default=512,
     )
     parser.add_argument("--block-columns", type=int, default=1024)
+    parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--logical-slots", type=int, default=128)
     parser.add_argument("--visible", type=int, default=0)
     parser.add_argument(
@@ -50,6 +52,8 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.requests < 1 or args.query % args.requests:
+        parser.error("--requests must be positive and divide --query")
 
     device = torch.device("neuron:0")
     physical_stride = max(128, args.logical_slots)
@@ -58,7 +62,14 @@ def main() -> None:
     key_cache = torch.zeros(
         1, 1, physical_stride, 128, dtype=torch.bfloat16, device=device
     )
-    block_table = torch.zeros(args.block_columns, dtype=torch.int32, device=device)
+    block_table = torch.zeros(
+        args.requests, args.block_columns, dtype=torch.int32, device=device
+    )
+    owners = torch.arange(
+        args.requests, dtype=torch.int32, device=device
+    ).repeat_interleave(
+        args.query // args.requests
+    )
     if args.prefill_visibility:
         visible = torch.div(
             torch.arange(1, args.query + 1, dtype=torch.int32, device=device),
@@ -86,7 +97,7 @@ def main() -> None:
         RuntimeIndexer(args.logical_slots), backend="neuron", dynamic=False
     )
     started = time.monotonic()
-    indices, valid = compiled(query, gate, key_cache, block_table, visible)
+    indices, valid = compiled(query, gate, key_cache, block_table, owners, visible)
     torch.neuron.synchronize()
     elapsed = time.monotonic() - started
     indices_cpu = indices.to("cpu")
@@ -110,6 +121,7 @@ def main() -> None:
     )
     record = {
         "query": args.query,
+        "requests": args.requests,
         "block_columns": args.block_columns,
         "logical_slots_per_block": args.logical_slots,
         "capacity_entries": args.block_columns * args.logical_slots,

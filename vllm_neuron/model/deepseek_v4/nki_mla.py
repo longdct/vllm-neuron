@@ -693,6 +693,7 @@ def _paged_shared_latent_mla_kernel(
     compressed_slots,
     compressed_mask,
     sinks,
+    sliding_contiguous: bool = True,
     compressed_uniform: bool = False,
 ):
     q_count = query.shape[0]
@@ -741,7 +742,7 @@ def _paged_shared_latent_mla_kernel(
     first_q = 0 if q_count == 1 else program_id * queries_per_program
     sliding_span = None
     compressed_span = None
-    if _SPAN_GATHER:
+    if _SPAN_GATHER and sliding_contiguous:
         sliding_span = _build_sliding_span(
             sliding_cache, sliding_slots, first_q, queries_per_program, latent_dim
         )
@@ -787,7 +788,12 @@ def _paged_shared_latent_mla_kernel(
 
 @nki.jit
 def _paged_sliding_latent_mla_kernel(
-    query, sliding_cache, sliding_slots, sliding_mask, sinks
+    query,
+    sliding_cache,
+    sliding_slots,
+    sliding_mask,
+    sinks,
+    sliding_contiguous: bool = True,
 ):
     q_count, history = sliding_slots.shape
     assert q_count in (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
@@ -825,7 +831,7 @@ def _paged_sliding_latent_mla_kernel(
 
     first_q = 0 if q_count == 1 else program_id * queries_per_program
     sliding_span = None
-    if _SPAN_GATHER:
+    if _SPAN_GATHER and sliding_contiguous:
         sliding_span = _build_sliding_span(
             sliding_cache, sliding_slots, first_q, queries_per_program, latent_dim
         )
@@ -1046,6 +1052,7 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
                 sliding_slots[start:stop],
                 sliding_mask[start:stop],
                 inputs.sinks.to(torch.bfloat16),
+                inputs.sliding_contiguous,
             )
         return _wrapped_paged_shared_latent_mla[2](
             tiled_query,
@@ -1056,6 +1063,7 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
             compressed_slots[start:stop],
             compressed_mask[start:stop],
             inputs.sinks.to(torch.bfloat16),
+            inputs.sliding_contiguous,
             inputs.compressed_uniform,
         )
 
