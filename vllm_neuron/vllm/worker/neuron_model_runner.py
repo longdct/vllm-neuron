@@ -8506,6 +8506,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             group_params.max_num_blocks_per_req,
         )
 
+        # num_gpu_blocks_override is blocks *per pool*, and a hybrid model has
+        # one pool per layer in its largest group -- so the bytes it asks for
+        # are override x page_size x group_size, not override x page_size. The
+        # per-group block sizes above are also not cache_config.block_size:
+        # unification grows the attention block by the ratio between the
+        # padded Mamba page and the attention page (32 -> 416 on the 27B at
+        # 16K). Both together make it easy to ask for an order of magnitude
+        # more cache than the engine can ever address, and the only symptom is
+        # a device OOM naming a byte count that appears in no log.
+        override = self.vllm_config.cache_config.num_gpu_blocks_override
+        if override is not None:
+            usable = sum(group_params.max_num_blocks_per_req) * self.max_num_reqs
+            if override > usable:
+                logger.warning(
+                    "num_gpu_blocks_override=%d exceeds the %d blocks "
+                    "max_num_seqs=%d x max_model_len=%d can address "
+                    "(%s per request across %d groups). The excess is "
+                    "allocated on every one of the %d pools and cannot be "
+                    "used; %d is the value that fits this configuration.",
+                    override,
+                    usable,
+                    self.max_num_reqs,
+                    self.max_model_len,
+                    group_params.max_num_blocks_per_req,
+                    len(group_params.max_num_blocks_per_req),
+                    len(kv_cache_config.kv_cache_tensors),
+                    usable,
+                )
+
         # Initialize InputBatch with per-group lists matching the KV cache groups.
         #
         # ``max_num_blocks_per_req`` is passed explicitly rather than left to

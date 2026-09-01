@@ -544,11 +544,39 @@ in their own plan.
   scheduling: 18 GDN call sites in one graph rather than the 8 that have been
   reproduced clean, plus the interleaved attention layers. Until it is understood the GDN prefill runs the torch chunk rule,
   which is a performance gap, not a correctness one.
-- **TP=16 and TP=32 are unverified on hardware, and cannot be checked on the
-  0.8B at all**: vLLM requires `num_attention_heads % tp == 0` and this
-  checkpoint has 8, so TP=16 is rejected at config validation before reaching a
-  device. TP=8 is the ceiling here. TP=16 needs the 27B together with the 24->32
-  Q-head padding of section 2.2, so the two are gated on each other.
+- ~~**TP=16 needs the 27B together with the 24->32 Q-head padding, so the two
+  are gated on each other.**~~ **Wrong: the 27B does not unlock TP=16 either.**
+  vLLM requires `num_attention_heads % tp == 0`
+  (`ModelConfig.verify_with_parallel_config`, `vllm/config/model.py:1159-1170`,
+  called from `VllmConfig.__post_init__` at `vllm/config/vllm.py:866`). The
+  0.8B has 8 heads; the 27B has **24**, and `24 = 2^3 * 3`, so the largest
+  usable power of two is 8 for *both*. Confirmed on device: a TP=16 launch of
+  the 27B dies in `create_engine_config` with "Total number of attention heads
+  (24) must be divisible by tensor parallel size (16)". `hidden_size` (5120)
+  and `intermediate_size` (17408) would both permit 16 or 32; the head count
+  alone is the ceiling.
+
+  **TP=8 is therefore the maximum degree for this family, not a starting
+  point.** Two consequences worth stating plainly:
+
+  - The Q-head padding path (`padded_q_heads`, `q_head_indices`,
+    `kv_head_index`) is **latent, not live**. It is correct, and the
+    `kv_head_index` fix is real -- `rank // num_kv_replicas` genuinely
+    mis-pairs ranks 3, 6, 7, 9, 10 and 11 at tp=16 -- but nothing can reach it
+    through the vLLM engine, which refuses those degrees first. The fix and its
+    tests stay; the commit message for it overstated the severity.
+  - Memory pressure cannot be relieved by sharding harder. There is no higher
+    degree to go to.
+
+  Reaching TP=16 would mean making vLLM see a padded head count *before* that
+  line -- registering into `MODELS_CONFIG_MAP`
+  (`vllm/model_executor/models/config.py:671`, which runs at
+  `vllm/config/vllm.py:1911`, three lines before the check) or extending the
+  existing `verify_with_parallel_config` monkeypatch at
+  `vllm_neuron/vllm/platform.py:95-117`. It would buy ~3.4 GiB/rank of weights
+  and nothing on KV (4 KV heads stop splitting past tp=4), while wasting 25% of
+  attention FLOPs on ranks that hold only padding and halving instances per
+  box. Not worth it.
 - **Attention propagates padding NaN into real rows.** Through layers 0-2 the 32
   real rows stayed clean while padding rows were NaN (`bad_real = 0`); at layer 3,
   the first attention layer, all 2048 rows went bad including the real ones.
@@ -559,5 +587,75 @@ in their own plan.
 
 ## Where the 27B stands
 
-Downloaded (18 shards, 52 GB, 1199 keys: 850 text, 333 visual, 15 MTP) and all
-four load blockers above are fixed. Not yet compiled.
+Downloaded (18 shards, 52 GB, 1199 keys: 850 text, 333 visual, 15 MTP), all
+four load blockers fixed, and **running correctly on device at TP=8**.
+
+### It works, and the output proves which paths work
+
+Cold compile, load and generate at `max_model_len=2048`, TP=8, took **14m24s**
+end to end for 64 layers across 8 ranks. Greedy output on three real prompts:
+
+| prompt | output |
+|---|---|
+| `The capital of France is` | ` Paris.` then Berlin, Rome, Madrid, Lisbon, Athens -- six pairs, all correct |
+| `Q: What is 17 plus 25?\nA:` | `42`, then continues `42 + 13 = 55` -- correct two-step arithmetic |
+| `...why the sky appears blue:` | opens a `<think>` block, correctly names Rayleigh scattering |
+
+That single run clears the three things the 0.8B **cannot** exercise:
+
+- **The untied `lm_head`.** The 0.8B is `tie_word_embeddings=true`; the 27B is
+  false and ships a distinct `lm_head.weight` (verified against the checkpoint:
+  max abs difference 0.52 over the first 64 rows, different row norms). Using
+  the embedding as the output projection on a model trained untied yields word
+  salad, not correct capitals.
+- **Grouped GDN at 48 value / 16 key heads** -- `num_v_per_k = 3`, the
+  `repeat_interleave` path, live in 48 of 64 layers. The 0.8B is 16/16, ratio
+  1, so no device run had ever entered it.
+- **KV-head pairing at TP=8**, with zero query-head padding (24 = 3 x 8).
+
+### Measured memory, against the estimate
+
+| per rank | predicted | measured |
+|---|---|---|
+| weights | 6.26 GiB | **6.79 GiB** (+8%, alignment padding and runtime arena) |
+| free after load | -- | 17.21 GiB |
+
+### The 16K x 8 OOM was a wrong block count, not a defect
+
+`max_model_len=16384` with `max_num_seqs=8` OOM'd on a 1,744,830,464-byte
+allocation. The cause was `num_gpu_blocks_override=4096`, which is **twelve
+times too large**, and the reasoning that produced it was wrong twice over:
+
+- `num_gpu_blocks_override` is blocks **per memory pool**, and this model has
+  16 pools (`group_size` = max layers per group), each block being the unified
+  page (`vllm/v1/core/kv_cache_utils.py:940,972,1375-1392`). The failing
+  allocation is exactly `4096 x 425,984` -- pool #1 of 16. The intended total
+  was 26 GiB per rank.
+- The attention block size after page unification is **416, not 32**. The GDN
+  page (408,576 B) drives the unified size, and the attention block grows by
+  the ratio `425,984 / 32,768 = 13`. Computing `16384 / 32 x 8` is the trap.
+
+The correct arithmetic, and the units to think in:
+
+| | per request | 8 requests |
+|---|---|---|
+| attention pages, `cdiv(16384, 416)` | 40 | 320 |
+| GDN groups, 1 page each, context-independent | 3 | 24 |
+| **blocks** | **43** | **344** |
+| **bytes/rank**, `blocks x 425,984 x 16` | 0.27 GiB | **2.18 GiB** |
+
+At 344 the engine reports `GPU KV cache size: 131,072 tokens` -- exactly
+`8 x 16384`, against 1,560,671 before -- and allocates without complaint.
+
+Two claims made while debugging this were wrong and are retracted: vLLM did
+**not** ignore the override (1,560,671 is a derived concurrency report, not an
+allocation), and there is **no evidence** that the prefill activation arena
+consumed the memory.
+
+### Compile time at 16K is the real cost
+
+The 2048 prefill graph compiled in minutes. The **16384** single-shot prefill
+graph was still compiling after 45 minutes, having persisted only 708 KB / 11
+NEFFs. Because head_dim 256 rules out chunked prefill, the bucket must equal
+the context window, so every prefill pads to `max_model_len` however short the
+prompt. Warm the compile cache before any deployment, and budget for it.
