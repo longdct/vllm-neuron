@@ -352,6 +352,69 @@ So the kernel's own numerics are sound, and whatever costs 51 tokens at TP=1
 lives in how it is scheduled or composed at model scale, not in what it computes.
 It stays **off by default** behind `VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`.
 
+## How long a context this model can actually serve
+
+Asked to size the 27B for a 32K-64K context with a 4096- or 8192-token prefill
+bucket, the answer is that neither is reachable today, and the reason is not
+tensor parallelism or memory.
+
+**Three independent walls, in the order you hit them.**
+
+1. `MAX_MODEL_LEN_SINGLE_SHOT = 16 * 1024` (`utils/bucket_utils.py:329`).
+   Above 16K, `resolve_segmented_prefill_config` refuses single-shot prefill and
+   requires chunked prefill.
+2. Chunked prefill *is* segmented prefill here — the same function returns
+   `kv_segment_size_buckets`, and the segmented attention kernel raises
+   `head_dim=256 exceeds maximum supported head dimension (128)`
+   (`functional/attention/attention_segmented_cte.py:510`). The 27B and the 0.8B
+   are both head_dim 256.
+3. Even with both of those lifted, the torch fallback materialises the whole
+   score matrix — `scores = torch.matmul(q, k)` at
+   `functional/attention/attention_cte.py:125`, shaped `[heads, T, T]`, because
+   `flash_attention` also falls back at head_dim > 128. Per rank at TP=8
+   (3 query heads):
+
+   | prefill | scores, one copy | with softmax/probs |
+   |---|---|---|
+   | 4096 | 0.09 GiB | ~0.23 GiB |
+   | 8192 | 0.38 | ~0.94 |
+   | 16384 | 1.50 | ~3.75 |
+   | 32768 | 6.00 | ~15.0 |
+   | 65536 | 24.0 | ~60.0 |
+
+   Against a ~24 GB per-rank budget already holding 6.26 GiB of weights, 32K is
+   out on this term alone. So `MAX_MODEL_LEN_SINGLE_SHOT` is a policy constant,
+   but it is not an arbitrary one.
+
+**A consequence that is easy to miss:** with head_dim 256 the prefill bucket
+cannot be *smaller* than `max_model_len`, because that is precisely the chunked
+case. "Prefill 8192 with a 32K context" is not a configuration this model has —
+prefill bucket and `max_model_len` must be equal, and both under 16K.
+
+**The blocker is deeper than the kernel.** `Qwen3_5Attention.forward_prefill`
+has no `kv_segment_size` branch at all. Its sibling `qwen3` reads
+`attn_metadata[layer_name]["kv_segment_size"]` and dispatches to
+`NF.segmented_attention` (`qwen3/model.py:321, 363-371`); qwen3_5 runs one
+`flash_attention` over whatever tokens it was handed. So even a head-dim-256
+segmented kernel would not be enough on its own — the layer needs the branch
+too. Long context is two pieces of work, not one.
+
+**This used to fail silently, and now does not.** `needs_single_shot_prefill`
+was consulted in exactly one place, the factory, and only logged a warning.
+Nothing rejected a chunked configuration. Handed a chunk, the attention layer
+attends within that chunk and ignores everything cached before it — not a crash,
+but coherent, confident text computed against a truncated context, which is the
+worst available failure mode. `_validate_config` now raises when
+`kv_segment_size_buckets` is set, with a message naming the fix. The regression
+test asserts the raise, and was confirmed to fail without the guard.
+
+**Practical ceiling today: `max_model_len == max_num_batched_tokens <= 16384`.**
+At 16K with 8 concurrent requests on the 27B at TP=8 that is roughly 6.26 GiB
+weights + 2.0 GiB KV + 0.14 GiB GDN state + ~3.75 GiB prefill transient, near
+12 GiB of 24 before the compiler arena — comfortable. 32K and 64K need a tiled
+head-dim-256 prefill kernel plus the segmented branch in the layer, and belong
+in their own plan.
+
 ## Still open
 
 - **TP>1 loses accuracy on its own** -- 95/128 at TP=2 against 128/128 at TP=1,

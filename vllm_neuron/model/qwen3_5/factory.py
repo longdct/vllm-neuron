@@ -135,8 +135,32 @@ class Qwen3_5ForCausalLM(nn.Module):
         if config.needs_single_shot_prefill:
             # head_dim > 128 cannot use the segmented-attention kernel at all
             # (it raises), so chunked prefill is unavailable for the
-            # full-attention layers. Flag it loudly; the engine-level bucket
-            # validation enforces the corresponding max_model_len limit.
+            # full-attention layers.
+            #
+            # This has to *raise*, not warn. Unlike `qwen3`, whose attention
+            # dispatches on `kv_segment_size` and calls NF.segmented_attention
+            # (qwen3/model.py:321,363), `Qwen3_5Attention.forward_prefill` has
+            # no segmented branch at all: it runs one flash_attention over the
+            # tokens it was handed. Handed a chunk, it attends within that chunk
+            # and silently ignores everything cached before it -- coherent,
+            # confident, wrong output rather than a failure. A warning is not
+            # enough protection against that.
+            #
+            # `kv_segment_size_buckets` being set is the signal that segmented
+            # prefill is on; the engine fills it in from
+            # `resolve_segmented_prefill_config` whenever
+            # max_num_batched_tokens < max_model_len.
+            if neuron_config is not None and neuron_config.kv_segment_size_buckets:
+                raise ValueError(
+                    f"Qwen3.5 head_dim={config.head_dim} exceeds the "
+                    "segmented-attention kernel's 128-element partition bound, "
+                    "so chunked/segmented prefill is unavailable -- but "
+                    f"kv_segment_size_buckets="
+                    f"{neuron_config.kv_segment_size_buckets} requests it. "
+                    "Set max_num_batched_tokens == max_model_len (single-shot "
+                    "prefill) and keep max_model_len within the single-shot "
+                    "limit."
+                )
             logger.warning(
                 "Qwen3.5 head_dim=%d exceeds the segmented-attention kernel's "
                 "128-element partition bound, so chunked/segmented prefill is "

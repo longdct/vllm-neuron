@@ -16,8 +16,11 @@ from vllm_neuron.model.registry import get_models
 
 
 class _NeuronConfigStub:
-    def __init__(self, quantization=None):
+    def __init__(self, quantization=None, kv_segment_size_buckets=None):
         self.quantization = quantization
+        # Set by the engine whenever max_num_batched_tokens < max_model_len,
+        # i.e. whenever segmented/chunked prefill is on.
+        self.kv_segment_size_buckets = kv_segment_size_buckets
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +100,33 @@ def test_warns_that_head_dim_256_forces_single_shot_prefill(caplog):
     with caplog.at_level("WARNING"):
         Qwen3_5ForCausalLM._validate_config(Qwen3_5TextConfig(), _NeuronConfigStub())
     assert "single-shot" in caplog.text
+
+
+def test_rejects_segmented_prefill_rather_than_silently_ignoring_it():
+    """Chunked prefill must fail at startup, not produce confident wrong output.
+
+    ``Qwen3_5Attention.forward_prefill`` has no ``kv_segment_size`` branch --
+    unlike ``qwen3``, which dispatches to ``NF.segmented_attention``. Handed a
+    chunk, it attends within that chunk and ignores everything cached before
+    it. That is not a crash; it is coherent text computed against a truncated
+    context, which is the worst way for this to fail.
+
+    The engine sets ``kv_segment_size_buckets`` whenever
+    ``max_num_batched_tokens < max_model_len``, so that field is the signal.
+    """
+    config = Qwen3_5TextConfig()
+    assert config.needs_single_shot_prefill, "fixture must have head_dim > 128"
+    neuron_config = _NeuronConfigStub(kv_segment_size_buckets=[4096])
+    with pytest.raises(ValueError, match="chunked/segmented prefill is unavailable"):
+        Qwen3_5ForCausalLM._validate_config(config, neuron_config)
+
+
+def test_single_shot_prefill_is_accepted_when_no_segment_buckets_are_set():
+    """The complement: an empty bucket list is single-shot and must pass."""
+    for buckets in (None, []):
+        Qwen3_5ForCausalLM._validate_config(
+            Qwen3_5TextConfig(), _NeuronConfigStub(kv_segment_size_buckets=buckets)
+        )
 
 
 def test_tp_degree_defaults_to_one_outside_an_engine():
