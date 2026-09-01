@@ -104,6 +104,14 @@ def sample(
         # (NKI kernels may return uint32 indices)
         return _argmax_sample(logits, tp_group).to(torch.int32)
 
+    # Generic graphs may mix greedy and stochastic requests.  Preserve the
+    # CPU sampler's exact argmax tie-breaking for greedy rows instead of
+    # deriving them from top-k, whose ordering among tied values is not
+    # guaranteed.  Distributed argmax exchanges only local maxima/indices;
+    # it does not gather the vocabulary.
+    all_is_greedy = temperature < _SAMPLING_EPS
+    greedy_tokens = _argmax_sample(logits, tp_group).to(torch.int32)
+
     # Derive dp_degree from all2all_group if provided
     if all2all_group is not None:
         import torch.distributed as dist
@@ -145,18 +153,20 @@ def sample(
     probs = _top_p_filter(probs, top_p)
 
     # Sample: greedy for temp < eps, multinomial otherwise (vLLM pattern)
-    greedy_sampled = torch.argmax(probs, dim=-1)
     random_sampled = _multinomial(probs, deterministic)
-    sampled_idx = torch.where(is_greedy, greedy_sampled, random_sampled)
 
     # Map back to original vocab indices
     result = (
-        torch.gather(sorted_indices, -1, sampled_idx.unsqueeze(-1))
+        torch.gather(sorted_indices, -1, random_sampled.unsqueeze(-1))
         .squeeze(-1)
         .to(torch.int32)
     )
 
-    # Final gather if using DP (restore full batch on all ranks)
+    result = torch.where(all_is_greedy, greedy_tokens, result)
+
+    # Final gather if using DP (restore full batch on all ranks). Select
+    # greedy rows first because their parameters and token ids both have the
+    # local per-DP-rank batch shape.
     if all2all_group is not None:
         result = all_gather_tensor(result, 0, group=all2all_group)
 

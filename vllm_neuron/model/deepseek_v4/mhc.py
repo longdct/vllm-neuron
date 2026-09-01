@@ -112,6 +112,13 @@ def apply_hyperconnection(
     ):
         raise ValueError("mHC update shapes do not agree")
     dtype = hidden_streams.dtype
+    # Portable attention or MoE fallbacks may accumulate in FP32 even when the
+    # residual streams and model weights are BF16.  The architecture's residual
+    # contract is stream-dtype preserving; without this cast the first fallback
+    # update promotes every later projection input to FP32 and graph extraction
+    # fails on BF16 weights.  Device kernels already return BF16, so this is a
+    # no-op on the production path.
+    update = update.to(dtype)
     return post.to(dtype).unsqueeze(-1) * update.unsqueeze(-2) + torch.matmul(
         comb.to(dtype).transpose(-1, -2), hidden_streams
     )

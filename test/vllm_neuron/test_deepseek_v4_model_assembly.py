@@ -25,7 +25,7 @@ from vllm_neuron.model.deepseek_v4.model import (
 )
 from vllm_neuron.model.deepseek_v4.weight_loaders import load_checkpoint_weights
 from vllm_neuron.model.kv_cache import CacheKind
-from vllm_neuron.model.neuron_config import NeuronConfig
+from vllm_neuron.model.neuron_config import NeuronConfig, OnDeviceSamplingConfig
 from vllm_neuron.vllm.worker.kv_spec_conversion import layer_spec_to_vllm_spec
 
 
@@ -128,6 +128,83 @@ def test_hf_config_builds_device_shaped_multi_variant_model():
     ]
     assert "model.embed_tokens.weight" in dict(model.named_parameters())
     assert "lm_head.weight" in dict(model.named_parameters())
+
+
+@pytest.mark.parametrize(
+    ("max_logprobs", "debug_logits_dir", "expects_gather"),
+    [(0, None, False), (8, None, True), (0, "/tmp/dsv4-logits", True)],
+)
+def test_device_sampling_gathers_full_logits_only_when_requested(
+    max_logprobs, debug_logits_dir, expects_gather
+):
+    neuron_config = NeuronConfig(
+        on_device_sampling_config=OnDeviceSamplingConfig(
+            all_greedy=False, max_top_k=256
+        ),
+        max_logprobs=max_logprobs,
+        debug_logits_dir=debug_logits_dir,
+    )
+    model = DeepseekV4ForCausalLM.from_configs(hf_config(), neuron_config).eval()
+    assert model.lm_head.gather_output is False
+    assert model._gather_logits is expects_gather
+
+
+def test_cpu_sampling_retains_full_lm_head_logits():
+    model = DeepseekV4ForCausalLM.from_configs(
+        hf_config(), NeuronConfig(on_device_sampling_config=None)
+    ).eval()
+    assert model.lm_head.gather_output is True
+    assert not hasattr(model, "sampler")
+
+
+def test_device_sampling_forward_skips_full_vocab_all_gather_without_logprobs():
+    class Hidden(torch.nn.Module):
+        def forward(self, input_ids, positions, attn_metadata, **kwargs):
+            return torch.ones(input_ids.shape[0], 32)
+
+    class Head(torch.nn.Module):
+        def forward(self, hidden):
+            return torch.arange(64.0).expand(hidden.shape[0], -1)
+
+    class TokenSampler(torch.nn.Module):
+        def forward(self, logits, *args, **kwargs):
+            return torch.full((logits.shape[0],), 7, dtype=torch.int32)
+
+    class Group:
+        def __init__(self):
+            self.calls = 0
+
+        def all_gather(self, logits, dim):
+            self.calls += 1
+            return torch.cat((logits, logits), dim=dim)
+
+    model = DeepseekV4ForCausalLM.from_configs(
+        hf_config(),
+        NeuronConfig(
+            on_device_sampling_config=OnDeviceSamplingConfig(
+                all_greedy=False, max_top_k=256
+            ),
+            max_logprobs=0,
+        ),
+    ).eval()
+    model.model = Hidden()
+    model.lm_head = Head()
+    model.sampler = TokenSampler()
+    group = Group()
+    model.lm_head_tp_group = group
+    sampled, gathered = model(
+        torch.tensor([1]), torch.tensor([0]), {}, torch.tensor([0])
+    )
+    assert sampled.tolist() == [7]
+    assert gathered is None
+    assert group.calls == 0
+
+    model._gather_logits = True
+    _, gathered = model(
+        torch.tensor([1]), torch.tensor([0]), {}, torch.tensor([0])
+    )
+    assert gathered.shape == (1, 128)
+    assert group.calls == 1
 
 
 def test_load_weights_restores_nonpersistent_buffers_after_meta_materialization(

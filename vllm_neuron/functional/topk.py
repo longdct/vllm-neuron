@@ -349,9 +349,9 @@ def _can_use_nki_topk(tensor: Tensor, k: int, dim: int) -> bool:
     """True if the rotational NKI top-k kernel can handle this (tensor, k, dim).
 
     The kernel (nkilib.core.topk.rotational_topk) reduces over the LAST
-    dimension. Following the standard vLLM-Neuron kernel pattern (cf.
-    functional.argmax._can_use_nki_max), the kernel is used automatically
-    whenever it can run; everything else falls back to ``torch.topk``.
+    dimension. Following the standard vLLM-Neuron kernel pattern, the kernel
+    is used automatically whenever it can run; everything else falls back to
+    ``torch.topk``.
 
     The cheap checks below are NECESSARY conditions (runtime availability,
     rank/dim/dtype, and ``0 < k < vocab_size``). They are NOT sufficient: the

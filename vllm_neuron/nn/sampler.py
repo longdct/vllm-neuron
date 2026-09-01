@@ -32,6 +32,7 @@ class Sampler(torch.nn.Module):
         self,
         sampling_config: "OnDeviceSamplingConfig",  # type: ignore
         process_group: "ProcessGroup | None" = None,  # type: ignore
+        vocab_size: int | None = None,
     ) -> None:
         super().__init__()
         self.all_greedy = sampling_config.all_greedy
@@ -39,6 +40,7 @@ class Sampler(torch.nn.Module):
         self.deterministic = sampling_config.deterministic
         self.capture_topk = sampling_config.capture_topk
         self.process_group = process_group
+        self.vocab_size = vocab_size
 
         from vllm_neuron.parallel.neuron_parallel_state import (
             get_neuron_sampling_all2all_group,
@@ -90,6 +92,36 @@ class Sampler(torch.nn.Module):
             >>> mask[:, 500:] = False  # Only allow tokens 0-499
             >>> tokens = sampler(logits, logit_mask=mask)
         """
+        # Padded vocabulary rows have zero-filled weights and can otherwise
+        # beat real negative logits.  Mask them before greedy or top-k
+        # collectives.  ``tp_rank`` remains a tensor so this does not create a
+        # rank-specialized graph under TorchNeuron tracing.
+        tp_degree = (
+            torch.distributed.get_world_size(self.process_group)
+            if self.process_group is not None
+            else 1
+        )
+        padded_vocab_size = logits.shape[-1] * tp_degree
+        if self.vocab_size is not None and self.vocab_size < padded_vocab_size:
+            if self.process_group is not None and tp_rank is None:
+                raise ValueError(
+                    "tp_rank must be provided when masking padded vocabulary shards"
+                )
+            rank = (
+                tp_rank.to(dtype=torch.int64).reshape(())
+                if tp_rank is not None
+                else logits.new_zeros((), dtype=torch.int64)
+            )
+            global_indices = (
+                torch.arange(
+                    logits.shape[-1], device=logits.device, dtype=torch.int64
+                )
+                + rank * logits.shape[-1]
+            )
+            logits = logits.masked_fill(
+                global_indices.unsqueeze(0) >= self.vocab_size, float("-inf")
+            )
+
         # Apply grammar mask for structured output (constrained decoding)
         if logit_mask is not None:
             # Shard full-vocab mask to local vocab shard (matches lm_head sharding)

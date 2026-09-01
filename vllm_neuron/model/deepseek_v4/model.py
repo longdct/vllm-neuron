@@ -759,6 +759,8 @@ class DeepseekV4Attention(nn.Module):
     Above TP8, consecutive ranks split one group's input columns and replicate
     that group's ``o_b_proj`` columns. The all-reduce after ``o_b_proj`` then
     reconstructs both the within-group column sum and the sum across groups.
+    This extends the grouped projection through the production TP32 and TP64
+    geometries without gathering attention heads.
     """
 
     def __init__(
@@ -1587,12 +1589,22 @@ class DeepseekV4Expert(nn.Module):
         # w1/w3 are independently sliced by the model-specific stacked loader.
         set_weight_loader(self.down_proj, loader(1, self.intermediate_size))
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward_local(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Return this rank's unreduced shared-expert TP partial.
+
+        The ordinary DeepSeek-V4 MoE path combines this partial with the
+        routed-expert partial before issuing its single TP all-reduce.  Keep
+        the unreduced operation explicit so cross-DP EP can retain the two
+        communication domains required by that topology.
+        """
         gate_up = F.linear(hidden, self.gate_up_proj)
         gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        output = F.linear(F.silu(gate) * up, self.down_proj)
+        return F.linear(F.silu(gate) * up, self.down_proj)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        output = self.forward_local(hidden)
         if self.tp_degree > 1:
             output = self.tp_group.all_reduce(output)
         return output
@@ -1738,12 +1750,19 @@ class DeepseekV4MoE(nn.Module):
             start = dp_group.rank_in_group * original_tokens
             routed = routed[start : start + original_tokens]
             hidden = hidden[start : start + original_tokens]
-        elif self.topology.tp_degree > 1 and self.tp_group is not None:
-            # One reduction combines both EP placement and expert-TP partials
-            # when all participating ranks are inside the TP world.
-            routed = self.tp_group.all_reduce(routed)
+            # Routed experts reduce over the wide EP world while the shared
+            # expert is sharded only over TP.  These domains are not
+            # interchangeable, so preserve the legacy separate reductions.
+            return routed + self.shared_experts(hidden)
 
-        return routed + self.shared_experts(hidden)
+        # When EP is wholly contained inside TP, both routed and shared
+        # outputs are local partials over the same final TP domain.  Addition
+        # is linear, so reduce their sum once instead of reducing each term:
+        #   all_reduce(routed + shared) == all_reduce(routed) + all_reduce(shared)
+        output = routed + self.shared_experts.forward_local(hidden)
+        if self.topology.tp_degree > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
 
     def _forward_portable(
         self, hidden: torch.Tensor, affinities: torch.Tensor
@@ -2116,9 +2135,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             if config.neuron_config is not None
             else None
         )
-        self._gather_logits = bool(
-            config.neuron_config is not None and config.neuron_config.max_logprobs != 0
+        debug_logits_enabled = bool(
+            config.neuron_config is not None
+            and config.neuron_config.debug_logits_dir is not None
         )
+        self._gather_logits = bool(
+            config.neuron_config is not None
+            and config.neuron_config.max_logprobs != 0
+        ) or debug_logits_enabled
         try:
             from vllm.distributed.parallel_state import get_tp_group
 
@@ -2138,7 +2162,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._setup_lm_head_weight_loader()
         if self.on_device_sampling_config is not None:
             self.sampler = neuron_nn.Sampler(
-                self.on_device_sampling_config, process_group=device_group
+                self.on_device_sampling_config,
+                process_group=device_group,
+                vocab_size=config.vocab_size,
             )
 
     def _setup_lm_head_weight_loader(self) -> None:

@@ -4387,6 +4387,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         is_prefill = (num_tokens // num_reqs) > decode_token_threshold
 
+        # In CPU mode, ``Tensor.to(cpu)`` returns the original runtime owner
+        # tensor for every cache group.  Mirror that aliasing during graph
+        # extraction so fail-on-recompile does not reject the first real async
+        # batch.  Neuron transfers allocate distinct device tensors and retain
+        # the existing per-group construction below.
+        shared_cpu_token_to_request = None
+        if device.type == "cpu":
+            shared_cpu_token_to_request = (
+                torch.arange(num_tokens, device=device)
+                .mul(num_reqs)
+                .div(num_tokens, rounding_mode="floor")
+                .to(torch.int32)
+            )
+
         for _, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
@@ -4511,10 +4525,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ),
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
-                "token_to_request": torch.arange(num_tokens, device=device)
-                .mul(num_reqs)
-                .div(num_tokens, rounding_mode="floor")
-                .to(torch.int32),
+                "token_to_request": (
+                    shared_cpu_token_to_request
+                    if shared_cpu_token_to_request is not None
+                    else torch.arange(num_tokens, device=device)
+                    .mul(num_reqs)
+                    .div(num_tokens, rounding_mode="floor")
+                    .to(torch.int32)
+                ),
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset

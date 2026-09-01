@@ -13,14 +13,6 @@ import torch
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed._functional_collectives import all_gather_tensor
-import nki
-from nkilib.core.max.cascaded_max import cascaded_max
-from vllm_neuron import envs
-from torch_neuronx.nki_hop import wrap_nki
-from vllm_neuron.utils.neuron_utils import can_run_kernel
-
-cascaded_max_jit = nki.jit()(cascaded_max)
-
 logger = logging.getLogger(__name__)
 
 
@@ -89,6 +81,13 @@ def argmax(
     if process_group is None:
         raise ValueError("process_group must be provided for distributed argmax")
 
+    # ``all_gather_tensor`` is not negative-dimension safe: its internal
+    # chunk/cat view construction treats ``-1 + 1`` as the start of the shape
+    # and appends the original dimensions again. Normalize both dimensions
+    # before gathering, matching the distributed top-k implementation.
+    dim = dim % tensor.ndim
+    gather_dim = gather_dim % tensor.ndim
+
     tp_degree = torch.distributed.get_world_size(group=process_group)
 
     # Fast path for single device
@@ -120,52 +119,15 @@ def argmax(
 
 
 def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
-    """Compute local max using NKI kernel when possible, otherwise torch.max."""
-    if _can_use_nki_max(tensor, dim):
-        is_3d = len(tensor.shape) == 3
-        input_tensor = tensor.squeeze(0) if is_3d else tensor
+    """Compute a graph-compatible local maximum.
 
-        cascaded_max_nki = wrap_nki(cascaded_max_jit)
-        value, index = cascaded_max_nki[2](input_tensor)
-        # NKI kernel returns uint32 indices; gloo all_gather doesn't support
-        # uint32, so cast to int64 (matching torch.max) in CPU mode.
-        if envs.VLLM_NEURON_CPU_MODE:
-            index = index.to(torch.int64)
-        # Restore dimension if squeezed
-        if is_3d:
-            value = value.unsqueeze(0)
-            index = index.unsqueeze(0)
-        return value, index
-    else:
-        return torch.max(tensor, dim=dim, keepdim=True)
-
-
-def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
+    The nkilib cascaded-max kernel shipped with nki 0.6.0 fails HOP lowering
+    with an unresolved ``cascaded_max_utils.reduce`` symbol. Native
+    ``torch.max`` lowers successfully on the same Neuron stack and preserves
+    the required first-index tie breaking, so use it until that kernel is
+    consumable from the installed library.
     """
-    Check if we can use the NKI max kernel.
-
-    Requirements:
-    - NKI kernels can run (hardware or CPU simulator)
-    - dim must be the last dimension (NKI kernel only supports this)
-    - Tensor must be 2D or 3D with shape[0] == 1
-    - Reduction dimension must have at least 128 elements
-    """
-    if not can_run_kernel(tensor):
-        return False
-
-    shape = tensor.shape
-    num_dims = len(shape)
-
-    # NKI kernel only works on last dimension
-    if dim != num_dims - 1 and dim != -1:
-        return False
-
-    # Check tensor dimensionality
-    if not (num_dims == 2 or (num_dims == 3 and shape[0] == 1)):
-        return False
-
-    # Check minimum reduction size
-    return not shape[dim] < 128
+    return torch.max(tensor, dim=dim, keepdim=True)
 
 
 def _apply_sharding_offset(

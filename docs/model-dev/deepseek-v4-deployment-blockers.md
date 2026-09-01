@@ -9,6 +9,11 @@
 > depth, compile cost, and the Neuron scheduler's existing single-prefill / no
 > mixed-prefill-and-decode limitation.
 
+> **Decode performance** is tracked separately in
+> `deepseek-v4-decode-performance-gate.md`: the phase-separated measurement
+> definitions, `tools/deepseek_v4/benchmark_decode.py`, the device-sampling
+> path, and the acceptance gate that these blockers sit in front of.
+
 ## 2026-08-31 scale-first implementation update
 
 This pass deliberately stays on the model's 16-bit BF16 path. FP8/FP4,
