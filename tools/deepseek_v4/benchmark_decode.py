@@ -421,6 +421,12 @@ def cache_artifacts(cache_root: Path) -> dict[str, Any]:
 
 
 async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    # DeepSeek-V4 registration is opt-in (vllm_neuron/model/registry.py).  Without
+    # the gate, `ModelRegistry.resolve_model_cls` silently returns vLLM's own
+    # `DeepseekV4ForCausalLM` and every worker dies with "has no attribute
+    # 'from_configs'".  This tool can only ever benchmark DeepSeek-V4, so set the
+    # gate rather than make each caller remember it.
+    os.environ.setdefault("VLLM_NEURON_ENABLE_DEEPSEEK_V4", "1")
     # Register TorchNeuron Native before vLLM resolves its platform plugin.
     import vllm_neuron  # noqa: F401
     import vllm.platforms as vllm_platforms
