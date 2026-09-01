@@ -289,7 +289,7 @@ Before batching, because batching multiplies it by 4x.
 
 ### Step 4 — Depth ladder
 
-Rungs **3 → 8 → 16 layers** at TP=16 with batching enabled:
+Rungs **3 → 8 → 16 → 43 layers** at TP=16, compiling batch 1 first:
 
 ```bash
 python tools/deepseek_v4/build_tiny_from_official.py \
@@ -307,6 +307,52 @@ compile.
 Record per rung: compile wall-clock, instruction count, per-rank HBM, tokens/s.
 The deliverable is a defensible extrapolation to 43 layers / 256 experts.
 
+#### Production-depth validation tooling (implemented 2026-09-01)
+
+`tools/deepseek_v4/validate_production_depth.py` separates structural depth
+from real-checkpoint width. It creates config-only BF16 checkpoints at depths
+3/8/16/43, retaining the official per-layer attention and hash/top-k router
+sequence while selecting a smaller expert count. The model loader now
+materializes these checkpoints with vLLM's deterministic dummy-weight policy;
+previously an empty checkpoint left `to_empty()` parameters uninitialized.
+
+The tool is dry-run by default. Each rung gets an isolated cache, exact command,
+source-config checksum, layer manifest, and machine-readable ladder report.
+`--execute` adds cold execution, `--warm` repeats against the identical cache,
+and `--capture-canaries` captures sparse boundaries (quartiles, router
+transition, first and last layer) and reduces them to finite-value, RMS, and
+row-RMS summaries. It refuses occupied logical Neuron cores and concurrent
+compiler processes, and requires an explicit acknowledgement before executing
+any rung deeper than 16 layers. The execution command and report also pin the
+memory-utilization and KV-cap policy. Its 256-block default is the minimum
+validated Q512 diagnostic setting for the heterogeneous KV groups; 32 blocks
+admit only about 72 tokens and therefore fail before compilation.
+
+```bash
+python tools/deepseek_v4/validate_production_depth.py \
+  /home/ubuntu/dsv4-official-shards /tmp/dsv4-depth-plan \
+  --depths 3,8,16,43 --experts 32 --tensor-parallel-size 16
+```
+
+Real official slices built by `build_tiny_from_official.py` now emit
+`slice-manifest.json`, recording source config/index checksums, original-to-new
+layer mapping, attention/router types, tensor count, bytes, and the emitted
+model checksum. This makes early/middle/late real-weight windows auditable.
+
+Run Q512 with only sequence bucket `[1]` through the depth ladder first. Add a
+single batch-8 graph only after batch-1 succeeds at the target depth; reserve
+Q8192 for the 16- and 43-layer gates so context and batching do not multiply
+every intermediate compile.
+
+The first strict cold gate passed on 2026-09-01 at depth 3 / 32 experts / TP8
+using logical cores 8-15. Q512 prefill and batch-1 decode both compiled and ran:
+172.27 s cold wall time, 145.13 s engine initialization, 69 NEFFs, 0.973 GiB
+parameter footprint and 1.07 GiB HBM used per rank, and 1.46 generated tok/s.
+The isolated report and cache are retained at
+`/tmp/dsv4-depth-tp8-b1-block256-20260901a`. The compiler emitted no instruction
+count in the captured run log, so that report field is explicitly `null` rather
+than inferred. Depth 8 is the next cold rung.
+
 ---
 
 ## Verification
@@ -315,10 +361,13 @@ The deliverable is a defensible extrapolation to 43 layers / 256 experts.
 
 ```bash
 .venv/bin/python -m pytest test/unit/model/deepseek_v4/ \
-    test/unit/test_deepseek_v4_small_context_buckets.py -q
+    test/unit/test_deepseek_v4_small_context_buckets.py \
+    test/unit/vllm/test_deepseek_v4_admission.py \
+    test/unit/vllm/test_deepseek_v4_feature_guards.py \
+    test/unit/vllm/test_deepseek_v4_registry_gate.py -q
 ```
 
-Current result after the continuous-batching changes: **322 passed / 4 skipped**.
+Current result after the production-depth changes: **330 passed / 4 skipped**.
 The full DeepSeek-V4 NKI simulator suite is **43 passed**.
 
 **Device, per step** — greedy token comparison plus per-module activation diffing,

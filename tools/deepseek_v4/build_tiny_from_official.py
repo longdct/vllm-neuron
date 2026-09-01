@@ -28,6 +28,7 @@ them when that matters.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -61,6 +62,14 @@ OUTPUT_STACK = (
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "generation_config.json")
 
 _EXPERT_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def remap_tid2eid(table: torch.Tensor, n_keep: int) -> torch.Tensor:
@@ -177,7 +186,8 @@ def build(shard_dir: Path, output: Path, source_layers: tuple[int, ...],
             handle.__exit__(None, None, None)
 
     output.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, str(output / "model.safetensors"))
+    model_path = output / "model.safetensors"
+    save_file(tensors, str(model_path))
 
     slim = dict(config)
     slim["num_hidden_layers"] = len(source_layers)
@@ -202,7 +212,46 @@ def build(shard_dir: Path, output: Path, source_layers: tuple[int, ...],
             shutil.copy2(candidate, output / filename)
 
     total = sum(t.numel() * t.element_size() for t in tensors.values())
+    tensor_dtypes: dict[str, dict[str, int]] = {}
+    for tensor in tensors.values():
+        dtype = str(tensor.dtype).removeprefix("torch.")
+        summary = tensor_dtypes.setdefault(dtype, {"tensor_count": 0, "bytes": 0})
+        summary["tensor_count"] += 1
+        summary["bytes"] += tensor.numel() * tensor.element_size()
+    manifest = {
+        "schema_version": 1,
+        "kind": "deepseek_v4_official_weight_slice",
+        "source_directory": str(shard_dir.resolve()),
+        "source_config_sha256": sha256_file(shard_dir / "config.json"),
+        "source_index_sha256": sha256_file(
+            shard_dir / "model.safetensors.index.json"
+        ),
+        "source_experts": n_routed,
+        "experts": keep_experts,
+        "weight_dtype": "bfloat16",
+        "tensor_dtypes": tensor_dtypes,
+        "layers": [
+            {
+                "source_layer": layer,
+                "destination_layer": destination,
+                "compress_ratio": ratios[layer],
+                "attention_type": RATIO_TO_LAYER_TYPE.get(
+                    ratios[layer], f"ratio_{ratios[layer]}"
+                ),
+                "router_type": "hash" if layer < n_hash_source else "topk",
+            }
+            for destination, layer in enumerate(source_layers)
+        ],
+        "tensor_count": len(tensors),
+        "parameter_bytes": total,
+        "model_file": model_path.name,
+        "model_sha256": sha256_file(model_path),
+    }
+    (output / "slice-manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n"
+    )
     print(f"wrote {len(tensors)} tensors, {total / 1e9:.2f} GB -> {output}")
+    print(f"manifest and model checksum -> {output / 'slice-manifest.json'}")
 
 
 def main() -> None:

@@ -2020,6 +2020,39 @@ class DeepseekV4Model(nn.Module):
         return self.norm(self.hc_head(streams))
 
 
+@torch.no_grad()
+def _initialize_dummy_parameters(module: nn.Module) -> None:
+    """Materialize stable, finite dummy weights without changing buffers.
+
+    The Neuron runner bypasses vLLM's generic ``DummyModelLoader`` and invokes
+    this model's loader directly. Config-only depth checkpoints therefore need
+    the equivalent per-parameter initialization here. Buffers are left alone
+    because routing tables and RoPE state were just reconstructed by their
+    owning modules.
+    """
+    from vllm.model_executor.model_loader.weight_utils import (
+        initialize_single_dummy_weight,
+    )
+
+    for parameter in module.parameters():
+        if parameter.device.type != "neuron":
+            initialize_single_dummy_weight(parameter)
+            continue
+        if not torch.is_floating_point(parameter):
+            continue
+        # PrivateUse1 does not provide torch.Generator, which the generic vLLM
+        # initializer assumes. Match its stable per-parameter policy on CPU,
+        # then use the normal host-to-Neuron weight copy path.
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(1234)
+        value = torch.empty(
+            parameter.shape,
+            dtype=parameter.dtype,
+            device="cpu",
+        ).uniform_(-1e-3, 1e-3, generator=generator)
+        parameter.copy_(value)
+
+
 class DeepseekV4ForCausalLM(nn.Module):
     """Device-shaped DeepSeek-V4: batched, ``attn_metadata``-driven forward."""
 
@@ -2349,9 +2382,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         directly -- there is no vLLM-generic loader indirection to hook into
         here, unlike the standard ``DefaultModelLoader`` path other backends
         use, so ``load_format="dummy"`` is not honored automatically). When
-        the checkpoint directory has no ``.safetensors`` files (as in a
-        dummy-load smoke test with only a ``config.json``), this leaves the
-        randomly-initialized parameters as-is rather than erroring -- the
+        the checkpoint directory has no ``.safetensors`` files, this initializes
+        every parameter with vLLM's deterministic dummy-weight policy. The
         real-weight path below is exercised whenever files are present.
         """
         import glob
@@ -2379,9 +2411,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         # "cannot copy out of meta tensor" error load_weights exists to
         # avoid. Deterministic buffers (moe routing tables, never provided
         # by a checkpoint) are recomputed explicitly since nothing else
-        # touches them; real parameters are left as to_empty()'s
-        # uninitialized values when no checkpoint is present (a smoke-test
-        # scenario only -- see the docstring above).
+        # touches them. If no checkpoint is present, the parameter-only dummy
+        # initializer below fills the storage allocated by to_empty().
         self.to_empty(device=device)
         self.model._setup_weight_loaders()
         self._setup_lm_head_weight_loader()
@@ -2400,6 +2431,16 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if hasattr(module, "_setup_weight_loaders"):
                     module._setup_weight_loaders()
         if not files:
+            _initialize_dummy_parameters(self)
+            parameter_bytes = sum(
+                parameter.numel() * parameter.element_size()
+                for parameter in self.parameters()
+            )
+            logger.info(
+                "DeepSeek-V4 initialized deterministic dummy parameters; "
+                "rank footprint: %.3f GiB",
+                parameter_bytes / (1024**3),
+            )
             return
 
         def _weights():

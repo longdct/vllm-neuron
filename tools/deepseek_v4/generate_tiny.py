@@ -63,8 +63,7 @@ def main() -> None:
     parser.add_argument(
         "--capture-attention-internals-layer",
         type=int,
-        choices=range(3),
-        metavar="{0,1,2}",
+        metavar="LAYER",
         help="Capture only one layer plus its attention projection internals.",
     )
     parser.add_argument(
@@ -172,6 +171,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    config_path = args.checkpoint / "config.json"
+    if not config_path.is_file():
+        parser.error(f"checkpoint config does not exist: {config_path}")
+    checkpoint_config = json.loads(config_path.read_text())
+    num_hidden_layers = int(checkpoint_config["num_hidden_layers"])
     if args.tensor_parallel_size < 1:
         parser.error("--tensor-parallel-size must be positive")
     if args.max_num_seqs < 1:
@@ -189,6 +193,13 @@ def main() -> None:
         parser.error(
             "--capture-modules and --capture-attention-internals-layer are "
             "mutually exclusive"
+        )
+    if args.capture_attention_internals_layer is not None and not (
+        0 <= args.capture_attention_internals_layer < num_hidden_layers
+    ):
+        parser.error(
+            "--capture-attention-internals-layer must be in "
+            f"[0, {num_hidden_layers})"
         )
     prompt_modes = sum(
         value is not None
@@ -275,7 +286,7 @@ def main() -> None:
                 "model.embed_tokens",
                 *[
                     f"model.layers.{layer}.{module}"
-                    for layer in range(3)
+                    for layer in range(num_hidden_layers)
                     for module in (
                         "attn_hc",
                         "input_layernorm",
@@ -285,7 +296,7 @@ def main() -> None:
                         "moe",
                     )
                 ],
-                *(f"model.layers.{layer}" for layer in range(3)),
+                *(f"model.layers.{layer}" for layer in range(num_hidden_layers)),
                 "lm_head",
             ]
         else:
@@ -344,9 +355,7 @@ def main() -> None:
     initialization_seconds = time.perf_counter() - initialization_started
     # Read the bound rather than hardcoding the synthetic model's 64-token vocab,
     # so a real checkpoint is validated against its own vocabulary.
-    vocab_size = json.loads(
-        (args.checkpoint / "config.json").read_text()
-    )["vocab_size"]
+    vocab_size = checkpoint_config["vocab_size"]
     batch_workload = args.batch_prompt_lengths is not None
     length_spec = args.batch_prompt_lengths or args.workload_lengths
     if length_spec:
