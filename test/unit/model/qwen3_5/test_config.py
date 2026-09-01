@@ -276,6 +276,75 @@ def test_rejects_tp_that_splits_kv_heads_unevenly():
 
 
 # ---------------------------------------------------------------------------
+# Full-attention head partition
+#
+# The rank -> KV head mapping used to be `rank // num_kv_replicas`, computed
+# inline in the weight loader. That is right only while the query heads are
+# unpadded, so it is right for the 0.8B at every degree and wrong for the
+# shipped 27B as soon as padding appears. Nothing asserted which global heads a
+# rank owns, which is why it survived.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16, 32])
+def test_every_rank_query_heads_share_its_kv_head_group(tp):
+    """The invariant that matters: a rank's query heads and its KV head agree.
+
+    Checks the shipped 27B geometry (24 Q / 4 KV, GQA group 6). At tp=16 the 24
+    heads pad to 32, and the old `rank // num_kv_replicas` gives rank 3 KV head
+    0 while it owns query heads 6-7, which belong to KV head 1.
+    """
+    c = Qwen3_5TextConfig()
+    p = resolve_sharding(c, tp)
+    if p.kv_heads_per_rank != 1:
+        pytest.skip("KV heads are split, not replicated, at this degree")
+
+    for rank in range(tp):
+        real = [h for h in p.q_head_indices(rank) if h < p.num_q_heads]
+        if not real:
+            # Padding-only rank: its output is annihilated by the zeroed
+            # o_proj columns, but the index must still be in range.
+            assert 0 <= p.kv_head_index(rank) < p.num_kv_heads
+            continue
+        wanted = {h // p.gqa_group_size for h in real}
+        assert len(wanted) == 1, (
+            f"tp={tp} rank={rank} owns heads {real} spanning KV groups {wanted}"
+        )
+        assert p.kv_head_index(rank) == wanted.pop(), (
+            f"tp={tp} rank={rank} heads={real} got KV head "
+            f"{p.kv_head_index(rank)}"
+        )
+
+
+def test_kv_head_index_is_not_the_rank_over_replicas_shortcut():
+    """Pin the specific 27B ranks the old expression got wrong.
+
+    Without this, a regression back to `rank // num_kv_replicas` passes every
+    other test in the suite.
+    """
+    p = resolve_sharding(Qwen3_5TextConfig(), 16)
+    assert p.padded_q_heads == 32 and p.q_heads_per_rank == 2
+    shortcut = [rank // p.num_kv_replicas for rank in range(16)]
+    correct = [p.kv_head_index(rank) for rank in range(16)]
+    assert correct != shortcut
+    # Rank 3 owns query heads 6-7; 6 // 6 == KV head 1, not 0.
+    assert p.q_head_indices(3) == [6, 7]
+    assert p.kv_head_index(3) == 1
+    assert shortcut[3] == 0
+
+
+def test_rejects_a_degree_whose_ranks_straddle_kv_groups():
+    """6 Q / 2 KV at tp=4 gives 2 heads per rank against a group of 3.
+
+    Rank 1 would own heads 2 and 3 -- one from each group -- and a single KV
+    head cannot serve both. Reject rather than shard silently wrong.
+    """
+    c = Qwen3_5TextConfig(num_attention_heads=6, num_key_value_heads=2)
+    with pytest.raises(ValueError, match="span two GQA groups"):
+        resolve_sharding(c, 4)
+
+
+# ---------------------------------------------------------------------------
 # Gated DeltaNet row partition
 #
 # Every GDN weight loader and the state-cache spec derive their widths from

@@ -83,16 +83,22 @@ def gated_qkv_weight_loader(
     which is what lets :func:`~vllm_neuron.model.qwen3_5.attention.split_query_and_gate`
     recover the two by viewing as ``[..., heads, 2 * head_dim]``.
 
-    Query heads are padded up to a multiple of the TP degree with **zero** rows.
-    A zero query head produces a zero attention output, and the matching
-    ``o_proj`` rows are zeroed too, so padded heads contribute nothing to the
-    reduced result rather than merely being ignored.
+    Query heads are padded up to a multiple of the TP degree with **zero** rows,
+    and the matching ``o_proj`` columns are zeroed as well.
+
+    Only the second of those is load-bearing, contrary to what this docstring
+    used to claim. A zero query does *not* produce a zero attention output: all
+    scores become zero, softmax over the causal window turns that into a uniform
+    distribution, and the result is the mean of V -- then scaled by
+    ``sigmoid(0) = 0.5`` by the output gate. It is nonzero and data-dependent.
+    What annihilates it is the zeroed ``o_proj`` column block. The zeroed
+    ``q_proj`` rows only make the padded head's value cheap and deterministic;
+    they are not a second, independent safety net.
     """
     head_dim = config.head_dim
     num_q_heads = config.num_attention_heads
     q_per_rank = policy.q_heads_per_rank
     kv_per_rank = policy.kv_heads_per_rank
-    replicas = policy.num_kv_replicas
 
     def transform(slices, rank):
         q_slice, k_slice, v_slice = slices
@@ -112,8 +118,20 @@ def gated_qkv_weight_loader(
         q_part = torch.cat(rows, dim=0)
 
         # --- key / value ---
-        kv_rank = rank // replicas if replicas > 1 else rank
-        kv_lo = kv_rank * kv_per_rank * head_dim
+        # Two regimes, and they index differently:
+        #
+        # * More ranks than KV heads (kv_per_rank == 1): the KV heads are
+        #   replicated, and *which* one this rank needs is set by its query
+        #   heads, not by its rank index. Ask the policy --
+        #   `rank // num_kv_replicas` is right only when the query heads are
+        #   unpadded, and silently mis-pairs ranks once they are.
+        # * Fewer ranks than KV heads (kv_per_rank > 1): this rank takes a
+        #   contiguous run of KV heads, and rank order does map linearly.
+        if kv_per_rank == 1:
+            first_kv_head = policy.kv_head_index(rank)
+        else:
+            first_kv_head = rank * kv_per_rank
+        kv_lo = first_kv_head * head_dim
         kv_hi = kv_lo + kv_per_rank * head_dim
         k_part = k_slice[kv_lo:kv_hi, :][:]
         v_part = v_slice[kv_lo:kv_hi, :][:]

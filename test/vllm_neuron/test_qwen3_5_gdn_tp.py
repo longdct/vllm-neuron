@@ -54,7 +54,11 @@ def _config(**overrides):
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
-        num_attention_heads=6,
+        # 8 rather than 6: these tests sweep tp=4, and 6 query heads over 4
+        # ranks gives 2 per rank against a GQA group of 3, so rank 1 would own
+        # heads 2 and 3 -- one from each group. resolve_sharding rejects that.
+        # Attention geometry is incidental here; the suite is about the GDN.
+        num_attention_heads=8,
         num_key_value_heads=2,
         head_dim=8,
         vocab_size=32,

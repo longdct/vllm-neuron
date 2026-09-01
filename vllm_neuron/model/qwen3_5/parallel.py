@@ -74,6 +74,7 @@ class Qwen3_5ShardingPolicy:
 
     # -- Full attention
     num_q_heads: int
+    num_kv_heads: int
     padded_q_heads: int
     q_heads_per_rank: int
     kv_heads_per_rank: int
@@ -145,6 +146,49 @@ class Qwen3_5ShardingPolicy:
         """
         return 2 * self.key_dim_per_rank + self.value_dim_per_rank
 
+    # -- Full-attention head partition -------------------------------------
+    #
+    # These exist for the same reason as the Gated DeltaNet helpers below: so
+    # the partition is stated in one place instead of being re-derived inside
+    # each weight loader. Their absence is precisely why the KV mis-pairing
+    # below went unnoticed -- the attention loaders computed
+    # ``rank // num_kv_replicas`` inline, which is right only when the query
+    # heads are unpadded, and no test asserted which global heads a rank owns.
+
+    @property
+    def gqa_group_size(self) -> int:
+        """Query heads sharing one KV head in the *unsharded* checkpoint."""
+        return self.num_q_heads // self.num_kv_heads
+
+    def q_head_indices(self, rank: int) -> list[int]:
+        """Global query heads owned by ``rank``.
+
+        Indices at or beyond ``num_q_heads`` are padding: they are loaded as
+        zero rows in ``q_proj`` and their ``o_proj`` columns are zeroed too.
+        """
+        first = rank * self.q_heads_per_rank
+        return list(range(first, first + self.q_heads_per_rank))
+
+    def kv_head_index(self, rank: int) -> int:
+        """Global KV head serving ``rank``'s query heads.
+
+        Derived from the rank's first *real* query head, not from the rank
+        index. ``rank // num_kv_replicas`` -- what the loader used to do --
+        assumes rank order maps linearly onto KV heads, which holds only when
+        the query heads are unpadded. It is therefore correct for the 0.8B
+        (8 Q / 2 KV, no padding at any degree) and wrong for the 27B
+        (24 Q / 4 KV) as soon as padding appears: at tp=16 the 24 heads pad to
+        32, and rank 3 owns global query heads 6-7, which belong to KV head 1,
+        while ``3 // 4`` hands it KV head 0. Ranks 3, 6, 7, 9, 10 and 11 are all
+        mis-paired at tp=16, and tp=32 is wrong too.
+
+        Ranks holding only padded query heads are clamped to the last KV head;
+        their attention output is annihilated by the zeroed ``o_proj`` columns,
+        so the choice is arbitrary but the index must stay in range.
+        """
+        first_head = rank * self.q_heads_per_rank
+        return min(first_head // self.gqa_group_size, self.num_kv_heads - 1)
+
     # -- Which global heads / rows belong to a rank ------------------------
 
     def k_head_indices(self, rank: int) -> list[int]:
@@ -207,7 +251,13 @@ def resolve_sharding(
             f"tp_degree={tp_degree}."
         )
     if config.hidden_size % tp_degree:
-        # Sequence parallelism scatters the hidden dim across ranks.
+        # Not because the hidden dim is sharded -- it is not. Sequence
+        # parallelism scatters *tokens* (dim 0); every rank holds the full
+        # hidden width. The real constraint is that the token count handed to
+        # the embedding must divide the world size (nn/embedding.py:200
+        # asserts it), and the bucket sizes that satisfy that are powers of two
+        # like hidden_size. Keeping the check is cheap insurance against an
+        # exotic degree; the original rationale was simply wrong.
         raise ValueError(
             f"hidden_size={config.hidden_size} is not divisible by "
             f"tp_degree={tp_degree}."
@@ -237,6 +287,33 @@ def resolve_sharding(
             )
         kv_heads_per_rank = kv_heads // tp_degree
         num_kv_replicas = 1
+
+    # A rank holding one KV head must have all of its real query heads inside
+    # that head's GQA group, or one of them attends against the wrong K/V.
+    #
+    # This can only break when the query heads are padded, because padding is
+    # appended at the end rather than distributed per group, so it shifts the
+    # rank boundaries off the group boundaries. Both shipped checkpoints are
+    # clean at every supported degree -- 8Q/2KV (group 4) and 24Q/4KV (group 6)
+    # -- but the combination is expressible, and a straddling rank is exactly
+    # the kind of silently-wrong shard this module exists to turn into an error.
+    if kv_heads_per_rank == 1 and config.num_attention_heads % kv_heads == 0:
+        group = config.num_attention_heads // kv_heads
+        for rank in range(tp_degree):
+            first = rank * q_heads_per_rank
+            if first >= config.num_attention_heads:
+                continue  # padding only; its output is zeroed by o_proj
+            last = min(first + q_heads_per_rank - 1, config.num_attention_heads - 1)
+            if first // group != last // group:
+                raise ValueError(
+                    f"tp_degree={tp_degree} splits query heads "
+                    f"{q_heads_per_rank} per rank, but rank {rank} would own "
+                    f"heads {first}-{last}, which span two GQA groups of "
+                    f"{group} (num_attention_heads="
+                    f"{config.num_attention_heads}, num_key_value_heads="
+                    f"{kv_heads}). One KV head cannot serve both, so this "
+                    "degree would shard attention silently wrong."
+                )
 
     # ---- Gated DeltaNet --------------------------------------------------
     k_heads = config.linear_num_key_heads
@@ -271,6 +348,7 @@ def resolve_sharding(
     return Qwen3_5ShardingPolicy(
         tp_degree=tp_degree,
         num_q_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
         padded_q_heads=padded_q_heads,
         q_heads_per_rank=q_heads_per_rank,
         kv_heads_per_rank=kv_heads_per_rank,

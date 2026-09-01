@@ -781,7 +781,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # rank's token slice on prefill.
         if self.world_size > 1:
             if is_decode:
-                self.tp_group.all_reduce(output)
+                # Assign -- see the note in Qwen3_5MLP.forward. This module
+                # already assigns the gated-norm all_reduce a few hundred lines
+                # up; the two are now consistent.
+                output = self.tp_group.all_reduce(output)
             else:
                 output = self.tp_group.reduce_scatter(output, dim=0)
         return output

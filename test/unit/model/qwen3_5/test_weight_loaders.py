@@ -48,7 +48,7 @@ def _config(**overrides):
         hidden_size=64,
         intermediate_size=128,
         num_hidden_layers=4,
-        num_attention_heads=6,
+        num_attention_heads=8,
         num_key_value_heads=2,
         head_dim=8,
         vocab_size=32,
@@ -207,21 +207,26 @@ def test_qkv_loader_shards_heads_across_ranks_without_overlap():
 
 
 def test_padded_query_heads_are_zero():
-    """6 heads over tp=4 pads to 8; the two extra heads must be zeros."""
-    config = _config()
-    policy = resolve_sharding(config, 4)
+    """6 heads over tp=8 pads to 8; the two extra heads must be zeros.
+
+    tp=8 rather than tp=4: at tp=4 this geometry gives 2 query heads per rank
+    against a GQA group of 3, so rank 1 would own heads 2 and 3 -- one from each
+    group -- and resolve_sharding now rejects that outright.
+    """
+    config = _config(num_attention_heads=6)
+    policy = resolve_sharding(config, 8)
     assert policy.padded_q_heads == 8
     assert policy.q_head_padding == 2
 
     head_dim = config.head_dim
-    last_rank = 3
+    last_rank = 7
     fused_t = (
         gated_qkv_weight_loader(config, policy)
         .load(_qkv_slices(config), rank=last_rank)
         .t()
     )
     q_block = fused_t[: policy.q_heads_per_rank * 2 * head_dim]
-    # Rank 3 owns heads 6 and 7, both beyond the real 6.
+    # Rank 7 owns head 7, beyond the real 6.
     assert torch.all(q_block == 0)
 
 
@@ -246,16 +251,16 @@ def test_kv_heads_replicate_when_ranks_outnumber_them():
 
 
 def test_o_proj_zeroes_the_padded_head_columns():
-    config = _config()
-    policy = resolve_sharding(config, 4)
+    config = _config(num_attention_heads=6)
+    policy = resolve_sharding(config, 8)
     hidden, head_dim = config.hidden_size, config.head_dim
 
     o = torch.arange(
         hidden * config.num_attention_heads * head_dim, dtype=torch.float32
     ).reshape(hidden, config.num_attention_heads * head_dim)
 
-    loaded = gated_o_proj_weight_loader(config, policy).load([FakeSlice(o)], rank=3)
-    # Parameter is [heads_per_rank * head_dim, hidden]; rank 3 is all padding.
+    loaded = gated_o_proj_weight_loader(config, policy).load([FakeSlice(o)], rank=7)
+    # Parameter is [heads_per_rank * head_dim, hidden]; rank 7 is all padding.
     assert torch.all(loaded == 0)
 
 

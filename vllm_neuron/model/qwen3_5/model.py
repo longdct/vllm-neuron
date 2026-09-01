@@ -136,7 +136,14 @@ class Qwen3_5MLP(nn.Module):
             if is_prefill:
                 output = self.tp_group.reduce_scatter(output, dim=0)
             else:
-                self.tp_group.all_reduce(output)
+                # Assign: vLLM documents all_reduce as out-of-place ("we always
+                # make the all-reduce operation out-of-place",
+                # parallel_state.py:632). It happens to mutate in place today
+                # only because Neuron leaves use_custom_op_call False and the
+                # base communicator does dist.all_reduce(input_); the
+                # custom-op path returns a new tensor and would silently leave
+                # this rank's un-reduced partial behind.
+                output = self.tp_group.all_reduce(output)
         return output
 
 
@@ -356,7 +363,8 @@ class Qwen3_5Attention(nn.Module):
         ).squeeze(0)
 
         if self.world_size > 1:
-            self.tp_group.all_reduce(attn_output)
+            # Assign -- see the note in Qwen3_5MLP.forward.
+            attn_output = self.tp_group.all_reduce(attn_output)
         return attn_output
 
 
