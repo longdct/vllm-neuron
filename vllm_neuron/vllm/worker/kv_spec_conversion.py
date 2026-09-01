@@ -25,8 +25,10 @@ from vllm_neuron.model.kv_cache import CacheKind, LayerSpec
 logger = logging.getLogger(__name__)
 
 
-def layer_spec_to_vllm_spec(layer: LayerSpec, block_size: int, dtype):
-    block_size = layer.block_size or block_size
+def layer_spec_to_vllm_spec(
+    layer: LayerSpec, block_size: int, dtype, mamba_block_size: int | None = None
+):
+    attn_block_size = layer.block_size or block_size
 
     if layer.cache_kind is CacheKind.MAMBA:
         # Linear-attention state is per request, not per token: vLLM's
@@ -36,12 +38,30 @@ def layer_spec_to_vllm_spec(layer: LayerSpec, block_size: int, dtype):
         # max_model_len so the block table is a single column. The per-request
         # state index is that column; slot_mapping does not apply.
         #
+        # That last part only held if someone actually passed max_model_len.
+        # Falling back to cache_config.block_size (32) made the comment a lie:
+        # the pool sizer still budgeted one page per request -- MambaSpec's
+        # max_memory_usage_bytes ignores block_size outside cache mode "all"
+        # -- but the *allocator* did not. It sizes a request from
+        # cdiv(num_tokens, block_size) (single_type_kv_cache_manager.py:132),
+        # so a 16384-token prefill transiently demanded cdiv(16384, 32) = 512
+        # blocks per linear group against a budget of 1, and the block table
+        # was 512 columns wide instead of one
+        # (input_batch_params.py: cdiv(max_model_len, spec.block_size)).
+        # The blocks come back the next step, but the peak scales with
+        # concurrency and is exactly the wrong thing to leave under a comment
+        # claiming it cannot happen.
+        #
+        # Safe to raise: MambaSpec.page_size_bytes is a function of shapes and
+        # dtypes alone (kv_cache_interface.py:638), so the page -- and with it
+        # the unified page every attention group is padded to -- is unchanged.
+        #
         # dtypes come from the layer, not cache_config: the recurrent state is
         # an fp32 accumulator and must not inherit an fp8/bf16 KV choice.
         from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
         return MambaSpec(
-            block_size=block_size,
+            block_size=layer.block_size or mamba_block_size or block_size,
             shapes=tuple(tuple(shape) for shape in layer.state_shapes),
             dtypes=tuple(layer.state_dtypes),
             mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
@@ -53,16 +73,16 @@ def layer_spec_to_vllm_spec(layer: LayerSpec, block_size: int, dtype):
         layer.dtype if layer.cache_kind is CacheKind.COMPRESSOR_STATE else dtype
     )
     common = dict(
-        block_size=block_size,
+        block_size=attn_block_size,
         num_kv_heads=layer.num_kv_heads,
         head_size=layer.head_size,
         dtype=effective_dtype,
     )
     if layer.cache_kind is CacheKind.MLA:
-        if block_size % layer.compress_ratio:
+        if attn_block_size % layer.compress_ratio:
             raise ValueError(
-                f"layer {layer.name}: block size {block_size} is not divisible "
-                f"by compression ratio {layer.compress_ratio}"
+                f"layer {layer.name}: block size {attn_block_size} is not "
+                f"divisible by compression ratio {layer.compress_ratio}"
             )
         return MLAAttentionSpec(
             **common,

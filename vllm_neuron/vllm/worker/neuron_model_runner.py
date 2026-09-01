@@ -8759,10 +8759,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
 
+        # Linear-attention state is per request, so its block must span the
+        # whole sequence: one page per request, a single-column block table.
+        # The model cannot supply this itself -- max_model_len is an engine
+        # decision, not a checkpoint property -- so it is passed in here.
+        mamba_block_size = self.vllm_config.model_config.max_model_len
+
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
-            spec = layer_spec_to_vllm_spec(layer, block_size, kv_cache_dtype)
+            spec = layer_spec_to_vllm_spec(
+                layer, block_size, kv_cache_dtype, mamba_block_size=mamba_block_size
+            )
             all_kv_cache_specs[layer_name] = spec
 
         if self.speculative_config and self.speculative_config.use_eagle():
