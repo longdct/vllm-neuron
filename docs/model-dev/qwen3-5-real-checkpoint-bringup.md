@@ -652,6 +652,40 @@ Two claims made while debugging this were wrong and are retracted: vLLM did
 allocation), and there is **no evidence** that the prefill activation arena
 consumed the memory.
 
+**The override was never needed.** The same log line that applies it says what
+it replaced: `Overriding num_gpu_blocks=1043 with
+num_gpu_blocks_override=344`. vLLM's own sizing lands at 1043 blocks -- about
+7.1 GiB a rank, just under the `0.30 x 24 GiB` Neuron KV budget cap -- which
+fits perfectly well. Passing nothing would have worked from the start; passing
+344 is tighter and leaves more HBM free; passing 4096 is what broke it. The
+lesson is not "compute the override carefully" but **"do not set it unless you
+have a reason"**, and the guard added alongside this now names the usable
+figure when someone does.
+
+### Confirmed: 16K x 8 requests works at TP=8
+
+`max_model_len=16384`, `max_num_seqs=8`, `num_gpu_blocks_override=344`, eight
+prompts of unequal length submitted in one `generate()` call so the scheduler
+actually batches them (`Processed prompts: 8/8 [01:29]`). All eight correct:
+`23, 29, 31` for primes above 20; `Au`, from Latin *aurum*; Jupiter and
+Ganymede; `17 + 25 = 42`; Rayleigh scattering; and the train-speed and
+translation prompts both opening `<think>` blocks with the right setup.
+
+**Cold wall time: 2h42m** (20:45:58 -> 23:28:00) for compile, 50 GiB load and
+generation. Generation itself was 1m29s for 8 x 32 tokens. The compile is
+essentially all of it, and it is the number to plan around: warm the cache.
+
+One honest correction to the commit that precedes this one. That run executed
+on the **pre-fix** code -- its log shows
+`max_num_blocks_per_req=[512, 512, 512, 40]`, the linear groups still at 512
+blocks a request -- and it passed anyway. So the transient over-demand
+described there did **not** in fact bite at 8-way concurrency at 16K; the
+claim that it "would have bitten next" was speculation that the device did not
+bear out. The fix stands on its own terms -- the block tables really are 512
+columns wide instead of one, and the allocator really does ask for 512 blocks
+where the sizer budgeted one -- but it was not a prerequisite for this result
+and should not be described as one.
+
 ### Compile time at 16K is the real cost
 
 The 2048 prefill graph compiled in minutes. The **16384** single-shot prefill
