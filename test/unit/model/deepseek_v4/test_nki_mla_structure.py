@@ -9,23 +9,18 @@ from vllm_neuron.model.deepseek_v4 import nki_mla
 from vllm_neuron.model.deepseek_v4.attention import SharedLatentMLAInputs
 
 
-def test_paged_mla_has_fixed_tiled_lnc2_program_shape():
+def test_paged_mla_has_one_bounded_runtime_loop_call_per_scheduler_bucket():
     shared = inspect.getsource(nki_mla._paged_shared_latent_mla_kernel)
     sliding = inspect.getsource(nki_mla._paged_sliding_latent_mla_kernel)
 
-    # The tile is overridable (VLLM_NEURON_DSV4_MLA_QUERY_TILE) to trade outer-
-    # graph custom-call sites against kernel body size. The span gather in
-    # _build_sliding_span costs `count + n_q - 1` rows per query run whatever
-    # the tile is, so it amortizes better the larger the tile -- hence a default
-    # well above the historical 8.
-    tile = nki_mla._PREFILL_QUERY_TILE
-    assert tile > 1 and tile % 2 == 0, "the tile must split across LNC2"
-    assert tile <= 128, "_build_sliding_span gathers its tail in one DMA"
-    assert nki_mla._PAGED_KERNEL_QUERY_BUCKETS == frozenset((1, tile))
+    assert nki_mla._PAGED_KERNEL_QUERY_BUCKETS == frozenset(
+        (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)
+    )
     for source in (shared, sliding):
-        assert "q_count in (1, _PREFILL_QUERY_TILE)" in source
-        assert "queries_per_program <= _PREFILL_QUERY_TILE" in source
+        assert "q_count in (1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)" in source
         assert "program_id * queries_per_program" in source
+        assert "nl.fori_loop(0, queries_per_program, process_query)" in source
+        assert "2 * _MAX_RUNTIME_LOOP_TRIPS" in source
 
 
 def test_paged_mla_gathers_the_sliding_run_once_not_per_query():
@@ -111,7 +106,7 @@ def test_paged_mla_does_not_materialize_query_by_history_hbm():
     )
 
 
-@pytest.mark.parametrize("query_count", [512, 1024, 2048, 4096])
+@pytest.mark.parametrize("query_count", [8, 64, 512, 1024, 2048, 4096, 8192])
 def test_paged_dispatch_preserves_microchunk_and_tile_order(monkeypatch, query_count):
     launches = []
 
@@ -147,6 +142,5 @@ def test_paged_dispatch_preserves_microchunk_and_tile_order(monkeypatch, query_c
         )
     )
 
-    tile = nki_mla._PREFILL_QUERY_TILE
     assert output.shape == query.shape
-    assert launches == [(start, tile) for start in range(0, query_count, tile)]
+    assert launches == [(0, query_count)]

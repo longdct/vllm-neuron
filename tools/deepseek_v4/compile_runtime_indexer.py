@@ -34,10 +34,20 @@ class RuntimeIndexer(torch.nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", type=int, choices=(1, 16, 512, 1024), default=512)
+    parser.add_argument(
+        "--query",
+        type=int,
+        choices=(1, 8, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
+        default=512,
+    )
     parser.add_argument("--block-columns", type=int, default=1024)
     parser.add_argument("--logical-slots", type=int, default=128)
     parser.add_argument("--visible", type=int, default=0)
+    parser.add_argument(
+        "--prefill-visibility",
+        action="store_true",
+        help="use the CSA position-0..Q-1 visibility ramp instead of --visible",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -49,7 +59,28 @@ def main() -> None:
         1, 1, physical_stride, 128, dtype=torch.bfloat16, device=device
     )
     block_table = torch.zeros(args.block_columns, dtype=torch.int32, device=device)
-    visible = torch.full((args.query,), args.visible, dtype=torch.int32, device=device)
+    if args.prefill_visibility:
+        visible = torch.div(
+            torch.arange(1, args.query + 1, dtype=torch.int32, device=device),
+            4,
+            rounding_mode="floor",
+        )
+        visible_cpu = visible.to("cpu").long()
+        visible_record: int | list[int] | dict[str, int]
+        if args.query <= 1024:
+            visible_record = visible_cpu.tolist()
+        else:
+            visible_record = {
+                "count": args.query,
+                "first": int(visible_cpu[0]),
+                "last": int(visible_cpu[-1]),
+            }
+    else:
+        visible = torch.full(
+            (args.query,), args.visible, dtype=torch.int32, device=device
+        )
+        visible_cpu = visible.to("cpu").long()
+        visible_record = args.visible
 
     compiled = torch.compile(
         RuntimeIndexer(args.logical_slots), backend="neuron", dynamic=False
@@ -60,29 +91,42 @@ def main() -> None:
     elapsed = time.monotonic() - started
     indices_cpu = indices.to("cpu")
     valid_cpu = valid.to("cpu")
-    expected_used = min(
-        max(args.visible, 0),
-        args.block_columns * args.logical_slots,
-        512,
+    expected_visible = visible_cpu
+    expected_used = expected_visible.clamp(
+        min=0,
+        max=min(args.block_columns * args.logical_slots, 512),
     )
     valid_counts = valid_cpu.sum(dim=1)
-    valid_indices = indices_cpu[valid_cpu]
     valid_count_ok = bool((valid_counts == expected_used).all())
+    mismatched_rows = torch.nonzero(valid_counts != expected_used).flatten()
     valid_range_ok = bool(
-        valid_indices.numel() == 0
-        or ((valid_indices >= 0) & (valid_indices < args.visible)).all()
+        (
+            ~valid_cpu
+            | (
+                (indices_cpu >= 0)
+                & (indices_cpu < expected_visible[:, None])
+            )
+        ).all()
     )
     record = {
         "query": args.query,
         "block_columns": args.block_columns,
         "logical_slots_per_block": args.logical_slots,
         "capacity_entries": args.block_columns * args.logical_slots,
-        "visible_entries": args.visible,
+        "visible_entries": visible_record,
         "wall_seconds": elapsed,
         "peak_rss_kbytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "output_shapes": [list(indices.shape), list(valid.shape)],
         "valid_count_ok": valid_count_ok,
         "valid_range_ok": valid_range_ok,
+        "valid_counts_summary": {
+            "min": int(valid_counts.min()),
+            "max": int(valid_counts.max()),
+            "mismatch_count": int(mismatched_rows.numel()),
+            "first_mismatch": (
+                int(mismatched_rows[0]) if mismatched_rows.numel() else None
+            ),
+        },
     }
     text = json.dumps(record, indent=2) + "\n"
     if args.output is not None:

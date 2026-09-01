@@ -126,6 +126,48 @@ def test_candidate_count_is_one_for_q1_and_ceil_query_over_ratio_otherwise():
         assert indices.shape == (expected,)
 
 
+def test_two_candidate_kernel_launch_is_padded_to_four(monkeypatch):
+    captured = {}
+
+    class FakeKernel:
+        def __getitem__(self, lnc):
+            captured["lnc"] = lnc
+
+            def launch(_cache, slots, _mask, valid, _bias, _overlap):
+                captured["slots"] = slots
+                captured["valid"] = valid
+                return torch.zeros(slots.shape[0], 128)
+
+            return launch
+
+    monkeypatch.setattr(nki_compressor, "can_run_kernel", lambda _: True)
+    monkeypatch.setattr(
+        nki_compressor, "_wrapped_paged_gated_compressor", FakeKernel()
+    )
+    positions = torch.arange(3, 11)
+    output_slots = torch.where(
+        (positions + 1) % 4 == 0,
+        torch.arange(8),
+        torch.full((8,), -1),
+    )
+
+    reduced, _, _, _ = nki_compressor.paged_gated_compressor(
+        torch.zeros(1, 1, 128, 512, dtype=torch.bfloat16),
+        positions,
+        torch.zeros(8, dtype=torch.long),
+        torch.tensor([[0]]),
+        output_slots,
+        torch.zeros(4, 256, dtype=torch.bfloat16),
+        ratio=4,
+        overlap=True,
+    )
+
+    assert captured["lnc"] == 2
+    assert captured["slots"].shape == (4, 8)
+    assert captured["valid"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    assert reduced.shape == (2, 128)
+
+
 def test_forward_packed_nki_path_finalizes_only_boundary_candidates(monkeypatch):
     query = 512
     head_dim = 128

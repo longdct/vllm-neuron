@@ -84,6 +84,7 @@ from .compressor import (
 )
 from .config import DeepseekV4ModelConfig
 from .indexer import (
+    fixed_prefix_compressed_entries,
     lightning_index_scores,
     select_compressed_entries,
     selection_mask_from_indices,
@@ -94,7 +95,10 @@ from .moe import dense_expert_affinities, hash_topk, routed_topk
 from .nki_compressor import paged_gated_compressor
 from .nki_indexer import paged_projected_bf16_indexer
 from .nki_mla import _HCA_COUNT_BUCKETS, paged_shared_latent_mla
-from .parallel import resolve_parallel_topology
+from .parallel import (
+    resolve_output_projection_partition,
+    resolve_parallel_topology,
+)
 from .weight_loaders import ExpertDType, load_checkpoint_weights
 
 
@@ -757,15 +761,11 @@ class DeepseekV4Attention(nn.Module):
     (the shared latent must be identical on every rank -- it feeds the
     compressed cache). ``q_b_proj``'s output and ``o_a_proj``'s input are
     head-sharded (``num_heads // world_size`` heads per rank, the standard
-    MLA TP split); ``o_groups`` is sharded the same way
-    (``o_groups // world_size`` groups per rank, each covering exactly the
-    same ``num_heads*head_dim // o_groups``-wide input the unsharded real
-    architecture would, since both numerator and denominator scale down by
-    ``world_size`` together), with an all-reduce after ``o_b_proj`` (a
-    row-parallel linear over the local group slice, same pattern as the
-    existing dense ``o_proj`` all-reduce). Not exercised at ``world_size >
-    1`` on real hardware -- see
-    ``docs/model-dev/deepseek-v4-serving-roadmap.md``.
+    MLA TP split). Through TP8, each rank owns whole output groups. Above TP8,
+    multiple ranks split the input columns of one group and replicate its
+    matching low-rank output columns; the existing ``o_b_proj`` all-reduce
+    then sums those partials. This extends the grouped projection through the
+    production TP32 and TP64 geometries without gathering attention heads.
     """
 
     def __init__(
@@ -822,24 +822,28 @@ class DeepseekV4Attention(nn.Module):
         self.kv_norm = DeepseekV4RMSNorm(self.head_dim, eps=rms_norm_eps)
 
         o_groups = int(getattr(hf_config, "o_groups", 8))
-        o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
-        if o_groups % self.world_size:
-            raise ValueError(
-                f"o_groups={o_groups} must be divisible by TP "
-                f"world_size={self.world_size}"
-            )
-        self.o_groups = o_groups // self.world_size
+        self.o_lora_rank = int(getattr(hf_config, "o_lora_rank", 1024))
+        self.output_partition = resolve_output_projection_partition(
+            tp_degree=self.world_size,
+            tp_rank=self.topology.tp_rank if self.world_size > 1 else 0,
+            output_groups=o_groups,
+            total_input_width=num_heads * self.head_dim,
+        )
+        self.o_groups = self.output_partition.group_count
         local_width = self.heads_per_rank * self.head_dim
-        if local_width % self.o_groups:
+        expected_local_width = self.o_groups * self.output_partition.input_width
+        if local_width != expected_local_width:
             raise ValueError(
-                f"heads_per_rank*head_dim={local_width} must be divisible by "
-                f"o_groups (post-TP-shard)={self.o_groups}"
+                f"heads_per_rank*head_dim={local_width} does not match grouped "
+                f"output projection width={expected_local_width}"
             )
         self.o_a_proj = DeepseekV4GroupedLinear(
-            local_width // self.o_groups, self.o_groups * o_lora_rank, self.o_groups
+            self.output_partition.input_width,
+            self.o_groups * self.o_lora_rank,
+            self.o_groups,
         )
         self.o_b_proj = nn.Linear(
-            self.o_groups * o_lora_rank, config.hidden_size, bias=False
+            self.o_groups * self.o_lora_rank, config.hidden_size, bias=False
         )
         self.sinks = nn.Parameter(torch.zeros(self.heads_per_rank))
         # Hookable no-op boundaries for focused CPU/Neuron accuracy capture.
@@ -870,6 +874,7 @@ class DeepseekV4Attention(nn.Module):
         """Attach rank-aware loaders (also called after ``to_empty``)."""
         if self.world_size > 1:
             from vllm_neuron.utils.weight_loader import (
+                SafetensorsWeightLoader,
                 set_weight_loader,
                 sharding_weight_loader,
                 with_rank_override,
@@ -887,13 +892,24 @@ class DeepseekV4Attention(nn.Module):
                 self.q_b_proj.weight,
                 loader(0, self.q_b_proj.out_features),
             )
+            partition = self.output_partition
+            row_start = partition.group_start * self.o_lora_rank
+            row_end = row_start + partition.group_count * self.o_lora_rank
+            input_start = partition.input_offset
+            input_end = input_start + partition.input_width
             set_weight_loader(
                 self.o_a_proj.weight,
-                loader(0, self.o_a_proj.out_features),
+                SafetensorsWeightLoader(
+                    transform=lambda slices, _: slices[0][
+                        row_start:row_end, input_start:input_end
+                    ]
+                ),
             )
             set_weight_loader(
                 self.o_b_proj.weight,
-                loader(1, self.o_b_proj.in_features),
+                SafetensorsWeightLoader(
+                    transform=lambda slices, _: slices[0][:, row_start:row_end]
+                ),
             )
             set_weight_loader(
                 self.sinks,
@@ -1426,22 +1442,59 @@ class DeepseekV4Attention(nn.Module):
                 index_state = attn_metadata[
                     f"{self_attn_name}.indexer.compressor.state_cache"
                 ]
-                index_slots = compressed_entry_slot_mapping(
-                    index_entry["slot_mapping"],
-                    self.ratio,
-                    self.indexer.mla_raw_block_size,
-                    self.indexer.mla_cache.shape[2],
-                )
-                selection = self.indexer.forward_packed(
-                    hidden,
-                    q_residual,
-                    positions=pos,
-                    token_to_request=owners,
-                    block_tables=index_entry["block_table_tensor"],
-                    state_block_tables=index_state["block_table_tensor"],
-                    state_slot_mapping=index_state["slot_mapping"],
-                    mla_slot_mapping=index_slots,
-                )
+                fixed_selection = os.environ.get(
+                    "VLLM_NEURON_DSV4_FIXED_CSA_SELECTION", "0"
+                ) == "1"
+                if fixed_selection:
+                    # Preserve the indexer's key-compressor/cache-write path;
+                    # only replace scoring/top-k so the bisection removes one
+                    # dependency edge at a time.
+                    index_slots = compressed_entry_slot_mapping(
+                        index_entry["slot_mapping"],
+                        self.ratio,
+                        self.indexer.mla_raw_block_size,
+                        self.indexer.mla_cache.shape[2],
+                    )
+                    self.indexer.compressor.forward_packed(
+                        hidden,
+                        positions=pos,
+                        token_to_request=owners,
+                        state_block_tables=index_state["block_table_tensor"],
+                        state_slot_mapping=index_state["slot_mapping"],
+                        mla_cache=self.indexer.mla_cache,
+                        mla_slot_mapping=index_slots,
+                    )
+                    physical_capacity = mla_entry["block_table_tensor"].shape[1] * (
+                        self.mla_raw_block_size // self.ratio
+                    )
+                    # This is a runtime-hang bisection, not a production
+                    # selector.  At large warmup buckets choose the first
+                    # ``topk`` valid entries; the short diagnostic prompt has
+                    # fewer live entries than ``topk``, so its selection
+                    # remains dense-equivalent.
+                    capacity = min(physical_capacity, self.indexer.index_topk)
+                    selection = fixed_prefix_compressed_entries(
+                        visible_compressed_entries(pos, self.ratio),
+                        topk=self.indexer.index_topk,
+                        capacity=capacity,
+                    )
+                else:
+                    index_slots = compressed_entry_slot_mapping(
+                        index_entry["slot_mapping"],
+                        self.ratio,
+                        self.indexer.mla_raw_block_size,
+                        self.indexer.mla_cache.shape[2],
+                    )
+                    selection = self.indexer.forward_packed(
+                        hidden,
+                        q_residual,
+                        positions=pos,
+                        token_to_request=owners,
+                        block_tables=index_entry["block_table_tensor"],
+                        state_block_tables=index_state["block_table_tensor"],
+                        state_slot_mapping=index_state["slot_mapping"],
+                        mla_slot_mapping=index_slots,
+                    )
                 slots, compressed_valid = logical_to_physical_slots_batched(
                     selection.logical_indices,
                     selection.valid,
@@ -1550,12 +1603,22 @@ class DeepseekV4Expert(nn.Module):
         # w1/w3 are independently sliced by the model-specific stacked loader.
         set_weight_loader(self.down_proj, loader(1, self.intermediate_size))
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def forward_local(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Return this rank's unreduced shared-expert TP partial.
+
+        The ordinary DeepSeek-V4 MoE path combines this partial with the
+        routed-expert partial before issuing its single TP all-reduce.  Keep
+        the unreduced operation explicit so cross-DP EP can retain the two
+        communication domains required by that topology.
+        """
         gate_up = F.linear(hidden, self.gate_up_proj)
         gate, up = gate_up.chunk(2, dim=-1)
         gate = gate.clamp(max=self.swiglu_limit)
         up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        output = F.linear(F.silu(gate) * up, self.down_proj)
+        return F.linear(F.silu(gate) * up, self.down_proj)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        output = self.forward_local(hidden)
         if self.tp_degree > 1:
             output = self.tp_group.all_reduce(output)
         return output
@@ -1701,12 +1764,19 @@ class DeepseekV4MoE(nn.Module):
             start = dp_group.rank_in_group * original_tokens
             routed = routed[start : start + original_tokens]
             hidden = hidden[start : start + original_tokens]
-        elif self.topology.tp_degree > 1 and self.tp_group is not None:
-            # One reduction combines both EP placement and expert-TP partials
-            # when all participating ranks are inside the TP world.
-            routed = self.tp_group.all_reduce(routed)
+            # Routed experts reduce over the wide EP world while the shared
+            # expert is sharded only over TP.  These domains are not
+            # interchangeable, so preserve the legacy separate reductions.
+            return routed + self.shared_experts(hidden)
 
-        return routed + self.shared_experts(hidden)
+        # When EP is wholly contained inside TP, both routed and shared
+        # outputs are local partials over the same final TP domain.  Addition
+        # is linear, so reduce their sum once instead of reducing each term:
+        #   all_reduce(routed + shared) == all_reduce(routed) + all_reduce(shared)
+        output = routed + self.shared_experts.forward_local(hidden)
+        if self.topology.tp_degree > 1:
+            output = self.tp_group.all_reduce(output)
+        return output
 
     def _forward_portable(
         self, hidden: torch.Tensor, affinities: torch.Tensor
@@ -1765,10 +1835,17 @@ class DeepseekV4MoE(nn.Module):
         )
 
         original_tokens = hidden.shape[0]
-        # shard-on-block materializes complete 128-token output tiles. Decode
-        # supplies one token, so carry inert rows through routing and trim the
-        # kernel result. Zero affinities keep padding out of every expert.
-        padded_tokens = ((original_tokens + 127) // 128) * 128
+        # The BF16 shard-on-block kernel statically unrolls one body per routed
+        # block.  Q8192 with B128 exceeds the compiler's five-million-
+        # instruction limit; B512 cuts that fanout by roughly four while
+        # remaining within the kernel's documented 128..512 geometry. Decode
+        # and ordinary prefills retain B128 to avoid unnecessary padding.
+        moe_block_size = 512 if original_tokens > 4096 else 128
+        # Carry inert rows through routing and trim the kernel result. Zero
+        # affinities keep padding out of every expert.
+        padded_tokens = (
+            (original_tokens + moe_block_size - 1) // moe_block_size
+        ) * moe_block_size
         if padded_tokens != original_tokens:
             token_padding = padded_tokens - original_tokens
             hidden = F.pad(hidden, (0, 0, 0, token_padding))
@@ -1789,7 +1866,7 @@ class DeepseekV4MoE(nn.Module):
             expert_affinities=local_affinities,
             num_local_experts=self.num_local_experts,
             num_experts_per_token=self.topk,
-            block_size=128,
+            block_size=moe_block_size,
             moe_group=group,
             tp_degree=self.expert_tp_degree,
         )
@@ -1801,7 +1878,7 @@ class DeepseekV4MoE(nn.Module):
             token_position_to_id=token_ids,
             block_to_expert=block_experts,
             conditions=conditions,
-            block_size=128,
+            block_size=moe_block_size,
             implementation=MoECTEImplementation.shard_on_block,
             activation_function=ActFnType.SiLU,
             compute_dtype=nl.bfloat16,
@@ -2039,9 +2116,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             if config.neuron_config is not None
             else None
         )
-        self._gather_logits = bool(
-            config.neuron_config is not None and config.neuron_config.max_logprobs != 0
+        debug_logits_enabled = bool(
+            config.neuron_config is not None
+            and config.neuron_config.debug_logits_dir is not None
         )
+        self._gather_logits = bool(
+            config.neuron_config is not None
+            and config.neuron_config.max_logprobs != 0
+        ) or debug_logits_enabled
         try:
             from vllm.distributed.parallel_state import get_tp_group
 
@@ -2061,7 +2143,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         self._setup_lm_head_weight_loader()
         if self.on_device_sampling_config is not None:
             self.sampler = neuron_nn.Sampler(
-                self.on_device_sampling_config, process_group=device_group
+                self.on_device_sampling_config,
+                process_group=device_group,
+                vocab_size=config.vocab_size,
             )
 
     def _setup_lm_head_weight_loader(self) -> None:
@@ -2103,6 +2187,15 @@ class DeepseekV4ForCausalLM(nn.Module):
         long-context latent pages and the compressor's fp32 carry pages.
         """
         specs: list[LayerSpec] = []
+        requested_block_size = (
+            getattr(self.config.neuron_config, "kv_cache_block_size", None) or 32
+        )
+        # vLLM 0.24 requires every sliding-MLA page to fit within the largest
+        # full-MLA page before it unifies heterogeneous groups. The ratio-4
+        # cache is the largest full group; four raw-token slots per compressed
+        # entry makes 4 * the public block size give it exactly the SWA page's
+        # byte width. Keep 128 as the established floor for block_size=32.
+        compressed_raw_block_size = max(128, 4 * requested_block_size)
         for index, layer in enumerate(self.config.layers):
             prefix = f"model.layers.{index}.self_attn"
             specs.append(
@@ -2127,15 +2220,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                     dtype=torch.bfloat16,
                     cache_kind=CacheKind.MLA,
                     compress_ratio=ratio,
-                    # The compressed-entry addressing (attention.py::
-                    # compressed_entry_slot_mapping) relies on this group's
-                    # page block_size being a multiple of every supported
-                    # compress_ratio (4 and 128); the Neuron platform default
-                    # of 32 is not. Set explicitly rather than depend on the
-                    # caller passing --block-size 128 -- see
-                    # vllm_neuron/vllm/platform.py::register_custom_kv_cache_specs,
-                    # whose required MLAAttentionSpec fixtures use exactly 128.
-                    block_size=128,
+                    # Compressed-entry addressing requires this raw-token page
+                    # width to be divisible by every supported ratio. It also
+                    # scales with the public block size so vLLM can group it
+                    # with the SWA page at block sizes above the default 32.
+                    block_size=compressed_raw_block_size,
                     alignment=128,
                 )
             )
@@ -2167,7 +2256,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     dtype=torch.bfloat16,
                     cache_kind=CacheKind.MLA,
                     compress_ratio=ratio,
-                    block_size=128,
+                    block_size=compressed_raw_block_size,
                     alignment=128,
                 )
             )

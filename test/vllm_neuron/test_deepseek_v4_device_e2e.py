@@ -32,12 +32,9 @@ fixes beyond the model itself, all documented where they were made:
 - A missing ``@torch.no_grad()`` on ``DeepseekV4ForCausalLM.forward`` (every
   other model in this plugin has one on its top-level forward; this one
   didn't, so returned logits carried grad-tracking into the sampler).
-- Two ``additional_config`` overrides below (``async_scheduling=False``,
-  ``on_device_sampling_config=None``): on-device sampling is this plugin's
-  *default* (``on_device_sampling_config`` defaults to a non-``None`` value,
-  and async scheduling unconditionally skips the CPU sampler), which this
-  model does not implement -- it returns bare logits (the "CPU sampling, no
-  ODS" contract). Implementing on-device sampling is separate, unbuilt work.
+- DeepSeek-V4 now follows the plugin's on-device-sampling contract: the LM
+  head retains sharded logits, the model returns sampled token ids, and async
+  scheduling consumes them without invoking the CPU sampler.
 
 Run this file alone, or as part of ``test/vllm_neuron/`` alone -- both pass
 cleanly and exercise the real engine end to end. **Do not read anything into
@@ -178,25 +175,15 @@ def _run(tensor_parallel_size: int):
         enable_prefix_caching=False,
         skip_tokenizer_init=True,
         num_gpu_blocks_override=256,
-        # Two independent on-device-sampling assumptions to route around --
-        # this model implements the "CPU sampling (no ODS)" contract (bare
-        # logits return), not on-device sampling, which is real, separate,
-        # unbuilt work and not part of this pass:
-        #  1. Async scheduling (on by default) unconditionally treats the
-        #     model's return value as already-sampled token ids
-        #     (neuron_model_runner.py::_sample's async branch skips the CPU
-        #     sampler entirely) -- forcing sync scheduling restores the CPU
-        #     sampler call.
-        #  2. NeuronConfig.on_device_sampling_config defaults to a
-        #     *non-None* factory value, so `on_device_sampling` is True
-        #     unless explicitly cleared -- even with sync scheduling, a
-        #     True value here still takes the ODS branch inside `_sample`
-        #     and treats bare logits as pre-sampled ids.
-        async_scheduling=False,
+        async_scheduling=True,
         additional_config={
             "neuron_config": {
                 "num_batched_tokens_buckets": [8, 64],
-                "on_device_sampling_config": None,
+                "on_device_sampling_config": {
+                    "all_greedy": False,
+                    "max_top_k": 256,
+                    "deterministic": True,
+                },
             }
         },
     )

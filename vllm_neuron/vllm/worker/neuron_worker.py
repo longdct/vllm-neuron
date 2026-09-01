@@ -2134,6 +2134,23 @@ class NeuronWorker(WorkerBase):
             "sync_fallback_steps": self.model_runner._sync_fallback_steps,
         }
 
+    def get_hbm_memory_stats(self) -> dict[str, int | None]:
+        """Return per-worker HBM usage for benchmark provenance."""
+        if not self._use_neuron_device():
+            return {
+                "rank": self.rank,
+                "local_rank": self.local_rank,
+                "bytes_used": None,
+                "bytes_free": None,
+            }
+        bytes_used, bytes_free = self._query_runtime_memory_stats()
+        return {
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "bytes_used": bytes_used,
+            "bytes_free": bytes_free,
+        }
+
     def _use_neuron_device(self) -> bool:
         """
         VLLM_NEURON_CPU_MODE forces cpu as the device with vLLM.

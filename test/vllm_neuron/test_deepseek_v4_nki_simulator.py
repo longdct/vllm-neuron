@@ -25,6 +25,7 @@ from vllm_neuron.model.deepseek_v4.nki_compressor import (
 )
 from vllm_neuron.model.deepseek_v4.nki_indexer import (
     _projected_bf16_indexer_kernel,
+    _visible_page_counts,
 )
 from vllm_neuron.model.deepseek_v4.nki_mla import (
     _manual_shared_latent_mla_kernel,
@@ -683,7 +684,7 @@ def test_projected_indexer_q16_tile_handles_runtime_visible_page_counts():
         [0, 1, 17, 31, 32, 127, 255, 511, 512, 3, 33, 129, 257, 377, 500, 64],
         dtype=torch.int32,
     )
-    visible_pages = ((visible + 511) // 512).to(torch.int32)
+    visible_pages = _visible_page_counts(visible, 512)
     indices, used = nki.simulate(_projected_bf16_indexer_kernel[2])(
         query, keys, gate, visible, visible_pages, 512
     )

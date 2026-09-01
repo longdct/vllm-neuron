@@ -435,14 +435,22 @@ def paged_gated_compressor(
     kernel_slots = slots
     kernel_mask = mask
     kernel_valid = valid
-    if candidate_count > 1 and candidate_count % 2:
-        # LNC2 gives both programs the same runtime-loop bound. Pad one inert
-        # candidate for odd shapes, then restore the public fixed candidate
-        # count after the opaque call.
-        kernel_slots = torch.cat((slots, torch.zeros_like(slots[:1])), dim=0)
-        kernel_mask = torch.cat((mask, torch.zeros_like(mask[:1])), dim=0)
-        kernel_valid = torch.cat((valid, torch.zeros_like(valid[:1])), dim=0)
-    lnc = 1 if candidate_count == 1 else 2
+    padding = 4 - candidate_count if candidate_count < 4 else candidate_count % 2
+    if padding:
+        # LNC2 gives both programs the same runtime-loop bound. Keep every
+        # small launch at a minimum of four candidates: the compiler's PSUM
+        # spill pass asserts for two, while a one-candidate LNC1 runtime loop
+        # produces mismatched basic blocks when linked into the LNC2 model.
+        # Larger odd shapes need only one inert row. Restore the public
+        # candidate count after the opaque call in every case.
+        kernel_slots = torch.cat(
+            (slots, torch.zeros_like(slots[:padding])), dim=0
+        )
+        kernel_mask = torch.cat((mask, torch.zeros_like(mask[:padding])), dim=0)
+        kernel_valid = torch.cat(
+            (valid, torch.zeros_like(valid[:padding])), dim=0
+        )
+    lnc = 2
     reduced = _wrapped_paged_gated_compressor[lnc](
         state_cache,
         kernel_slots,

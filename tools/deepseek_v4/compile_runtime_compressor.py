@@ -80,7 +80,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ratio", type=int, choices=(4, 128), required=True)
     parser.add_argument("--head-dim", type=int, choices=(128, 512), required=True)
-    parser.add_argument("--query", type=int, choices=(1, 512, 1024), default=512)
+    parser.add_argument(
+        "--query", type=int, choices=(1, 8, 512, 1024, 8192), default=512
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.ratio == 128 and args.head_dim != 512:

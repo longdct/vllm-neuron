@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 
 # TorchNeuron Native must register its PrivateUse1 device before vLLM resolves
 # the active platform.  Importing vLLM first can leave current_platform as the
@@ -27,6 +28,8 @@ def main() -> None:
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--block-size", type=int, default=32)
     parser.add_argument("--enable-expert-parallel", action="store_true")
     parser.add_argument(
         "--ep-degree",
@@ -108,6 +111,16 @@ def main() -> None:
     )
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument(
+        "--first-token-probe",
+        action="store_true",
+        help="Generate and time one token before the requested workload.",
+    )
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="Force generation to reach --max-tokens for throughput timing.",
+    )
+    parser.add_argument(
         "--kv-cache-dtype",
         default="auto",
         help=(
@@ -120,6 +133,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.tensor_parallel_size < 1:
         parser.error("--tensor-parallel-size must be positive")
+    if args.max_num_seqs < 1:
+        parser.error("--max-num-seqs must be positive")
+    if args.block_size < 1:
+        parser.error("--block-size must be positive")
     if args.ep_degree is not None:
         if not args.enable_expert_parallel:
             parser.error("--ep-degree requires --enable-expert-parallel")
@@ -230,13 +247,14 @@ def main() -> None:
             "capture_dir": str(args.capture_dir),
         }
 
+    initialization_started = time.perf_counter()
     llm = LLM(
         model=str(args.checkpoint),
         load_format=args.load_format,
-        max_num_seqs=1,
+        max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
-        block_size=32,
+        block_size=args.block_size,
         tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enforce_eager=args.enforce_eager,
@@ -247,6 +265,7 @@ def main() -> None:
         async_scheduling=False,
         additional_config={"neuron_config": neuron_config},
     )
+    initialization_seconds = time.perf_counter() - initialization_started
     # Read the bound rather than hardcoding the synthetic model's 64-token vocab,
     # so a real checkpoint is validated against its own vocabulary.
     vocab_size = json.loads(
@@ -275,22 +294,56 @@ def main() -> None:
     )
     if any(len(prompt) + args.max_tokens > args.max_model_len for prompt in prompts):
         parser.error("every prompt length plus --max-tokens must fit --max-model-len")
+    first_token_result = None
+    if args.first_token_probe:
+        probe_started = time.perf_counter()
+        probe_outputs = llm.generate(
+            [{"prompt_token_ids": prompts[0]}],
+            SamplingParams(temperature=0.0, max_tokens=1, ignore_eos=True),
+        )
+        probe_seconds = time.perf_counter() - probe_started
+        probe_tokens = list(probe_outputs[0].outputs[0].token_ids)
+        if len(probe_tokens) != 1:
+            raise SystemExit(f"first-token probe returned {probe_tokens}")
+        first_token_result = {
+            "token_id": probe_tokens[0],
+            "seconds": probe_seconds,
+        }
+
     workload_results = []
     for prompt_ids in prompts:
+        generation_started = time.perf_counter()
         outputs = llm.generate(
             [{"prompt_token_ids": prompt_ids}],
-            SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
+            SamplingParams(
+                temperature=0.0,
+                max_tokens=args.max_tokens,
+                ignore_eos=args.ignore_eos,
+            ),
         )
+        generation_seconds = time.perf_counter() - generation_started
         token_ids = list(outputs[0].outputs[0].token_ids)
         if len(token_ids) != args.max_tokens or any(
             token < 0 or token >= vocab_size for token in token_ids
         ):
             raise SystemExit(f"invalid generated tokens: {token_ids}")
         workload_results.append(
-            {"prompt_length": len(prompt_ids), "token_ids": token_ids}
+            {
+                "prompt_length": len(prompt_ids),
+                "token_ids": token_ids,
+                "generation_seconds": generation_seconds,
+                "tokens_per_second": len(token_ids) / generation_seconds,
+            }
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    result = {"token_ids": workload_results[-1]["token_ids"]}
+    result = {
+        "token_ids": workload_results[-1]["token_ids"],
+        "initialization_seconds": initialization_seconds,
+        "generation_seconds": workload_results[-1]["generation_seconds"],
+        "tokens_per_second": workload_results[-1]["tokens_per_second"],
+    }
+    if first_token_result is not None:
+        result["first_token_probe"] = first_token_result
     if len(workload_results) > 1 or lengths:
         result["workloads"] = workload_results
     args.output.write_text(json.dumps(result, indent=2) + "\n")

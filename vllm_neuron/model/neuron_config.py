@@ -126,6 +126,10 @@ class NeuronConfig:
     embedding_dp_size: int = 1  # Shard Embedding across TP * this many DP ranks
     lm_head_dp_size: int = 1  # Shard LM Head across TP * this many DP ranks
     mlp_dp_size: int = 1  # Shard dense MLP across TP * this many DP ranks
+    # Populated by NeuronModelRunner from vLLM's CacheConfig. Models with
+    # heterogeneous cache page sizes use it to keep their model-owned specs
+    # aligned with the user-facing --block-size value.
+    kv_cache_block_size: int | None = None
     on_device_sampling_config: OnDeviceSamplingConfig | None = field(
         default_factory=OnDeviceSamplingConfig
     )
@@ -226,6 +230,7 @@ class NeuronConfig:
             embedding_dp_size=config_dict.get("embedding_dp_size", 1),
             lm_head_dp_size=config_dict.get("lm_head_dp_size", 1),
             mlp_dp_size=config_dict.get("mlp_dp_size", 1),
+            kv_cache_block_size=config_dict.get("kv_cache_block_size"),
             on_device_sampling_config=on_device_sampling_config,
             max_logprobs=config_dict.get("max_logprobs", 0),
             tensor_capture=tensor_capture,
@@ -267,6 +272,14 @@ class NeuronConfig:
         if not isinstance(self.mlp_dp_size, int) or self.mlp_dp_size < 1:
             raise ValueError(
                 f"mlp_dp_size must be a positive integer, got {self.mlp_dp_size}"
+            )
+        if self.kv_cache_block_size is not None and (
+            not isinstance(self.kv_cache_block_size, int)
+            or self.kv_cache_block_size < 1
+        ):
+            raise ValueError(
+                "kv_cache_block_size must be a positive integer when set, got "
+                f"{self.kv_cache_block_size}"
             )
         if not isinstance(self.enable_structured_outputs, bool):
             raise ValueError(

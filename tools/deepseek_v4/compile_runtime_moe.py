@@ -65,11 +65,15 @@ class RuntimeMoE(torch.nn.Module):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--query", type=int, choices=(512, 1024), default=512)
+    parser.add_argument(
+        "--query", type=int, choices=(512, 1024, 2048, 4096, 8192), default=512
+    )
+    parser.add_argument("--block-size", type=int, choices=(128, 256, 512), default=128)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    hidden_size, intermediate, experts, top_k, block_size = 4096, 2048, 32, 6, 128
+    hidden_size, intermediate, experts, top_k = 4096, 2048, 32, 6
+    block_size = args.block_size
     # The mapper reserves one partially filled block per expert in addition to
     # the densely packed routed-token blocks.
     blocks = (args.query * top_k + block_size - 1) // block_size + experts

@@ -31,6 +31,7 @@ from vllm_neuron.functional.vendored_kernels.rotational_topk import (
 )
 from torch_neuronx.utils import map_torch_dtype_to_external
 from torch_neuronx.nki_hop import wrap_nki
+from vllm_neuron.nki.nki_dtype import torch_to_nki_dtype
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -166,6 +167,19 @@ def topk(
         ...                        process_group=pg, rank=rank_t)
         >>> # Returns shapes (1, 10) with global values and indices
     """
+    # Normalize dims to non-negative BEFORE any all_gather_tensor call below.
+    # torch._utils._maybe_view_chunk_cat (reached via all_gather_tensor) builds
+    # its view as shape[:1] + shape[1:gather_dim] + [shape[0] * shape[gather_dim]]
+    # + shape[gather_dim + 1:]. For a negative gather_dim, ``gather_dim + 1``
+    # wraps to 0, so the final slice re-appends the WHOLE shape: gathering a
+    # (16, 256) result with group_size=16 and gather_dim=-1 asks for a view of
+    # [1, 4096, 16, 256] on 4096 elements and raises. That helper is simply not
+    # negative-dim safe, so callers must hand it a normalized dim.
+    # ``gather_dim == dim`` below is load-bearing (it gates the sharding-offset
+    # correction), so both must be normalized the same way.
+    dim = dim % tensor.ndim
+    gather_dim = gather_dim % tensor.ndim
+
     # Fast path for single device (no process group or tp_degree=1)
     if process_group is None:
         tp_degree = 1
@@ -270,6 +284,16 @@ def batch_sharded_topk(
         group=all2all_group,
     )
 
+    # Normalize dims to non-negative BEFORE any all_gather_tensor call below.
+    # torch._utils._maybe_view_chunk_cat (reached via all_gather_tensor) builds
+    # its view as shape[:1] + shape[1:gather_dim] + [shape[0] * shape[gather_dim]]
+    # + shape[gather_dim + 1:]. For a negative gather_dim, ``gather_dim + 1``
+    # wraps to 0, so the final slice re-appends the WHOLE shape: gathering a
+    # (16, 256) result with group_size=16 and gather_dim=-1 asks for a view of
+    # [1, 4096, 16, 256] on 4096 elements and raises. That helper is simply not
+    # negative-dim safe, so callers must hand it a normalized dim.
+    dim = dim % tensor.ndim
+
     bs = tensor.shape[0]  # batch/DP
     sharded_size = tensor.shape[dim] // dp_degree
 
@@ -325,9 +349,9 @@ def _can_use_nki_topk(tensor: Tensor, k: int, dim: int) -> bool:
     """True if the rotational NKI top-k kernel can handle this (tensor, k, dim).
 
     The kernel (nkilib.core.topk.rotational_topk) reduces over the LAST
-    dimension. Following the standard vLLM-Neuron kernel pattern (cf.
-    functional.argmax._can_use_nki_max), the kernel is used automatically
-    whenever it can run; everything else falls back to ``torch.topk``.
+    dimension. Following the standard vLLM-Neuron kernel pattern, the kernel
+    is used automatically whenever it can run; everything else falls back to
+    ``torch.topk``.
 
     The cheap checks below are NECESSARY conditions (runtime availability,
     rank/dim/dtype, and ``0 < k < vocab_size``). They are NOT sufficient: the

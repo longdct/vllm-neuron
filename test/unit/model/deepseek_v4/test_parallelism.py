@@ -4,7 +4,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from vllm_neuron.model.deepseek_v4.parallel import DeepseekV4ParallelTopology
+from vllm_neuron.model.deepseek_v4.parallel import (
+    DeepseekV4ParallelTopology,
+    resolve_output_projection_partition,
+)
 from vllm_neuron.model.deepseek_v4.weight_loaders import load_checkpoint_weights
 
 
@@ -21,6 +24,103 @@ def test_valid_topologies(tp, dp, ep, expert_tp):
         expert_intermediate_size=2048,
     )
     assert topology.expert_tp_degree == expert_tp
+
+
+@pytest.mark.parametrize("tp,ep", [(8, 1), (32, 2), (64, 4)])
+def test_production_tp_ep_topologies_accept_grouped_output_projection(tp, ep):
+    topology = DeepseekV4ParallelTopology(tp_degree=tp, ep_degree=ep)
+    topology.validate(
+        num_heads=64,
+        output_groups=8,
+        num_experts=256,
+        expert_intermediate_size=2048,
+    )
+    assert topology.expert_tp_degree == (16 if tp > 8 else 8)
+
+
+@pytest.mark.parametrize(
+    ("tp", "rank", "expected"),
+    [
+        (1, 0, (0, 8, 1, 0, 4096)),
+        (8, 7, (7, 1, 1, 0, 4096)),
+        (16, 3, (1, 1, 2, 2048, 2048)),
+        (32, 17, (4, 1, 4, 1024, 1024)),
+        (64, 63, (7, 1, 8, 3584, 512)),
+    ],
+)
+def test_output_projection_partition_covers_tp64(tp, rank, expected):
+    partition = resolve_output_projection_partition(
+        tp_degree=tp,
+        tp_rank=rank,
+        output_groups=8,
+        total_input_width=64 * 512,
+    )
+    assert (
+        partition.group_start,
+        partition.group_count,
+        partition.ranks_per_group,
+        partition.input_offset,
+        partition.input_width,
+    ) == expected
+
+
+@pytest.mark.parametrize("tp_degree", [1, 8, 16, 32, 64])
+def test_output_projection_tp_partials_sum_to_unsharded_result(tp_degree):
+    """The existing TP all-reduce reconstructs the official projection."""
+    torch.manual_seed(0)
+    tokens, output_groups, group_width, lora_rank, hidden = 3, 8, 16, 5, 7
+    total_width = output_groups * group_width
+    x = torch.randn(tokens, total_width, dtype=torch.float64)
+    o_a = torch.randn(
+        output_groups * lora_rank, group_width, dtype=torch.float64
+    )
+    o_b = torch.randn(hidden, output_groups * lora_rank, dtype=torch.float64)
+    grouped = x.view(tokens, output_groups, group_width)
+    projected = torch.cat(
+        [
+            torch.nn.functional.linear(
+                grouped[:, group],
+                o_a[group * lora_rank : (group + 1) * lora_rank],
+            )
+            for group in range(output_groups)
+        ],
+        dim=-1,
+    )
+    expected = torch.nn.functional.linear(projected, o_b)
+
+    partials = []
+    rank_width = total_width // tp_degree
+    for rank in range(tp_degree):
+        partition = resolve_output_projection_partition(
+            tp_degree=tp_degree,
+            tp_rank=rank,
+            output_groups=output_groups,
+            total_input_width=total_width,
+        )
+        local_x = x[:, rank * rank_width : (rank + 1) * rank_width].view(
+            tokens, partition.group_count, partition.input_width
+        )
+        local_projected = []
+        for local_group in range(partition.group_count):
+            group = partition.group_start + local_group
+            rows = o_a[group * lora_rank : (group + 1) * lora_rank]
+            columns = rows[
+                :,
+                partition.input_offset : (
+                    partition.input_offset + partition.input_width
+                ),
+            ]
+            local_projected.append(
+                torch.nn.functional.linear(local_x[:, local_group], columns)
+            )
+        local_projected = torch.cat(local_projected, dim=-1)
+        start = partition.group_start * lora_rank
+        end = start + partition.group_count * lora_rank
+        partials.append(
+            torch.nn.functional.linear(local_projected, o_b[:, start:end])
+        )
+
+    torch.testing.assert_close(sum(partials), expected)
 
 
 @pytest.mark.parametrize(
