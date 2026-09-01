@@ -283,12 +283,19 @@ TP axis was never a variable. Running all four corners, same four prompts, same
 | TP=2, scan kernel off | 95 / 128 |
 | TP=2, scan kernel on | 1 / 128 |
 
-Two independent defects, which compound:
+Two independent effects, which compound:
 
-1. **The scan kernel costs accuracy even at TP=1** (128 -> 77).
+1. **The scan kernel costs accuracy even at TP=1** (128 -> 77). This one is a
+   real defect and is still open.
 2. **TP>1 costs accuracy with no NKI kernel anywhere in the graph** (128 -> 95).
 
-The second one is the more serious, and it was invisible until TP=1 was run. An
+> **Superseded.** This section originally called the second one "the more
+> serious" defect. It is not a defect at all -- a per-layer TP=1 vs TP=2 capture
+> shows accumulated bf16 rounding from a changed reduction order, with no
+> discontinuity and no layer-type asymmetry, and TP=4 scores *better* than TP=2.
+> See "The TP gap is precision, not a bug" below. Row 1 stands.
+
+The second effect was invisible until TP=1 was run. An
 earlier note in this file recorded that TP=2 and TP=8 produce byte-identical
 output and called that TP-invariance confirmed. They *are* identical to each
 other -- but both are wrong, and TP=1 is right. Invariance among TP>=2 held;
@@ -351,6 +358,109 @@ closed before the kernel could be cleared.
 So the kernel's own numerics are sound, and whatever costs 51 tokens at TP=1
 lives in how it is scheduled or composed at model scale, not in what it computes.
 It stays **off by default** behind `VLLM_NEURON_ENABLE_QWEN3_5_SCAN_KERNEL=1`.
+
+## The TP gap is precision, not a bug
+
+The previous section called the TP>1 accuracy loss "the biggest open correctness
+defect". A per-layer capture says that is wrong, and it is worth being precise
+about what the evidence actually shows.
+
+**Method.** The real 0.8B run twice on the same prompt and seed with all NKI
+kernels off, TP=1 and TP=2, with `tensor_capture` hooking all 24 decoder layers
+(`neuron_config.tensor_capture`, `modules=["model.layers.0-23"]`). Diffed per
+layer, per forward pass, prefill and decode separately — never aggregated. This
+is the method that localized DeepSeek-V4's TP bug to `layers.0.moe` at 161%
+relative error with everything upstream bit-exact.
+
+**Result — prefill, TP=1 vs TP=2, expressed in bf16 ULP (1 ULP = 2^-8):**
+
+```
+L0  gdn  1.5    L6  gdn  1.0    L12 gdn  5.2    L18 gdn  3.2
+L1  gdn  2.3    L7  attn 1.9    L13 gdn  4.4    L19 attn 3.0
+L2  gdn  3.6    L8  gdn  2.0    L14 gdn  1.8    L20 gdn  3.6
+L3  attn 3.4    L9  gdn  2.0    L15 attn 6.7    L21 gdn  4.8
+L4  gdn  3.6    L10 gdn  1.9    L16 gdn  5.5    L22 gdn  4.2
+L5  gdn  4.6    L11 attn 4.8    L17 gdn  4.6    L23 attn 6.5
+```
+
+Four independent properties, each of which a structural sharding bug would
+violate:
+
+1. **No discontinuity.** The error starts at 1.5 ULP in layer 0 and drifts to
+   ~6.5 by layer 23, wandering up and down on the way (L5 is 4.6, L6 is 1.0).
+   A partition error does not drift; it jumps, and everything upstream of it is
+   exact.
+2. **The ranks agree with each other exactly.** Decode captures record a
+   per-rank spread of 0 — every `all_reduce` lands and every rank ends the layer
+   holding the same tensor.
+3. **No non-finite values anywhere**, in any layer, in any pass. This retires
+   the leading candidate from the previous plan: the unmasked-V path in
+   `_gather_cache`, where `0 * NaN = NaN` on never-written slots, is not firing
+   in this configuration.
+4. **Both layer types are equally affected**, which is the strongest single
+   piece of evidence:
+
+   | pass | attention layers | GDN layers |
+   |---|---|---|
+   | prefill | 4.38 ULP | 3.32 ULP |
+   | decode 0 | 1.77 | 1.02 |
+   | decode 1 | 2.15 | 1.44 |
+   | decode 2 | 0.88 | **1.05** |
+
+   A bug in the attention partition would put attention far above GDN; a bug in
+   the GDN partition, the reverse. They track each other within ~1.3x, and in
+   one decode pass GDN is the higher of the two. What they share is that both
+   end in a collective.
+
+**The magnitude accounts for the token flips.** The last layer differs by ~2.5e-2
+relative. Logits sit at a scale of about 19.8 (measured earlier in this
+document), so that is roughly 0.5 absolute — about 4 ULP at that magnitude. Any
+token whose top-1/top-2 logit gap is under ~0.5 can therefore flip. In natural
+text that is a large fraction of positions, which is exactly the observed
+33-of-128 rate.
+
+**The degree sweep corroborates it.** Running all four degrees, kernels off:
+
+| TP | tokens matching HF | 12-token prompt |
+|---|---|---|
+| 1 | 128/128 | 32/32 |
+| 2 | 95/128 | 12/32 |
+| 4 | **115/128** | **32/32** |
+| 8 | 95/128 | 12/32 |
+
+Non-monotonic — 128, 95, 115, 95 — and the 12-token prompt is *exact* at TP=4
+after failing at TP=2. A systematic sharding error does not improve when you
+shard harder. This is coin-flipping on near-ties. It also retires the earlier
+claim that "TP=2 and TP=8 are byte-identical, so the cause is structural and
+degree-independent": TP=4 is not identical to either, so that agreement was
+coincidence on a four-prompt set, not evidence of structure.
+
+**Why TP=1 is exact and TP>1 is not.** At `world_size == 1` every collective is
+bypassed (`GroupCoordinator.all_reduce` returns its input unchanged), so the
+model computes each projection as one contraction, in the same order the
+HuggingFace reference does — hence 128/128. At TP>1 the same sum is split across
+ranks and recombined, which changes the summation order. Two mechanisms
+contribute, and both are inherent rather than defects:
+
+- the cross-rank reduction itself, performed in bf16 on the model dtype (no site
+  in this repo upcasts for collectives — `qwen3` and `deepseek_v4` do the same);
+- `NF.o_proj`'s 3-D path, which re-derives `D = min(128, ND)` and `N = ND // D`
+  (`functional/attention/o_proj.py:186-192`), so the reduction is tiled as
+  N = 16 / 8 / 4 / 2 at TP = 1 / 2 / 4 / 8. The contraction is mathematically
+  identical; its accumulation order is not.
+
+**What this means for acceptance testing.** "Token-identical to TP=1" is not a
+reachable bar for bf16 tensor parallelism over a 32-token greedy generation, and
+holding to it would mean chasing noise indefinitely. It is also not the bar that
+matters: every TP=2/4/8 continuation observed here is coherent and factually
+correct ("Rome. The capital of Spain is Madrid..."). The right criterion is a
+quality metric — perplexity on a held-out set, or task accuracy — plus the
+structural invariants that *are* exact and worth asserting: ranks agreeing with
+each other, no non-finite values, and shard-reassembly identities.
+
+If the constant needs to come down, the lever is reducing collectives in fp32
+(upcast before, downcast after) at the cost of doubled collective bandwidth.
+That should be measured before it is adopted, not assumed.
 
 ## How long a context this model can actually serve
 
@@ -417,13 +527,17 @@ in their own plan.
 
 ## Still open
 
-- **TP>1 loses accuracy on its own** -- 95/128 at TP=2 against 128/128 at TP=1,
-  with no NKI kernel in the graph. This is the biggest open correctness defect
-  and it is not the GDN partition arithmetic, which is covered by 21 passing CPU
-  shard-invariance tests. The next cut is attention sharding (the Q-head padding
-  and KV replication of section 2.2) against the device-side collectives; the
-  cheapest probe is a single sharded attention layer at TP=1 vs TP=2 on the same
-  real weights, the way `run_scan_device.py` does it for the scan.
+- ~~**TP>1 loses accuracy on its own.**~~ **Closed, and it was not a defect.**
+  The per-layer capture in "The TP gap is precision, not a bug" shows a smooth
+  1.5 -> 6.5 bf16 ULP drift with no discontinuity, ranks agreeing exactly, no
+  non-finite values, and attention and GDN equally affected. TP=4 scores 115/128
+  where TP=2 scores 95 -- non-monotonic, so not systematic. What remains is a
+  decision, not a bug: whether to spend doubled collective bandwidth on fp32
+  reductions to lower the constant. Measure before adopting.
+- **Acceptance testing needs a quality metric, not exact-token-match.** Holding
+  TP>1 to "identical to TP=1" is unreachable in bf16 and would mean chasing
+  noise. Use perplexity or task accuracy, plus the invariants that *are* exact:
+  cross-rank agreement, finiteness, and shard reassembly.
 - **The scan kernel costs 51 tokens at TP=1** (128 -> 77) even though it is exact
   on device in isolation at every geometry, dtype, decay regime, padding, alias
   structure and TP degree tried (see the table above). What is left is scale and
