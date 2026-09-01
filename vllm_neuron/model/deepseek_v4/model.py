@@ -1759,6 +1759,13 @@ class DeepseekV4MoE(nn.Module):
         # outputs are local partials over the same final TP domain.  Addition
         # is linear, so reduce their sum once instead of reducing each term:
         #   all_reduce(routed + shared) == all_reduce(routed) + all_reduce(shared)
+        # ``VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION=0`` restores the two separate
+        # reductions for on-device A/B attribution of the saved collective.
+        if os.environ.get("VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION", "1") == "0":
+            if self.topology.tp_degree > 1:
+                routed = self.tp_group.all_reduce(routed)
+            return routed + self.shared_experts(hidden)
+
         output = routed + self.shared_experts.forward_local(hidden)
         if self.topology.tp_degree > 1:
             output = self.tp_group.all_reduce(output)

@@ -184,6 +184,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def model_environment() -> dict[str, str | None]:
+    """Capture every environment variable that changes what is measured.
+
+    The two arms of an A/B are otherwise indistinguishable in the retained
+    JSON: both record the same revision and the same CLI arguments while an
+    env flag silently selects a different graph.  Record the flags explicitly
+    so a report proves which configuration produced it, and record ``None``
+    for an unset flag rather than omitting the key, so the absence of a flag
+    is evidence too.
+    """
+    tracked = (
+        "VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION",
+        "VLLM_NEURON_DSV4_FIXED_CSA_SELECTION",
+        "VLLM_NEURON_DSV4_NKI_COMPRESSOR",
+        "VLLM_NEURON_DSV4_DYNAMIC_PAGE_LOOP",
+        "NEURON_VISIBLE_DEVICES",
+        "NEURON_RT_VISIBLE_CORES",
+        "VLLM_NEURON_CPU_MODE",
+        "VLLM_CACHE_ROOT",
+    )
+    return {name: os.environ.get(name) for name in tracked}
+
+
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     positive = {
         "tensor parallel size": args.tensor_parallel_size,
@@ -555,6 +578,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "git_revision": command_output("git", "rev-parse", "HEAD"),
             "git_status": command_output("git", "status", "--short"),
             "neuron_visible_devices": os.environ.get("NEURON_VISIBLE_DEVICES"),
+            "model_environment": model_environment(),
         },
         "initialization_seconds": initialization_seconds,
         "hbm": hbm,

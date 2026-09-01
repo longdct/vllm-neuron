@@ -6,6 +6,7 @@ import pytest
 
 from tools.deepseek_v4.benchmark_decode import (
     build_parser,
+    model_environment,
     request_metrics,
     sequence_buckets,
     selected_workloads,
@@ -79,3 +80,23 @@ def test_short_only_probe_fits_its_fixed_four_token_output():
 def test_single_request_probe_does_not_compile_batch8_graph():
     assert sequence_buckets(["short", "sustained"]) == [1]
     assert sequence_buckets(["batch8"]) == [1, 8]
+
+
+def test_provenance_records_the_flags_that_select_a_different_graph(monkeypatch):
+    """An A/B's two arms share a revision and CLI, so the flags must be kept.
+
+    Without this the retained JSON cannot distinguish a fused run from a
+    legacy one, nor a normal-CSA run from the fixed-CSA bypass.
+    """
+    monkeypatch.setenv("VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION", "0")
+    monkeypatch.setenv("VLLM_NEURON_DSV4_FIXED_CSA_SELECTION", "1")
+    monkeypatch.delenv("VLLM_NEURON_DSV4_NKI_COMPRESSOR", raising=False)
+
+    captured = model_environment()
+
+    assert captured["VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION"] == "0"
+    assert captured["VLLM_NEURON_DSV4_FIXED_CSA_SELECTION"] == "1"
+    # An unset flag is recorded as None rather than omitted: its absence is
+    # evidence about the run too.
+    assert "VLLM_NEURON_DSV4_NKI_COMPRESSOR" in captured
+    assert captured["VLLM_NEURON_DSV4_NKI_COMPRESSOR"] is None
