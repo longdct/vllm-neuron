@@ -19,11 +19,14 @@ torch = pytest.importorskip("torch")
 
 from vllm_neuron.model.deepseek_v4.quant_formats import (
     FP4_BLOCK,
+    FP8_BLOCK,
     FP4_TABLE,
     MAX_EXACT_CHANNEL_SPREAD,
     dequantize_fp4_blockwise,
     dequantize_fp8_per_channel,
+    dequantize_fp8_blockwise,
     requantize_fp4_to_fp8,
+    requantize_fp8_blockwise_to_per_channel,
     unpack_fp4,
 )
 
@@ -167,3 +170,120 @@ class TestAgainstTheOfficialCheckpoint:
         assert worst <= MAX_EXACT_CHANNEL_SPREAD, worst
         # Recorded so a regression is visible as a number, not just a pass.
         assert worst <= 3, f"spread grew to {worst}; plan measured 3"
+
+
+#: Attention and shared-expert tensors in the layer-0 shard. Every one is
+#: e4m3 with a [128,128] E8M0 scale; the routed experts above are MXFP4.
+BLOCKWISE_FP8_TENSORS = [
+    "layers.0.attn.wq_a",
+    "layers.0.attn.wq_b",
+    "layers.0.attn.wkv",
+    "layers.0.attn.wo_a",
+    "layers.0.attn.wo_b",
+    "layers.0.ffn.shared_experts.w1",
+    "layers.0.ffn.shared_experts.w2",
+    "layers.0.ffn.shared_experts.w3",
+]
+
+
+class TestFp8BlockwiseCollapse:
+    """Collapsing [128,128] block scales to per-channel is close, not exact.
+
+    The routed-expert widening is bitwise exact and is asserted as such. This
+    one cannot be: the elements already use e4m3's full range, so a rescale
+    can push the smallest of them subnormal. What matters is whether the
+    residue is small next to the precision the activations already carry, so
+    these tests measure it rather than asserting equality -- and they pin the
+    measured value, so a regression shows up as a number.
+    """
+
+    def test_a_synthetic_collapse_stays_within_the_representable_range(self):
+        rows, cols = 256, 256
+        generator = torch.Generator().manual_seed(3)
+        reference = torch.randn((rows, cols), generator=generator)
+        weight = reference.to(torch.float8_e4m3fn)
+        scale = torch.ones((rows // FP8_BLOCK, cols // FP8_BLOCK))
+
+        elements, channel_scale = requantize_fp8_blockwise_to_per_channel(
+            weight, scale
+        )
+        assert elements.dtype is torch.float8_e4m3fn
+        assert channel_scale.shape == (rows,)
+        magnitude = elements.float().abs()
+        assert torch.isfinite(magnitude).all()
+        assert float(magnitude.max()) <= 240.0
+
+    def test_an_all_zero_output_channel_survives(self):
+        """A zero row has no peak to normalize against; it must stay zero."""
+        rows, cols = 128, 128
+        reference = torch.randn((rows, cols))
+        reference[7] = 0.0
+        weight = reference.to(torch.float8_e4m3fn)
+        scale = torch.ones((1, 1))
+
+        elements, channel_scale = requantize_fp8_blockwise_to_per_channel(
+            weight, scale
+        )
+        restored = dequantize_fp8_per_channel(elements, channel_scale)
+        assert torch.equal(restored[7], torch.zeros(cols))
+        assert torch.isfinite(channel_scale).all()
+
+    def test_a_scale_that_does_not_match_the_weight_is_rejected(self):
+        weight = torch.randn((256, 256)).to(torch.float8_e4m3fn)
+        with pytest.raises(ValueError, match="does not match"):
+            requantize_fp8_blockwise_to_per_channel(weight, torch.ones((1, 1)))
+
+
+@pytest.mark.skipif(
+    not OFFICIAL_SHARDS.exists(), reason="official DeepSeek-V4 shards not on disk"
+)
+class TestFp8CollapseAgainstTheOfficialCheckpoint:
+    """The number that decides whether attention FP8 is worth doing."""
+
+    @pytest.mark.parametrize("name", BLOCKWISE_FP8_TENSORS)
+    def test_the_collapse_residue_is_far_below_bfloat16_resolution(self, name):
+        shard = OFFICIAL_SHARDS / LAYER_SHARDS[0]
+        if not shard.exists():
+            pytest.skip(f"{shard.name} not downloaded")
+        tensors = _read_tensors(shard, [f"{name}.weight", f"{name}.scale"])
+        weight = tensors[f"{name}.weight"]
+        scale = tensors[f"{name}.scale"]
+
+        reference = dequantize_fp8_blockwise(weight, scale).float()
+        elements, channel_scale = requantize_fp8_blockwise_to_per_channel(
+            weight, scale
+        )
+        restored = dequantize_fp8_per_channel(elements, channel_scale)
+
+        peak = reference.abs().amax().clamp(min=1e-30)
+        relative_max = float((restored - reference).abs().max() / peak)
+        # bfloat16 carries 8 mantissa bits, i.e. ~4e-3 relative resolution.
+        # The collapse must be far under that to be irrelevant to the model.
+        assert relative_max < 1e-4, f"{name}: {relative_max:.2e}"
+
+    def test_a_projection_moves_by_far_less_than_bfloat16_rounding(self):
+        """Weight error is only interesting if it survives into the output."""
+        shard = OFFICIAL_SHARDS / LAYER_SHARDS[0]
+        if not shard.exists():
+            pytest.skip(f"{shard.name} not downloaded")
+        name = "layers.0.attn.wo_a"  # the widest measured spread (2 binades)
+        tensors = _read_tensors(shard, [f"{name}.weight", f"{name}.scale"])
+        reference = dequantize_fp8_blockwise(
+            tensors[f"{name}.weight"], tensors[f"{name}.scale"]
+        ).float()
+        elements, channel_scale = requantize_fp8_blockwise_to_per_channel(
+            tensors[f"{name}.weight"], tensors[f"{name}.scale"]
+        )
+        restored = dequantize_fp8_per_channel(elements, channel_scale)
+
+        generator = torch.Generator().manual_seed(0)
+        activations = torch.randn(
+            (32, reference.shape[1]), generator=generator
+        )
+        exact = activations @ reference.T
+        collapsed = activations @ restored.T
+        relative_rms = float(
+            (collapsed - exact).pow(2).mean().sqrt()
+            / exact.pow(2).mean().sqrt().clamp(min=1e-30)
+        )
+        assert relative_rms < 1e-5, relative_rms

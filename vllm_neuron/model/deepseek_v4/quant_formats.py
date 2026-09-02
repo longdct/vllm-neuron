@@ -213,6 +213,63 @@ def requantize_fp4_to_fp8(
     return elements, channel_scale
 
 
+def requantize_fp8_blockwise_to_per_channel(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 ``[out, in]`` + per-[128,128] E8M0 -> FP8 ``[out, in]`` + per-channel.
+
+    The attention and shared-expert weights already ship as ``e4m3``; only
+    their scale granularity is wrong for the kernels, which want one scale per
+    output channel. Collapsing a row's column-block scales onto that row's
+    largest exponent is a pure power-of-two rescale, so -- exactly as in
+    :func:`requantize_fp4_to_fp8` -- it moves an exponent without touching a
+    mantissa, and the only way to lose anything is to push a value below
+    e4m3's normal floor.
+
+    Unlike the FP4 widening this is **not** guaranteed exact, because these
+    elements already use e4m3's full range rather than FP4's narrow one. It is
+    close, though, and measurably so: on the real layer-0 tensors the
+    per-channel collapse has to absorb at most 2 binades, and the resulting
+    error is ``<= 7.7e-06`` relative to the tensor's peak, ``~4e-08`` RMS,
+    which moves a projection's output by ``~2e-07`` RMS -- four orders of
+    magnitude under bfloat16's own ``~4e-03`` resolution. See
+    ``test_quant_formats.py::TestFp8BlockwiseCollapse``.
+
+    Returns ``(fp8_weight, channel_scale)``, float32 scale of shape ``[out]``,
+    with ``fp8_weight[r, c] * channel_scale[r]`` approximating the blockwise
+    value.
+    """
+    if scale.ndim != 2:
+        raise ValueError(f"expected a 2-D fp8 scale, got {tuple(scale.shape)}")
+    rows, cols = weight.shape
+    expected = (
+        (rows + FP8_BLOCK - 1) // FP8_BLOCK,
+        (cols + FP8_BLOCK - 1) // FP8_BLOCK,
+    )
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"fp8 scale {tuple(scale.shape)} does not match weight "
+            f"[{rows}, {cols}] (expected {expected})"
+        )
+
+    reference = dequantize_fp8_blockwise(weight, scale).float()
+
+    # Per-channel peak sets the scale; ceil keeps every element at or below
+    # FP8_E4M3_MAX_TRN2 after the rescale. Rounding down instead would let the
+    # largest element of a channel exceed 240, saturate to inf, and take the
+    # whole row with it -- the same trap as in the FP4 path.
+    peak = reference.abs().amax(dim=1)
+    # An all-zero output channel has no peak to normalize against; leave its
+    # scale at 1 so the row stays exactly zero.
+    safe_peak = torch.where(peak > 0, peak, torch.ones_like(peak))
+    channel_scale = torch.exp2(
+        torch.ceil(torch.log2(safe_peak / FP8_E4M3_MAX_TRN2))
+    )
+    elements = (reference / channel_scale[:, None]).to(torch.float8_e4m3fn)
+    return elements, channel_scale
+
+
 def dequantize_fp8_per_channel(
     weight: torch.Tensor, channel_scale: torch.Tensor
 ) -> torch.Tensor:
