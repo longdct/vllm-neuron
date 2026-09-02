@@ -370,6 +370,7 @@ def moe_cte(
             n_dynamic_blocks=n_dynamic_blocks,
             top_k=top_k,
             ep_degree=ep_degree,
+            quantization_type=quantization_type,
             checkpoint_activation=checkpoint_activation,
             expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
             num_static_block=num_static_block,
@@ -648,6 +649,7 @@ def _build_moe_cte_spec(
     n_dynamic_blocks: int = -1,
     top_k: int = 1,
     ep_degree: int = 1,
+    quantization_type: QuantizationType = QuantizationType.NONE,
     # shard_on_i and shard_on_i_dropping parameters
     checkpoint_activation: bool = False,
     expert_affinity_multiply_on_I: bool = False,
@@ -661,6 +663,12 @@ def _build_moe_cte_spec(
         n_dynamic_blocks=n_dynamic_blocks,
         top_k=top_k,
         ep_degree=ep_degree,
+        # ``ShardOnBlockConfig`` defaults this to MX, which expects per-block
+        # uint8 scales. Without forwarding the caller's choice, the non-MX FP8
+        # scales documented for shard_on_block (``[E, 1, 2*I_TP]`` /
+        # ``[E, 1, H]``) are unreachable: the kernel is handed MX-shaped
+        # expectations and fails in neuronx-cc rather than at the API.
+        quantization_type=quantization_type,
     )
     shard_on_I = ShardOnIConfig(
         checkpoint_activation=checkpoint_activation,
@@ -692,6 +700,7 @@ def _torch_compatible_moe_cte_kernel(
     n_dynamic_blocks: int = -1,
     top_k: int = 1,
     ep_degree: int = 1,
+    quantization_type: QuantizationType = QuantizationType.NONE,
     # shard_on_i and shard_on_i_dropping parameters
     checkpoint_activation: bool = False,
     expert_affinity_multiply_on_I: bool = False,
@@ -725,6 +734,7 @@ def _torch_compatible_moe_cte_kernel(
         n_dynamic_blocks=n_dynamic_blocks,
         top_k=top_k,
         ep_degree=ep_degree,
+        quantization_type=quantization_type,
         checkpoint_activation=checkpoint_activation,
         expert_affinity_multiply_on_I=expert_affinity_multiply_on_I,
         num_static_block=num_static_block,
@@ -749,6 +759,14 @@ def _torch_compatible_moe_cte_kernel(
         gate_and_up_proj_bias=gate_and_up_proj_bias,
         down_proj_bias=down_proj_bias,
         quantization_config=quantization_config,
+        # Also pass the scales directly. A tensor wrapped in a dataclass is not
+        # traced as a kernel input -- the NKI tracer limitation nkilib's own
+        # docstring cites when it says the direct kwargs "take precedence over
+        # quantization_config". Passing only the dataclass compiles and runs but
+        # silently drops the scales: measured on device, doubling them or
+        # replacing them with ones left the output bit-identical.
+        gate_up_proj_scale=gate_up_proj_scale,
+        down_proj_scale=down_proj_scale,
         gate_up_activations_T=gate_up_activations_T,
         down_activations=down_activations,
         activation_function=activation_function,
