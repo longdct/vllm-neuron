@@ -101,6 +101,24 @@ def build_case(
     ) * 0.02
     down = torch.randn(experts, intermediate, hidden, generator=generator) * 0.02
 
+    # Give each output channel a deliberately different magnitude.
+    #
+    # Without this the probe is degenerate: randn*0.02 gives every channel
+    # nearly the same peak, so ceil(log2(peak/240)) collapses to ONE exponent
+    # and every per-channel scale is identical. The kernel then returns the
+    # right answer whatever it does with the channel axis -- including
+    # transposing it or broadcasting a single value -- so the test proves only
+    # that some scale was applied, not that the right scale reached the right
+    # channel. Spreading the channels over 5 binades makes the mapping
+    # observable, and makes the two flat orderings distinguishable.
+    channel_spread = torch.exp2(
+        (torch.arange(intermediate) % 5).float()
+    )  # [I]
+    gate_up = gate_up * channel_spread.view(1, 1, 1, intermediate)
+    down = down * torch.exp2(
+        (torch.arange(hidden) % 5).float()
+    ).view(1, 1, hidden)
+
     # gate/up output channels are (shard, intermediate); down's is hidden.
     gu_elem, gu_scale, gu_exact = quantize_per_channel(gate_up, (0, 2, 3))
     dn_elem, dn_scale, dn_exact = quantize_per_channel(down, (0, 2))
