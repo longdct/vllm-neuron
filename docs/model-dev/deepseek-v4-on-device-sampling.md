@@ -25,6 +25,31 @@ It reproduces in BF16, so it has nothing to do with FP8.
 **The all-gather inside the distributed sampler only fills the slots belonging
 to ranks on the same physical Neuron device. The rest are left uninitialized.**
 
+It takes two conditions together, and an earlier version of this document got
+that wrong by naming only the first:
+
+1. a **narrow** payload -- the `[batch, 1]` maximum the old algorithm
+   exchanged; and
+2. a TP group whose devices are **not adjacent in the Neuron interconnect**.
+
+Cores 12-19 is devices 3 and 4, and those two are not connected: `neuron-ls`
+lists device 3's neighbours as 15, 2, 7, 0, and device 4's as 0, 7, 8, 5.
+Neither appears in the other's list. Measured with the *unfixed* code:
+
+| group | devices | adjacent? | result |
+|---|---|---|---|
+| TP8, cores 12-19 | 3, 4 | no | **wrong** |
+| TP8, cores 16-23 | 4, 5 | yes | correct |
+| TP16, cores 16-31 | 4, 5, 6, 7 | yes (ring) | correct |
+
+So this is not "TP8 is broken" and not "spanning devices is broken". A narrow
+collective across a non-adjacent pair silently returns partial data; the same
+collective across a connected group is fine, at TP8 and at TP16.
+
+That also means **cores 12-19 is a poor TP8 placement on this instance**, which
+is worth knowing independently of this bug: every benchmark in this branch's
+history was run there.
+
 Cores 12-19 are device 3 (cores 12-15) and device 4 (cores 16-19). Stamping
 every NEFF output buffer before execution and reading back the sampled-token
 output on all eight ranks gives:
@@ -106,6 +131,7 @@ Verified at depth 3, TP8, cores 12-19, dummy weights, greedy:
 | host sampling (reference) | `[4868, 508, 4868, 508]` |
 | on-device, async off | `[4868, 508, 4868, 508]` |
 | on-device, async on | `[4868, 508, 4868, 508]` |
+| on-device, TP16 on cores 16-31 | `[4868, 508, 4868, 508]` |
 
 Exact equality is the right gate here, not "finite output": greedy argmax over
 identical logits has no legitimate freedom to differ.
@@ -113,8 +139,8 @@ identical logits has no legitimate freedom to differ.
 ## Why padding was rejected
 
 The obvious cheaper fix is to keep the exchange-maxima algorithm and pad the
-tiny payload up to a width that gathers correctly. Measured, the width has to
-be far larger than any useful `k`:
+tiny payload up to a width that gathers correctly. Measured on the bad
+topology (cores 12-19), the width has to be far larger than any useful `k`:
 
 | gathered width | result at TP8 |
 |---|---|
@@ -125,7 +151,14 @@ be far larger than any useful `k`:
 
 Anything wide enough to work costs about as much as gathering the shard
 outright, so padding buys nothing and leaves the code depending on an
-undocumented threshold that could move.
+undocumented threshold that could move -- and, as the adjacency table above
+shows, on a topology property the code cannot see.
+
+The alternative to fixing the code is to require adjacent-device TP groups.
+That is a real option, since the old algorithm is correct on one and moves far
+less data. It was not taken because the failure mode when the requirement is
+violated is a silently wrong token rather than an error, and because the
+measured cost of the safe algorithm is nil.
 
 ## The trap when fixing it
 
@@ -166,7 +199,9 @@ Depth-3, dummy weights, greedy, seed 0:
 - TP4 on one device (`NEURON_VISIBLE_DEVICES=12-15`): all ranks agree, and the
   device tokens `[4868, 508, 4868, 508]` match the CPU-sampled reference
   exactly. On-device sampling is correct here.
-- TP8 across two devices (`12-19`): fails as above.
+- TP8 across the non-adjacent pair (`12-19`): fails as above.
+- TP8 across an adjacent pair (`16-23`) and TP16 across a connected ring
+  (`16-31`): correct even without the fix.
 
 Timing numbers from earlier on-device runs are not invalidated — the decode
 graph ran to completion with the right shapes each step. The *tokens* from
