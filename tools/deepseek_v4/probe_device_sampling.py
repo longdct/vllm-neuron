@@ -32,21 +32,26 @@ Distributed mode mirrors ``NeuronWorker``'s startup exactly (per-rank
 other way is not the group the model uses, and a bare ``ProcessGroup`` from a
 plain ``init_process_group`` is not even traceable by dynamo here.
 
-**Distributed mode does not currently run.** It gets as far as compiling the
-graph and detecting the collective, then the Neuron runtime aborts in
-``encd_mesh_add_wr_barrier`` ("Assertion `event->evt_type == EVT_SYNC`
-failed"). That happens for a graph containing a single all-reduce just as it
-does for one containing the sampler's all-gather, so it is a property of
-executing a small standalone collective NEFF outside vLLM's executor, not of
-anything this probe is testing. Mirroring the worker's full runtime
-environment, its device indexing, its platform device count, and a shared
-compile cache did not change it.
+Distributed mode requires the TP group's Neuron devices to be **connected in
+the interconnect**, which is a real constraint and not a quirk of this script.
+On a disconnected group the runtime aborts in ``encd_mesh_add_wr_barrier``
+("Assertion `event->evt_type == EVT_SYNC` failed") before producing anything.
+That is the same defect the sampler hit, in a louder form: a small collective
+NEFF on such a group aborts, while a full model NEFF on it silently returns
+partial data. Measured on trn2:
 
-Until that is resolved, the multi-rank evidence comes from the full model --
-``generate_tiny.py --sampling-backend device`` compared against the same run
-with ``cpu`` -- which is what
-``docs/model-dev/deepseek-v4-on-device-sampling.md`` records. The TP1 mode
-below does work and is what cleared the sampler itself.
+===================  ===========  ============  ==========================
+cores                devices      connected?    probe
+===================  ===========  ============  ==========================
+``12-15``            3            single        passes
+``12-19``            3, 4         **no**        runtime abort
+``16-23``            4, 5         yes           passes
+``20-27``            5, 6         yes           passes
+``16-31``            4, 5, 6, 7   yes (ring)    passes
+===================  ===========  ============  ==========================
+
+``neuron-ls -j`` reports each device's neighbours; devices 3 and 4 are not in
+each other's lists. Pick cores whose devices form one connected component.
 """
 
 from __future__ import annotations

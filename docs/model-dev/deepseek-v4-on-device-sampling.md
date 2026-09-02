@@ -36,19 +36,38 @@ Cores 12-19 is devices 3 and 4, and those two are not connected: `neuron-ls`
 lists device 3's neighbours as 15, 2, 7, 0, and device 4's as 0, 7, 8, 5.
 Neither appears in the other's list. Measured with the *unfixed* code:
 
-| group | devices | adjacent? | result |
-|---|---|---|---|
-| TP8, cores 12-19 | 3, 4 | no | **wrong** |
-| TP8, cores 16-23 | 4, 5 | yes | correct |
-| TP16, cores 16-31 | 4, 5, 6, 7 | yes (ring) | correct |
+| group | devices | connected? | model, unfixed | sampler probe |
+|---|---|---|---|---|
+| TP4, cores 12-15 | 3 | single device | correct | passes |
+| TP8, cores 12-19 | 3, 4 | **no** | **silently wrong** | **runtime abort** |
+| TP8, cores 16-23 | 4, 5 | yes | correct | passes |
+| TP8, cores 20-27 | 5, 6 | yes | -- | passes |
+| TP16, cores 16-31 | 4, 5, 6, 7 | yes (ring) | correct | passes |
+
+The last column is `tools/deepseek_v4/launch_device_sampling_probe.sh`, which
+compiles the sampler alone across the group. It fails on the disconnected group
+too, and loudly: the runtime aborts in `encd_mesh_add_wr_barrier` ("Assertion
+`event->evt_type == EVT_SYNC` failed"). **The probe failure and the sampling
+defect are the same defect.** A small collective NEFF on a disconnected group
+aborts; a full model NEFF on the same group keeps running and returns partial
+data for its narrow collectives. That is the worse of the two outcomes, and it
+is the one production hits.
 
 So this is not "TP8 is broken" and not "spanning devices is broken". A narrow
 collective across a non-adjacent pair silently returns partial data; the same
 collective across a connected group is fine, at TP8 and at TP16.
 
-That also means **cores 12-19 is a poor TP8 placement on this instance**, which
-is worth knowing independently of this bug: every benchmark in this branch's
-history was run there.
+That also means **cores 12-19 is a broken TP8 placement on this instance**, not
+merely a suboptimal one, and it is worth knowing independently of this bug:
+every benchmark in this branch's history was run there. Derive the grouping
+from `neuron-ls -j`, which lists each device's neighbours, and choose cores
+whose devices form a single connected component -- `16-23`, `20-27` and
+`16-31` all do; `12-19` does not, because devices 3 and 4 have no link.
+
+Nothing in the stack checks this today. A TP group whose devices are
+disconnected is accepted at startup and fails later, either as an abort or as
+silently wrong numbers. A validation at group construction would turn the
+worst failure mode into an error message.
 
 Cores 12-19 are device 3 (cores 12-15) and device 4 (cores 16-19). Stamping
 every NEFF output buffer before execution and reading back the sampled-token
