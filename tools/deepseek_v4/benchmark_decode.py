@@ -145,6 +145,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ep-degree", type=int, default=4)
     parser.add_argument(
+        "--quantization",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help=(
+            "Routed-expert weight storage. 'fp8' also requires "
+            "UNSAFE_FP8FNCAST=1 and the neuronx-cc e4m3fn cast flag, and "
+            "routes the MoE to shard_on_i with a 256-token block."
+        ),
+    )
+    parser.add_argument(
         "--sampling-backend", choices=("cpu", "device"), default="device"
     )
     parser.add_argument(
@@ -464,6 +474,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         neuron_config["decode_context_length_buckets"] = explicit_decode
     if args.enable_expert_parallel:
         neuron_config["ep_degree"] = args.ep_degree
+    neuron_config["quantization"] = args.quantization
     if args.debug_logits_dir:
         neuron_config["debug_logits_dir"] = args.debug_logits_dir
 
@@ -564,6 +575,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "num_gpu_blocks_override": args.num_gpu_blocks_override,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "load_format": args.load_format,
+            "quantization": args.quantization,
             "sampling_backend": args.sampling_backend,
             "sampling_cases": cases,
             "on_device_sampling": neuron_config["on_device_sampling_config"],

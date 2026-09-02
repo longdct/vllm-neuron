@@ -26,6 +26,14 @@ from vllm import LLM, SamplingParams
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint", type=Path)
+    parser.add_argument(
+        "--quantization",
+        choices=("bf16", "fp8"),
+        help=(
+            "Weight storage for the routed experts. 'fp8' additionally needs "
+            "UNSAFE_FP8FNCAST=1 and the neuronx-cc e4m3fn cast flag."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -264,6 +272,8 @@ def main() -> None:
         neuron_config["num_seqs_buckets"] = num_seqs_buckets
     if args.ep_degree is not None:
         neuron_config["ep_degree"] = args.ep_degree
+    if args.quantization is not None:
+        neuron_config["quantization"] = args.quantization
     # The runner always compiles max_model_len as an implicit final decode
     # bucket. Accepting it in this benchmark-facing list keeps the requested
     # geometry explicit without passing a redundant value to core validation.
