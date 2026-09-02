@@ -195,6 +195,27 @@ class NormalizedDeepseekV4Config:
         return tuple(l.index for l in self.layers if l.cache_group_key == key)
 
 
+def _resolve_expert_weight_dtype(neuron_config: Any) -> Any:
+    """Map ``NeuronConfig.quantization`` to the routed experts' storage dtype.
+
+    Only the experts are covered here: they are ~95% of the parameters and
+    their MXFP4 -> FP8 widening is bit-exact, whereas the attention weights'
+    blockwise FP8 collapse is not. Keeping the two on separate switches is what
+    lets the exact half ship first.
+    """
+    import torch
+
+    quantization = getattr(neuron_config, "quantization", None)
+    if quantization in (None, "bf16"):
+        return torch.bfloat16
+    if quantization == "fp8":
+        return torch.float8_e4m3fn
+    raise DeepseekV4ConfigError(
+        f"unsupported quantization {quantization!r} for DeepSeek-V4; "
+        "expected None, 'bf16', or 'fp8'"
+    )
+
+
 @dataclass(frozen=True)
 class DeepseekV4ModelConfig:
     """Checkpoint-derived runtime configuration for the serving model."""
@@ -223,6 +244,12 @@ class DeepseekV4ModelConfig:
     torch_dtype: Any
     tie_word_embeddings: bool
     neuron_config: Any = None
+    #: Storage dtype of the routed expert weights. ``torch_dtype`` above stays
+    #: the activation/compute dtype in every case -- the official checkpoint
+    #: declares ``torch_dtype: bfloat16`` alongside its ``quantization_config``
+    #: precisely because those are different things. Set to
+    #: ``torch.float8_e4m3fn`` by ``quantization="fp8"``.
+    expert_weight_dtype: Any = None
 
     @classmethod
     def from_configs(cls, hf_config: Any, neuron_config: Any = None):
@@ -264,6 +291,7 @@ class DeepseekV4ModelConfig:
             index_head_dim=normalized.index_head_dim,
             layers=normalized.layers,
             torch_dtype=dtype,
+            expert_weight_dtype=_resolve_expert_weight_dtype(neuron_config),
             tie_word_embeddings=bool(_get(hf_config, "tie_word_embeddings", False)),
             neuron_config=neuron_config,
         )

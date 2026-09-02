@@ -58,7 +58,7 @@ def test_factory_instance_forwards_through_to_the_real_model():
     assert model._model.config.hidden_size == 32
 
 
-@pytest.mark.parametrize("quantization", ["fp8", "mxfp4", "compressed-tensors"])
+@pytest.mark.parametrize("quantization", ["mxfp4", "compressed-tensors", "int8"])
 def test_validate_config_rejects_quantization_not_yet_implemented(quantization):
     neuron_config = NeuronConfig(quantization=quantization)
     with pytest.raises(ValueError, match="quantization"):
@@ -70,3 +70,29 @@ def test_validate_config_accepts_bf16(quantization):
     neuron_config = NeuronConfig(quantization=quantization)
     model = DeepseekV4ForCausalLM.from_configs(hf_config(), neuron_config)
     assert model is not None
+
+
+def test_fp8_selects_e4m3_expert_weights_and_leaves_activations_bf16():
+    """FP8 is a weight-storage choice; the compute dtype does not move.
+
+    The official checkpoint declares ``torch_dtype: bfloat16`` alongside its
+    ``quantization_config`` for exactly this reason, so a config that conflated
+    the two would reject the real checkpoint.
+    """
+    import torch
+
+    neuron_config = NeuronConfig(quantization="fp8")
+    model = DeepseekV4ForCausalLM.from_configs(hf_config(), neuron_config)
+    config = model.config
+    assert config.expert_weight_dtype is torch.float8_e4m3fn
+    assert config.torch_dtype is torch.bfloat16
+
+
+def test_bf16_keeps_bf16_expert_weights():
+    import torch
+
+    for quantization in (None, "bf16"):
+        model = DeepseekV4ForCausalLM.from_configs(
+            hf_config(), NeuronConfig(quantization=quantization)
+        )
+        assert model.config.expert_weight_dtype is torch.bfloat16

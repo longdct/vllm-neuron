@@ -1654,13 +1654,56 @@ class DeepseekV4MoE(nn.Module):
             self.tp_group = None
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.routed_gate_up = nn.Parameter(
-            torch.randn(self.num_local_experts, config.hidden_size, 2, intermediate)
-            * 0.02
-        )
-        self.routed_down = nn.Parameter(
-            torch.randn(self.num_local_experts, intermediate, config.hidden_size) * 0.02
-        )
+        # TRN2 cannot execute the checkpoint's MXFP4 experts, so the FP8 path
+        # widens them to e4m3 with one scale per output channel -- exactly the
+        # granularity `shard_on_i` consumes. See quant_formats.requantize_fp4_to_fp8.
+        self.expert_weight_dtype = config.expert_weight_dtype
+        self.expert_fp8 = self.expert_weight_dtype is torch.float8_e4m3fn
+        if self.expert_fp8:
+            self.routed_gate_up = nn.Parameter(
+                torch.zeros(
+                    self.num_local_experts,
+                    config.hidden_size,
+                    2,
+                    intermediate,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                requires_grad=False,
+            )
+            self.routed_down = nn.Parameter(
+                torch.zeros(
+                    self.num_local_experts,
+                    intermediate,
+                    config.hidden_size,
+                    dtype=torch.float8_e4m3fn,
+                ),
+                requires_grad=False,
+            )
+            # Flat and shard-major: index = shard * I + i. The kernel docstring
+            # says only "[E, 1, 2*I_TP] ... reshaped to [E, 2, I_TP]"; the
+            # ordering was settled on device (probe_fp8_moe.py) because the
+            # interleaved guess also compiles and runs, quietly wrong.
+            self.routed_gate_up_scale = nn.Parameter(
+                torch.ones(self.num_local_experts, 1, 2 * intermediate),
+                requires_grad=False,
+            )
+            self.routed_down_scale = nn.Parameter(
+                torch.ones(self.num_local_experts, 1, config.hidden_size),
+                requires_grad=False,
+            )
+        else:
+            self.routed_gate_up = nn.Parameter(
+                torch.randn(
+                    self.num_local_experts, config.hidden_size, 2, intermediate
+                )
+                * 0.02
+            )
+            self.routed_down = nn.Parameter(
+                torch.randn(
+                    self.num_local_experts, intermediate, config.hidden_size
+                )
+                * 0.02
+            )
         self.shared_experts = DeepseekV4Expert(
             config.hidden_size,
             self.full_intermediate_size * config.n_shared_experts,
@@ -1805,7 +1848,16 @@ class DeepseekV4MoE(nn.Module):
                 "DeepSeek-V4 NKI MoE requires expert intermediate size >=128 "
                 f"and divisible by 16, got {intermediate}"
             )
-        if (
+        if self.expert_fp8:
+            if (
+                self.routed_gate_up.dtype != torch.float8_e4m3fn
+                or self.routed_down.dtype != torch.float8_e4m3fn
+            ):
+                raise RuntimeError(
+                    "DeepSeek-V4 FP8 MoE requires float8_e4m3fn routed weights, "
+                    f"got {self.routed_gate_up.dtype}/{self.routed_down.dtype}"
+                )
+        elif (
             self.routed_gate_up.dtype != torch.bfloat16
             or self.routed_down.dtype != torch.bfloat16
         ):
@@ -1819,6 +1871,7 @@ class DeepseekV4MoE(nn.Module):
             ExpertAffinityScaleMode,
             MoECTEImplementation,
         )
+        from nkilib.core.utils.common_types import QuantizationType
 
         import vllm_neuron.functional as NF
         from vllm.distributed import get_tp_group
@@ -1834,6 +1887,14 @@ class DeepseekV4MoE(nn.Module):
         # remaining within the kernel's documented 128..512 geometry. Decode
         # and ordinary prefills retain B128 to avoid unnecessary padding.
         moe_block_size = 512 if original_tokens > 4096 else 128
+        if self.expert_fp8:
+            # `shard_on_block` accepts the FP8 scale arguments and silently
+            # ignores them -- it compiles, runs, and returns output ~1e10x too
+            # large because it uses the raw e4m3 elements. Only `shard_on_i`
+            # dequantizes, and it asserts block_size % 256 == 0, so the 128
+            # decode block has to grow. Measured on device in
+            # tools/deepseek_v4/probe_fp8_moe.py.
+            moe_block_size = max(moe_block_size, 256)
         # Carry inert rows through routing and trim the kernel result. Zero
         # affinities keep padding out of every expert.
         padded_tokens = (
@@ -1872,7 +1933,18 @@ class DeepseekV4MoE(nn.Module):
             block_to_expert=block_experts,
             conditions=conditions,
             block_size=moe_block_size,
-            implementation=MoECTEImplementation.shard_on_block,
+            implementation=(
+                MoECTEImplementation.shard_on_i
+                if self.expert_fp8
+                else MoECTEImplementation.shard_on_block
+            ),
+            gate_up_proj_scale=(
+                self.routed_gate_up_scale if self.expert_fp8 else None
+            ),
+            down_proj_scale=self.routed_down_scale if self.expert_fp8 else None,
+            quantization_type=(
+                QuantizationType.ROW if self.expert_fp8 else QuantizationType.NONE
+            ),
             activation_function=ActFnType.SiLU,
             compute_dtype=nl.bfloat16,
             expert_affinities_scaling_mode=ExpertAffinityScaleMode.POST_SCALE,
@@ -2060,7 +2132,15 @@ def _initialize_dummy_parameters(module: nn.Module) -> None:
         initialize_single_dummy_weight,
     )
 
-    for parameter in module.parameters():
+    for name, parameter in module.named_parameters():
+        # A dequantization scale is a positive multiplier, not a weight. The
+        # generic uniform_(-1e-3, 1e-3) below would make it tiny and sometimes
+        # negative, which silently sign-flips whole expert channels and makes a
+        # dummy FP8 run unrepresentative of the real one.
+        if name.endswith("_scale") and parameter.dtype.is_floating_point:
+            with torch.no_grad():
+                parameter.fill_(1.0)
+            continue
         if parameter.device.type != "neuron":
             initialize_single_dummy_weight(parameter)
             continue
@@ -2071,11 +2151,23 @@ def _initialize_dummy_parameters(module: nn.Module) -> None:
         # then use the normal host-to-Neuron weight copy path.
         generator = torch.Generator(device="cpu")
         generator.manual_seed(1234)
+        # FP8 has no CPU uniform_; draw in float32 and cast. Values are kept
+        # inside e4m3's normal range so a dummy run exercises the real
+        # dequantization arithmetic rather than a field of zeros or subnormals.
+        draw_dtype = (
+            torch.float32
+            if parameter.dtype is torch.float8_e4m3fn
+            else parameter.dtype
+        )
         value = torch.empty(
             parameter.shape,
-            dtype=parameter.dtype,
+            dtype=draw_dtype,
             device="cpu",
         ).uniform_(-1e-3, 1e-3, generator=generator)
+        if parameter.dtype is torch.float8_e4m3fn:
+            # Scale into the format's sweet spot: -1e-3 would otherwise round
+            # to a subnormal or zero and make every expert output identical.
+            value = (value * 1e3).to(torch.float8_e4m3fn)
         parameter.copy_(value)
 
 

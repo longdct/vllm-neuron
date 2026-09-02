@@ -68,10 +68,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         step 4/P9).
         """
         quantization = neuron_config.quantization if neuron_config else None
-        if quantization not in (None, "bf16"):
+        if quantization not in (None, "bf16", "fp8"):
             raise ValueError(
                 f"quantization={quantization!r} is not supported for "
-                "DeepSeek-V4 yet -- only BF16 (quantization=None or 'bf16') "
-                "is implemented. Native FP8/FP4 checkpoint loading is "
-                "roadmap step 4 (P9), not yet built."
+                "DeepSeek-V4. Expected one of: None, 'bf16', 'fp8'. "
+                "'fp8' widens the checkpoint's MXFP4 routed experts to e4m3 "
+                "with per-output-channel scales; attention and shared experts "
+                "are still dequantized to BF16."
             )
