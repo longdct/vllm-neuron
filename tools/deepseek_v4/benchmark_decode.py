@@ -158,6 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--sampling-backend", choices=("cpu", "device"), default="device"
     )
     parser.add_argument(
+        "--async-scheduling",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Whether sampled tokens come back as device futures materialized "
+            "after the step. 'auto' follows --sampling-backend, which is the "
+            "historical behaviour. Separable because welding the two together "
+            "made an on-device sampling defect indistinguishable from a stale "
+            "async readback."
+        ),
+    )
+    parser.add_argument(
         "--sampling-case",
         action="append",
         choices=SAMPLING_CASES,
@@ -376,6 +388,21 @@ async def run_once(
         ]
     )
     finished = time.perf_counter()
+    # A benchmark that never looks at what it generated cannot tell a real
+    # sample from an unwritten buffer. On-device sampling read back token 0
+    # for an entire depth-8 run here and reported a clean tok/s number,
+    # because nothing checked. See the ODS investigation plan.
+    for request in requests:
+        invalid = [
+            token
+            for token in request["token_ids"]
+            if not 0 <= token < vocab_size
+        ]
+        if invalid:
+            raise ValueError(
+                f"{request['request_id']}: sampled token ids outside "
+                f"[0, {vocab_size}): {invalid[:8]}"
+            )
     total_tokens = sum(len(request["token_ids"]) for request in requests)
     elapsed = finished - started
     return {
@@ -475,6 +502,13 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if args.enable_expert_parallel:
         neuron_config["ep_degree"] = args.ep_degree
     neuron_config["quantization"] = args.quantization
+    async_scheduling = (
+        args.sampling_backend == "device"
+        if args.async_scheduling == "auto"
+        else args.async_scheduling == "on"
+    )
+    if async_scheduling and args.sampling_backend != "device":
+        raise ValueError("--async-scheduling on requires --sampling-backend device")
     if args.debug_logits_dir:
         neuron_config["debug_logits_dir"] = args.debug_logits_dir
 
@@ -492,7 +526,7 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
         enable_prefix_caching=False,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        async_scheduling=args.sampling_backend == "device",
+        async_scheduling=async_scheduling,
         stream_interval=1,
         max_logprobs=args.logprobs,
         disable_log_stats=True,
@@ -577,9 +611,10 @@ async def benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "load_format": args.load_format,
             "quantization": args.quantization,
             "sampling_backend": args.sampling_backend,
+            "async_scheduling_requested": args.async_scheduling,
             "sampling_cases": cases,
             "on_device_sampling": neuron_config["on_device_sampling_config"],
-            "async_scheduling": args.sampling_backend == "device",
+            "async_scheduling": async_scheduling,
             "full_logits_requested": bool(args.logprobs or args.debug_logits_dir),
             "warmups_discarded": args.warmups,
             "measured_repetitions": args.repetitions,

@@ -34,6 +34,27 @@ def main() -> None:
             "UNSAFE_FP8FNCAST=1 and the neuronx-cc e4m3fn cast flag."
         ),
     )
+    parser.add_argument(
+        "--sampling-backend",
+        choices=("cpu", "device"),
+        default="cpu",
+        help=(
+            "Where the token is chosen. 'device' compiles the sampler into the "
+            "model graph; 'cpu' returns logits and samples on the host. Kept "
+            "separate from --async-scheduling on purpose: benchmark_decode.py "
+            "welded the two together, which is why an on-device sampling "
+            "defect could never be isolated from the async readback."
+        ),
+    )
+    parser.add_argument(
+        "--async-scheduling",
+        choices=("on", "off"),
+        default="off",
+        help=(
+            "Return sampled tokens as device futures materialized after the "
+            "step. Only meaningful with --sampling-backend device."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--max-num-seqs", type=int, default=1)
@@ -264,9 +285,21 @@ def main() -> None:
     if num_seqs_buckets and num_seqs_buckets[-1] != args.max_num_seqs:
         parser.error("the last --num-seqs-buckets value must equal --max-num-seqs")
 
+    if args.async_scheduling == "on" and args.sampling_backend != "device":
+        parser.error("--async-scheduling on requires --sampling-backend device")
+
     neuron_config = {
         "num_batched_tokens_buckets": prefill_buckets,
-        "on_device_sampling_config": None,
+        "on_device_sampling_config": (
+            # Mirrors benchmark_decode.py's on-device configuration exactly.
+            # `all_greedy=False` is not a stylistic choice: it selects the
+            # generic sampling graph, and a temperature=0 request still gets
+            # argmax inside it. Diverging here would mean this harness
+            # compiles a different graph from the one that fails.
+            {"all_greedy": False, "max_top_k": 256, "deterministic": True}
+            if args.sampling_backend == "device"
+            else None
+        ),
     }
     if num_seqs_buckets:
         neuron_config["num_seqs_buckets"] = num_seqs_buckets
@@ -359,7 +392,7 @@ def main() -> None:
         kv_cache_dtype=args.kv_cache_dtype,
         gpu_memory_utilization=args.gpu_memory_utilization,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        async_scheduling=False,
+        async_scheduling=args.async_scheduling == "on",
         additional_config={"neuron_config": neuron_config},
     )
     initialization_seconds = time.perf_counter() - initialization_started
@@ -494,6 +527,11 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "token_ids": workload_results[-1]["token_ids"],
+        # Recorded because two runs of this script are only comparable when the
+        # sampling path matches; a device-sampled token list and a CPU-sampled
+        # one look identical in the JSON otherwise.
+        "sampling_backend": args.sampling_backend,
+        "async_scheduling": args.async_scheduling == "on",
         "initialization_seconds": initialization_seconds,
         "generation_seconds": workload_results[-1]["generation_seconds"],
         "tokens_per_second": workload_results[-1]["tokens_per_second"],
