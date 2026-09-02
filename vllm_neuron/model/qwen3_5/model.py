@@ -121,16 +121,25 @@ class Qwen3_5MLP(nn.Module):
         set_weight_loader(self.up_proj_weight, gate_up_loader)
         set_weight_loader(self.down_proj_weight, down_loader)
 
-    def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
-        if is_prefill and self.world_size > 1:
-            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+    def _mlp(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The projection itself, isolated so a quantized subclass can swap it.
 
-        output = NF.mlp(
+        Everything around it -- the sequence-parallel all_gather on the way in
+        and the reduce_scatter/all_reduce on the way out -- is precision
+        independent, so ``model_fp8.Qwen3_5MLPFP8`` overrides only this.
+        """
+        return NF.mlp(
             hidden_states,
             self.gate_proj_weight,
             self.up_proj_weight,
             self.down_proj_weight,
         )
+
+    def forward(self, hidden_states: torch.Tensor, is_prefill: bool) -> torch.Tensor:
+        if is_prefill and self.world_size > 1:
+            hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
+
+        output = self._mlp(hidden_states)
 
         if self.world_size > 1:
             if is_prefill:
@@ -211,16 +220,28 @@ class Qwen3_5Attention(nn.Module):
             self.o_proj_weight, gated_o_proj_weight_loader(config, policy)
         )
 
+    # -- the two matmul seams, isolated so a quantized subclass can swap them.
+    # Everything between them -- QK-norm, RoPE, the attention kernel, the
+    # output gate -- is precision independent and stays in one place.
+
+    def _qkv_proj(self, hidden_states):
+        return NF.qkv_proj(
+            hidden=hidden_states.unsqueeze(0),
+            qkv_weights=self.qkv_proj_weight,
+            bias=None,
+        ).squeeze(0)
+
+    def _out_proj(self, attn_output):
+        return NF.o_proj(
+            attn_output.unsqueeze(0), self.o_proj_weight, None
+        ).squeeze(0)
+
     # -- projection + norm + rope, shared by both paths --------------------
 
     def _project(self, hidden_states, cos, sin):
         tokens = hidden_states.shape[0]
 
-        qkv = NF.qkv_proj(
-            hidden=hidden_states.unsqueeze(0),
-            qkv_weights=self.qkv_proj_weight,
-            bias=None,
-        ).squeeze(0)
+        qkv = self._qkv_proj(hidden_states)
 
         # Explicit slices: Tensor.split with a list of sizes is divergence #1.
         qg = qkv[..., : self.q_gate_size]
@@ -317,9 +338,7 @@ class Qwen3_5Attention(nn.Module):
             hidden_states.shape[0], -1
         )
         attn_output = apply_output_gate(attn_output, gate)
-        attn_output = NF.o_proj(
-            attn_output.unsqueeze(0), self.o_proj_weight, None
-        ).squeeze(0)
+        attn_output = self._out_proj(attn_output)
 
         if self.world_size > 1:
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
@@ -358,9 +377,7 @@ class Qwen3_5Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).reshape(tokens, -1)
         attn_output = apply_output_gate(attn_output, gate)
-        attn_output = NF.o_proj(
-            attn_output.unsqueeze(0), self.o_proj_weight, None
-        ).squeeze(0)
+        attn_output = self._out_proj(attn_output)
 
         if self.world_size > 1:
             # Assign -- see the note in Qwen3_5MLP.forward.
@@ -388,12 +405,27 @@ class Qwen3_5DecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps, config.torch_dtype
         )
 
+        # Imported here, not at module scope: model_fp8 subclasses the two
+        # classes defined above, so a top-level import would be circular.
+        from .model_fp8 import resolve_module_classes
+
+        neuron_config = config.neuron_config
+        attention_cls, mlp_cls = resolve_module_classes(
+            getattr(neuron_config, "quantization", None) if neuron_config else None,
+            getattr(neuron_config, "modules_to_not_convert", None)
+            if neuron_config
+            else None,
+        )
+
         if self.layer_type == FULL_ATTENTION:
-            self.self_attn = Qwen3_5Attention(config, policy, layer_idx)
+            self.self_attn = attention_cls(config, policy, layer_idx)
         else:
+            # The GatedDeltaNet projections are plain nn.Linear with no kernel
+            # quantization path, so linear-attention layers stay BF16
+            # regardless of the requested precision.
             self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx, policy)
 
-        self.mlp = Qwen3_5MLP(config, policy)
+        self.mlp = mlp_cls(config, policy)
 
     @property
     def is_linear(self) -> bool:
@@ -770,19 +802,47 @@ class Qwen3_5TextForCausalLM(nn.Module):
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None
     ) -> None:
         mappings = text_weight_mappings(self.config)
+        mappings.update(self._fp8_scale_mappings(mappings))
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
             self.rank, self.world_size, self, mappings, device
         ).state_dict
 
+        # Cast towards each *destination parameter's* dtype rather than a
+        # single model dtype. For the BF16 path the two are the same, but an
+        # FP8 weight and its fp32 row scale are both "not bfloat16" and a
+        # blanket cast would quietly undo the quantization -- turning the FP8
+        # bytes back into bf16 and discarding the scale's precision.
+        destinations = {name: p.dtype for name, p in self.named_parameters()}
         target_dtype = self.config.torch_dtype
         for name, tensor in rank_sharded.items():
             # The GDN gates and state stay fp32; everything else takes the
-            # model dtype.
+            # dtype its parameter was declared with.
             if name.endswith(("A_log", "dt_bias")):
                 continue
-            if tensor.dtype != target_dtype:
-                rank_sharded[name] = tensor.to(target_dtype)
+            want = destinations.get(name, target_dtype)
+            if tensor.dtype != want:
+                rank_sharded[name] = tensor.to(want)
 
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+
+    def _fp8_scale_mappings(self, mappings: dict) -> dict:
+        """Point every FP8 row-scale parameter at its weight's checkpoint key.
+
+        The scales are *derived* from the weights rather than read from the
+        checkpoint, so a scale reads the same key (or, for fused QKV, the same
+        list of keys) as the weight it belongs to; only the transform differs.
+        Returning a dict rather than mutating keeps the BF16 path, where this
+        is empty, provably untouched.
+        """
+        from .model_fp8 import SCALE_SUFFIX
+
+        extra = {}
+        for name, _ in self.named_parameters():
+            if not name.endswith(SCALE_SUFFIX):
+                continue
+            weight_name = name[: -len(SCALE_SUFFIX)]
+            if weight_name in mappings:
+                extra[name] = mappings[weight_name]
+        return extra

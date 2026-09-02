@@ -106,10 +106,25 @@ class Qwen3_5ForCausalLM(nn.Module):
         cls, config: Qwen3_5TextConfig, neuron_config: NeuronConfig | None
     ) -> None:
         quantization = neuron_config.quantization if neuron_config else None
-        if quantization not in (None, "bf16"):
+        if quantization not in (None, "bf16", "fp8"):
             raise ValueError(
                 f"quantization={quantization!r} is not supported for the "
-                "Qwen3.5 family. Only BF16 (None or 'bf16') is implemented."
+                "Qwen3.5 family. Implemented: None/'bf16', and 'fp8' "
+                "(per-channel weights, runtime activation scales)."
+            )
+
+        if quantization == "fp8":
+            # Say the cost out loud. Quantizing to e4m3 is lossy in a way the
+            # BF16 path is not: measured on the real 27B, each quantized
+            # weight tensor carries ~2.6% relative error. That is normal for
+            # weight-only FP8 and usually harmless, but it is a change in
+            # output that no startup check can verify.
+            logger.warning(
+                "Qwen3.5: serving with per-channel FP8 weights. The MLP and "
+                "full-attention projections are quantized (~70%% of weights); "
+                "GatedDeltaNet layers, embeddings and lm_head stay BF16. "
+                "Expect ~2.6%% relative error per quantized tensor -- validate "
+                "output quality against the BF16 baseline before deploying."
             )
 
         # A quantized checkpoint must be refused, not tolerated. Nothing

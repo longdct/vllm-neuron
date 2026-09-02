@@ -69,12 +69,24 @@ def test_accepts_bf16():
         Qwen3_5ForCausalLM._validate_config(config, _NeuronConfigStub(quantization))
 
 
-@pytest.mark.parametrize("quantization", ["mxfp4", "mxfp8", "fp8"])
+@pytest.mark.parametrize("quantization", ["mxfp4", "mxfp8", "int8"])
 def test_rejects_quantized_configs(quantization):
+    """MX formats need Trn3 micro-scales, which Trainium2 does not have."""
     with pytest.raises(ValueError, match="is not supported for the"):
         Qwen3_5ForCausalLM._validate_config(
             Qwen3_5TextConfig(), _NeuronConfigStub(quantization)
         )
+
+
+def test_accepts_fp8_and_says_what_it_costs(caplog):
+    """FP8 is lossy in a way BF16 is not, and no startup check can verify
+    output quality, so accepting it must come with the number attached."""
+    with caplog.at_level("WARNING"):
+        Qwen3_5ForCausalLM._validate_config(
+            Qwen3_5TextConfig(), _NeuronConfigStub("fp8")
+        )
+    assert "2.6%" in caplog.text
+    assert "BF16 baseline" in caplog.text
 
 
 def test_rejects_a_quantized_checkpoint_rather_than_misreading_it():
