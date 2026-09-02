@@ -1001,14 +1001,23 @@ def paged_shared_latent_mla(inputs) -> torch.Tensor:
         raise RuntimeError(
             f"DeepSeek-V4 paged MLA history geometry is unsupported: {history}"
         )
-    if (
-        query.shape[0] not in _SCHEDULER_QUERY_BUCKETS
-        or query.shape[1] != 1
-        or not 1 <= query.shape[2] <= 64
-        or query.shape[3] != 512
-    ):
+    # Report which condition failed. Folding four into one message sends the
+    # reader after the head count when the usual cause is an unsupported query
+    # bucket -- Q=256 is absent from the set, so a max_model_len of 256 fails
+    # here complaining about H.
+    if query.shape[0] not in _SCHEDULER_QUERY_BUCKETS:
         raise RuntimeError(
-            "DeepSeek-V4 paged MLA requires [Q,1,H,512] query with 1 <= H <= 64"
+            f"DeepSeek-V4 paged MLA query bucket {query.shape[0]} is "
+            f"unsupported; expected one of {sorted(_SCHEDULER_QUERY_BUCKETS)}"
+        )
+    if query.shape[1] != 1 or query.shape[3] != 512:
+        raise RuntimeError(
+            "DeepSeek-V4 paged MLA requires [Q,1,H,512] query, got "
+            f"{tuple(query.shape)}"
+        )
+    if not 1 <= query.shape[2] <= 64:
+        raise RuntimeError(
+            f"DeepSeek-V4 paged MLA requires 1 <= H <= 64, got {query.shape[2]}"
         )
     if query.dtype != torch.bfloat16:
         raise RuntimeError("DeepSeek-V4 paged MLA requires BF16 query")
