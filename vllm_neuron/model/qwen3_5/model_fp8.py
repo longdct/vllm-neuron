@@ -34,6 +34,7 @@ measured on the real checkpoint it is no less accurate than per-tensor scaling
 """
 
 import logging
+import os
 
 import torch
 from nkilib.core.utils.common_types import QuantizationType
@@ -44,6 +45,7 @@ from vllm_neuron.utils.weight_loader import get_weight_loader, set_weight_loader
 
 from .model import Qwen3_5Attention, Qwen3_5MLP
 from .weight_loaders_fp8 import (
+    FP8_CLAMP_MAX,
     FP8_DTYPE,
     fp8_scale_loader,
     fp8_weight_loader,
@@ -61,6 +63,109 @@ _PMAX = 128
 #: filled. llama3 works around that with a second manual load pass; declaring a
 #: parameter lets the existing pipeline do it.
 SCALE_SUFFIX = "_scale"
+
+
+def _enable_legacy_fp8_cast() -> None:
+    """Tell NKI to read ``torch.float8_e4m3fn`` as Trn2's legacy ``e4m3``.
+
+    Without this, tracing dies at the first quantized kernel with::
+
+        RuntimeError: float8_e4m3fn is not supported in nki.
+        Set UNSAFE_FP8FNCAST to enable e4m3fn -> e4m3 casting.
+
+    Torch has no legacy-e4m3 dtype, so an FP8 weight can only be *stored* as
+    ``float8_e4m3fn``; Trn2's tensor engine only speaks legacy ``e4m3``. This
+    flag is the documented bridge between the two
+    (``nki/compiler/target.py:148-160``): on TRN2 it is the only setting under
+    which ``float8_e4m3fn`` compiles at all.
+
+    "Unsafe" refers to values in (240, 448] -- representable in OCP e4m3fn,
+    but inf or NaN in legacy e4m3. That cannot happen here:
+    :func:`~vllm_neuron.model.qwen3_5.weight_loaders_fp8.quantize_row_fp8`
+    clamps every value to ``FP8_CLAMP_MAX``, which *is* 240 on Trn2, and the
+    two encodings are bit-identical below it. The reinterpretation is exact.
+
+    Set here rather than left to the operator because the two halves must
+    agree: the flag without the clamp silently turns large weights into NaN,
+    and the clamp without the flag simply fails to compile.
+    """
+    current = os.environ.get("UNSAFE_FP8FNCAST", "")
+    if current.lower() not in ("1", "true", "yes", "on"):
+        os.environ["UNSAFE_FP8FNCAST"] = "1"
+        logger.info(
+            "Qwen3.5 FP8: set UNSAFE_FP8FNCAST=1 so NKI reads float8_e4m3fn "
+            "as Trn2's legacy e4m3. Exact here -- weights are clamped to %s.",
+            FP8_CLAMP_MAX,
+        )
+
+
+def unsupported_platform_reason() -> str | None:
+    """Why FP8 cannot run here, or ``None`` if it can.
+
+    On Trn2 the prefill (CTE) MLP kernel requires the **activation** to
+    already be FP8 whenever the weights are. ``mlp_cte_constants.py:145-157``
+    sets the PE-transpose destination dtype to the quantized weight dtype as
+    soon as the weights are quantized::
+
+        if use_pe_xpose_flag and nisa.get_nc_version() >= nisa.nc_version.gen3:
+            if mlpp_has_quantized_weights(mlp_params):
+                return src_proj_quant_data_type
+
+    while the tensor being transposed is the bf16 hidden state. gen3's
+    transpose-mode ``nc_matmul`` requires the two to match, so tracing dies
+    with::
+
+        nc_matmul (transpose mode) dst dtype must match input dtype on gen3+,
+        got dst=float8_e4m3 but input=bfloat16
+
+    Measured on a trn2.48xlarge, one NF.mlp call at Qwen3.5-27B's TP=8 dims:
+
+        mode              activation   decode (TKG)   prefill (CTE)
+        bf16              bf16         OK             OK
+        ROW fp8           bf16         OK             FAIL
+        STATIC fp8        bf16         OK             FAIL
+        ROW fp8           fp8          --             OK
+        STATIC fp8        fp8          --             OK
+
+    So this is not specific to ``ROW``: per-tensor ``STATIC`` fails the same
+    way with a bf16 activation. What makes llama3's Trn2 static-FP8 path work
+    is that its MLP owns the post-attention RMSNorm and calls
+    ``NF.rmsnorm_quant`` to hand the kernel an **fp8** activation.
+
+    Qwen3.5 cannot do that under ``ROW``: pre-quantizing the activation needs
+    the scale used to be passed alongside it, and ROW has no input-scale
+    argument -- it is defined to compute activation scales itself. Reaching
+    FP8 prefill on Trn2 therefore means moving to ``STATIC`` with calibrated
+    ``input_scale`` tensors, which no Qwen3.5 checkpoint ships (the official
+    FP8 release declares ``activation_scheme="dynamic"``), plus a fused
+    RMSNorm-quant on the prefill path. That is a separate piece of work.
+
+    Raising here rather than letting it compile costs the operator ten
+    minutes of graph extraction and a NKI assertion instead of a sentence.
+    """
+    from torch_neuronx.utils import get_platform_target
+
+    try:
+        target = get_platform_target()
+    except RuntimeError:
+        # No NRT and no override: a bare CPU run, where nothing compiles
+        # anyway. Not this function's business to fail.
+        return None
+
+    if target.startswith("trn2"):
+        return (
+            "FP8 weights cannot serve prefill on trn2. With quantized weights "
+            "the CTE MLP kernel transposes into an fp8 destination "
+            "(mlp_cte_constants.py:145-157) while the hidden state is still "
+            "bf16, and gen3 requires transpose src/dst dtypes to match: "
+            "'nc_matmul (transpose mode) dst dtype must match input dtype on "
+            "gen3+'. Decode compiles; prefill does not, in per-channel (ROW) "
+            "and per-tensor (STATIC) modes alike. Serving FP8 here needs "
+            "static activation scales from a calibrated checkpoint plus a "
+            "fused rmsnorm-quant on the prefill path -- neither exists for "
+            "Qwen3.5 today. Use quantization='bf16', or run on trn3."
+        )
+    return None
 
 
 def _quantize_parameter(module: nn.Module, name: str) -> None:
@@ -162,6 +267,7 @@ def resolve_module_classes(
     if quantization not in ("fp8",):
         return Qwen3_5Attention, Qwen3_5MLP
 
+    _enable_legacy_fp8_cast()
     skip = tuple(modules_to_not_convert or ())
 
     def keep_bf16(module_name: str) -> bool:

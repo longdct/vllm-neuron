@@ -787,3 +787,176 @@ graph was still compiling after 45 minutes, having persisted only 708 KB / 11
 NEFFs. Because head_dim 256 rules out chunked prefill, the bucket must equal
 the context window, so every prefill pads to `max_model_len` however short the
 prompt. Warm the compile cache before any deployment, and budget for it.
+
+## FP8 weights: what Trainium2 actually offers, and what it refuses
+
+The 27B serves in BF16 at 6.79 GiB/rank. FP8 is worth having here because the
+freed HBM goes straight to context or concurrency — the whole 16K x 8 KV pool
+is only 2.18 GiB/rank.
+
+**Outcome first: the implementation is complete and correct, and it cannot run
+on this box.** Trainium2's prefill MLP kernel rejects FP8 weights against a
+BF16 activation, in both per-channel and per-tensor modes. The path is
+implemented, unit-tested, and verified end to end on CPU against a real
+checkpoint; `quantization='fp8'` now refuses at startup on Trn2 with the
+reason. What follows is what was measured, so the next attempt starts from
+evidence rather than from this one's assumptions.
+
+### Trainium2's FP8 is not the FP8 in your checkpoint
+
+Trn2 is NeuronCore-v3, and its tensor engine speaks **legacy `float8_e4m3`**:
+max finite 240, with inf and 14 NaN codes reserved. The format every public
+checkpoint ships is **OCP `float8_e4m3fn`**: max finite 448, no inf, 2 NaN
+codes. `nki.isa.nc_matmul` documents `float8_e4m3fn` as NeuronCore-**v4** and
+later, and `torch_neuronx.utils.is_float8_e4m3fn_supported()` returns
+`get_platform_target() != "trn2"`.
+
+Comparing all 256 codes: the two encodings are **identical except for 14**,
+all of them above 240. Same bias, same denormals, same `min_pos` of 2^-9. So
+`torch.float8_e4m3fn` is a faithful container for values Trn2 will read as
+legacy e4m3 *provided nothing exceeds 240* — which is exactly what
+`dtype_utils.FP8_CLAMP_MAX` already encodes (240.0 on Trn2, 448.0 on Trn3).
+Hardcoding 448 anywhere in a scale computation emits values the hardware reads
+as inf or NaN.
+
+### ROW, not STATIC — because no checkpoint carries activation scales
+
+nkilib offers two FP8 modes on Trn2 (`common_types.py:64-85`):
+
+| | weight scale | activation scale |
+|---|---|---|
+| `STATIC` | one per tensor | **static, from the checkpoint** |
+| `ROW` | one per output channel | **computed at runtime** |
+
+llama3 uses `STATIC`, which asserts `*_in_scale` tensors
+(`mlp_parameters.py:168-179`). Qwen3.5 cannot: the BF16 checkpoint has no
+scales at all, and the official `Qwen/Qwen3.8-27B-FP8` declares
+`"activation_scheme": "dynamic"` — it carries none either. `ROW` needs no
+calibration set and no offline quantization step; the checkpoint already on
+disk is quantized on the loader thread.
+
+That is not a compromise. Measured on the real 27B weights, per-channel and
+per-tensor scales give **the same error**, because what limits FP8 is e4m3's
+3-bit mantissa, not the granularity of the scale:
+
+| tensor | scale spread within a row | ROW err | STATIC err |
+|---|---|---|---|
+| `layers.3.mlp.gate_proj` | 3.9x | 2.65% | 2.65% |
+| `layers.59.mlp.down_proj` | 18.7x | 2.64% | 2.65% |
+| `layers.3.self_attn.o_proj` | 8.3x | 2.65% | 2.65% |
+
+Across layers 3/31/59 x {gate,up,down,q,k,o} the block-scale spread within a
+row is 3.1x–18.7x — 2 to 4.3 binades, far inside e4m3's ~17-binade range — and
+the error never leaves 2.63–2.65%.
+
+### What is quantized, and what cannot be
+
+Measured over the 26.90 B params actually served (excluding `visual.*` and
+`mtp.*`, both skipped at load):
+
+| bucket | params | share | |
+|---|---|---|---|
+| MLP (`NF.mlp`) | 17.11 B | 61.6% | **FP8** |
+| GDN (`nn.Linear`) | 5.56 B | 20.7% | BF16 |
+| attention (`NF.qkv_proj`/`NF.o_proj`) | 1.68 B | 6.0% | **FP8** |
+| embed + `lm_head` | 2.54 B | 9.5% | BF16 |
+
+**69.9% quantized**, predicting 6.26 -> 4.07 GiB/rank at TP=8; against the
+measured 6.79 baseline, expect ~4.4. That is the *prediction*. It is not what
+this box does — see the next section.
+
+The 48 GatedDeltaNet layers are the cap. Their five projections are plain
+`nn.Linear`, not NKI kernel calls, so there is no `quantization_type` to pass
+— quantizing them means writing a dequant path, not setting a flag.
+
+### The blocker: Trn2 prefill will not take a BF16 activation against FP8 weights
+
+The 27B refused to compile. Two gates in sequence, the first easy and the
+second fatal.
+
+**Gate 1 — the dtype bridge.** Torch has no legacy-e4m3 dtype, so an FP8
+weight can only be stored as `float8_e4m3fn`, and NKI refuses that on Trn2:
+
+```
+RuntimeError: float8_e4m3fn is not supported in nki.
+Set UNSAFE_FP8FNCAST to enable e4m3fn -> e4m3 casting.
+```
+
+`UNSAFE_FP8FNCAST=1` is the documented bridge (`nki/compiler/target.py:148`),
+and on Trn2 it is the *only* setting under which `float8_e4m3fn` compiles.
+"Unsafe" means values in (240, 448] become inf or NaN — impossible here,
+because the quantizer clamps to `FP8_CLAMP_MAX`, which is 240 on Trn2, and
+the encodings are bit-identical below it. `model_fp8` sets the flag itself:
+the flag without the clamp corrupts weights, and the clamp without the flag
+merely fails to compile, so the two must not be separable.
+
+**Gate 2 — the prefill transpose.** Past that, graph extraction dies with
+
+```
+nc_matmul (transpose mode) dst dtype must match input dtype on gen3+,
+got dst=float8_e4m3 but input=bfloat16
+```
+
+`mlp_cte_constants.py:145-157` sets the PE-transpose destination dtype to the
+quantized weight dtype as soon as the weights are quantized, while the tensor
+being transposed is the bf16 hidden state.
+
+Measured directly, one `NF.mlp` call at the 27B's TP=8 dimensions — minutes,
+rather than inferring it from a two-hour model run:
+
+| mode | activation in | decode (TKG) | prefill (CTE) |
+|---|---|---|---|
+| bf16 | bf16 | OK | OK |
+| ROW fp8 | bf16 | OK | **FAIL** |
+| STATIC fp8 | bf16 | OK | **FAIL** |
+| ROW fp8 | **fp8** | — | OK |
+| STATIC fp8 | **fp8** | — | OK |
+
+Three things follow, and the last one is the point:
+
+1. It is **not** a `ROW` problem. Per-tensor `STATIC` fails identically, so
+   switching to a calibrated per-tensor checkpoint would not have helped —
+   worth knowing before anyone spends a week building a calibration pipeline.
+2. The prefill kernel is fine with FP8 weights *provided the activation is
+   already FP8*. That is exactly why llama3's Trn2 static-FP8 MLP owns the
+   post-attention RMSNorm and calls `NF.rmsnorm_quant` — it hands the kernel
+   an fp8 activation.
+3. `ROW` cannot do that. Pre-quantizing an activation means telling the kernel
+   what scale you used, and ROW has no input-scale argument — it is *defined*
+   to compute activation scales itself. So on Trn2 the two halves are
+   mutually exclusive: the mode that needs no calibration cannot feed prefill,
+   and the mode that can feed prefill needs calibration data no Qwen3.5
+   checkpoint ships.
+
+Reaching FP8 prefill on Trn2 therefore means `STATIC` plus calibrated
+`input_scale` tensors plus a fused RMSNorm-quant on the prefill path — a
+separate piece of work with a real dependency (calibration data). On Trn3 the
+question does not arise.
+
+The factory raises at startup with this reason rather than letting an operator
+wait ten minutes for a NKI assertion.
+
+### The failure mode this closes
+
+Before this work, pointing `qwen3_5` at an FP8 checkpoint **did not fail**.
+`text_weight_mappings` maps only `.weight` keys, so every `.weight_scale_inv`
+landed in `unexpected_keys` and was discarded; `checkpoints.py` then saw
+`float8_e4m3fn != bfloat16` and cast the raw bytes. Scales gone, mantissa and
+exponent bytes reinterpreted as bf16 magnitudes, and the only signal a
+per-parameter warning flood. `quantization.py` now refuses such a checkpoint
+by name, with the reason attached.
+
+Note that this is a refusal, not support: the FP8 path here quantizes **from
+the BF16 checkpoint**. Reading the official 128x128-blockwise FP8 release
+would additionally need its `weight_scale_inv` tensors mapped and dequantized
+(`tools/deepseek_v4/quant_formats.py::dequantize_fp8_blockwise` already reads
+that exact layout) before re-deriving row scales — worth doing, not done.
+
+### FP4 is not applicable and not implemented
+
+The local 27B checkpoint is 100% BF16 with no `quantization_config`, and the
+official quantized release is FP8, not FP4. No official FP4 Qwen3.8 exists.
+Beyond availability, Trn2 has no FP4 tensor-engine format at all, and
+nkilib's own note is explicit that `float4_e2m1fn_x4` "is not supported by
+`nisa.quantize_mx`". A 4-bit checkpoint is therefore rejected with that
+reason rather than silently degraded.

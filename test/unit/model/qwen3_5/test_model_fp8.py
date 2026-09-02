@@ -214,3 +214,46 @@ def test_embeddings_and_lm_head_stay_bf16_under_fp8():
     model = _build_model("fp8")
     assert model.lm_head.weight.dtype is torch.bfloat16
     assert model.model.embed_tokens.weight.dtype is torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Platform gate
+# ---------------------------------------------------------------------------
+
+
+def test_trn2_is_refused_with_the_prefill_reason():
+    """Trn2's CTE kernel cannot take a bf16 activation against fp8 weights, so
+    prefill never compiles. Measured for ROW and STATIC alike -- this is a
+    platform limit, not a mode choice. It must be a startup error, not a NKI
+    assertion ten minutes into graph extraction."""
+    from unittest import mock
+
+    from vllm_neuron.model.qwen3_5 import model_fp8
+
+    with mock.patch("torch_neuronx.utils.get_platform_target", return_value="trn2"):
+        reason = model_fp8.unsupported_platform_reason()
+    assert reason is not None
+    assert "prefill" in reason
+    assert "trn3" in reason
+
+
+def test_trn3_is_allowed():
+    from unittest import mock
+
+    from vllm_neuron.model.qwen3_5 import model_fp8
+
+    with mock.patch("torch_neuronx.utils.get_platform_target", return_value="trn3"):
+        assert model_fp8.unsupported_platform_reason() is None
+
+
+def test_a_cpu_run_with_no_runtime_is_not_this_functions_business():
+    """`get_platform_target` raises without NRT. Nothing compiles on a bare CPU
+    run anyway, so the gate must not turn that into an error."""
+    from unittest import mock
+
+    from vllm_neuron.model.qwen3_5 import model_fp8
+
+    with mock.patch(
+        "torch_neuronx.utils.get_platform_target", side_effect=RuntimeError("no NRT")
+    ):
+        assert model_fp8.unsupported_platform_reason() is None

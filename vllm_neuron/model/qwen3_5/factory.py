@@ -114,6 +114,14 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         if quantization == "fp8":
+            # Fail here, not ten minutes into graph extraction with a NKI
+            # assertion. See the docstring for the measured platform matrix.
+            from .model_fp8 import unsupported_platform_reason
+
+            reason = unsupported_platform_reason()
+            if reason is not None:
+                raise ValueError(f"quantization='fp8': {reason}")
+
             # Say the cost out loud. Quantizing to e4m3 is lossy in a way the
             # BF16 path is not: measured on the real 27B, each quantized
             # weight tensor carries ~2.6% relative error. That is normal for

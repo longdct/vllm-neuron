@@ -81,12 +81,24 @@ def test_rejects_quantized_configs(quantization):
 def test_accepts_fp8_and_says_what_it_costs(caplog):
     """FP8 is lossy in a way BF16 is not, and no startup check can verify
     output quality, so accepting it must come with the number attached."""
-    with caplog.at_level("WARNING"):
-        Qwen3_5ForCausalLM._validate_config(
-            Qwen3_5TextConfig(), _NeuronConfigStub("fp8")
-        )
+    with mock.patch("torch_neuronx.utils.get_platform_target", return_value="trn3"):
+        with caplog.at_level("WARNING"):
+            Qwen3_5ForCausalLM._validate_config(
+                Qwen3_5TextConfig(), _NeuronConfigStub("fp8")
+            )
     assert "2.6%" in caplog.text
     assert "BF16 baseline" in caplog.text
+
+
+def test_fp8_on_trn2_fails_at_startup_not_in_the_compiler():
+    """Trn2's prefill kernel cannot take a bf16 activation against fp8
+    weights. Without this gate the operator waits ten minutes for graph
+    extraction and gets a NKI assertion instead of a sentence."""
+    with mock.patch("torch_neuronx.utils.get_platform_target", return_value="trn2"):
+        with pytest.raises(ValueError, match="cannot serve prefill on trn2"):
+            Qwen3_5ForCausalLM._validate_config(
+                Qwen3_5TextConfig(), _NeuronConfigStub("fp8")
+            )
 
 
 def test_rejects_a_quantized_checkpoint_rather_than_misreading_it():
