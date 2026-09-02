@@ -169,6 +169,40 @@ Do not run the known broken full Q512 cold compile described in the MLA defect
 handoff until its structural checks confirm that static query expansion and
 query-by-history materializations are absent.
 
+## RETRACTED: the depth-8 A/B below did not test what it claimed
+
+The fused-vs-legacy comparison recorded in the next section is **invalid** and
+its conclusion must not be used.
+
+Its two arms selected the reduction with
+`VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION`, which is implemented only on this
+branch. But the arms did not set `PYTHONPATH`, and the editable install points
+at the primary checkout -- so vLLM's worker processes imported the model code
+from `/home/ubuntu/vllm-neuron` (then at `6c9c783`), which contains **zero**
+occurrences of that variable. The flag was never read. Both arms ran identical
+model code.
+
+The 0.52% difference between them was therefore run-to-run and cold-compile
+variation between two independent builds, not the fused reduction, and the
+"regression grows with depth" reading (-0.15% at depth 3, -0.52% at depth 8)
+has no support. The differing NEFF byte totals, offered at the time as proof
+the flag reached the graph, are explained the same way.
+
+What survives:
+
+  - The measured ITLs are still real measurements *of the primary checkout's
+    model* at those depths: 69.199 ms median steady ITL at depth 3 and
+    131.5-132.2 ms at depth 8, TP8/EP4, Q512, 256 experts, dummy BF16 weights,
+    fixed-CSA. They remain usable as BF16 baselines provided the code under
+    comparison is stated.
+  - The normal-CSA stall reproducing at depth 8 exactly as at depth 3. That is
+    a directly observed failure, independent of which reduction ran.
+
+Anything running a DeepSeek-V4 benchmark from a git worktree must export
+`PYTHONPATH=<worktree>` or it silently measures a different tree. The same
+mistake surfaced later as the factory rejecting `quantization="fp8"` that the
+worktree supports.
+
 ## Depth-8 A/B on 2026-09-02: the fused reduction is a small regression
 
 The 2026-09-01 comparison above could not separate the fused reduction from
