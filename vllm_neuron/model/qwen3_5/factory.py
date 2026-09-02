@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 from .config import Qwen3_5TextConfig
 from .parallel import resolve_sharding
+from .quantization import read_quantization_spec
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,10 @@ class Qwen3_5ForCausalLM(nn.Module):
         vision_neuron_config: "VisionNeuronConfig | None" = None,
     ) -> nn.Module:
         config = Qwen3_5TextConfig.from_configs(hf_config, neuron_config)
+        # ``quantization_config`` lives on the multimodal wrapper config and
+        # never reaches ``text_config``, so it is read here and attached
+        # rather than in ``from_configs``.
+        config.quant_spec = read_quantization_spec(hf_config)
         cls._validate_config(config, neuron_config)
 
         if vision_neuron_config is not None:
@@ -105,6 +110,23 @@ class Qwen3_5ForCausalLM(nn.Module):
             raise ValueError(
                 f"quantization={quantization!r} is not supported for the "
                 "Qwen3.5 family. Only BF16 (None or 'bf16') is implemented."
+            )
+
+        # A quantized checkpoint must be refused, not tolerated. Nothing
+        # downstream reads scale tensors: ``text_weight_mappings`` maps only
+        # ``.weight`` keys, so ``.weight_scale_inv`` is dropped as an
+        # unexpected key, and the loader then casts the raw fp8 bytes to
+        # bfloat16. That produces fluent, confidently wrong output with no
+        # error -- the worst possible failure. Raise instead.
+        spec = config.quant_spec
+        if spec is not None and spec.is_quantized():
+            raise ValueError(
+                f"checkpoint declares {spec.weight_format.value} weights, but "
+                "the Qwen3.5 BF16 implementation cannot read them: the "
+                "per-block scale tensors would be discarded and the FP8 bytes "
+                "reinterpreted as BF16, which produces plausible-looking "
+                "garbage rather than an error. Serve the unquantized BF16 "
+                "checkpoint instead."
             )
 
         # Multi-token prediction is out of scope. This used to raise, on the

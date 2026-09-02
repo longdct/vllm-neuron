@@ -26,11 +26,15 @@ get wrong; both are validated rather than assumed:
 
 import json
 from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING
 
 import torch
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+if TYPE_CHECKING:
+    from .quantization import Qwen3_5QuantizationSpec
 
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
@@ -164,6 +168,13 @@ class Qwen3_5TextConfig:
     mtp_num_hidden_layers: int = 0
 
     neuron_config: NeuronConfig | None = None
+
+    #: What the *checkpoint* says about its own weights, parsed from the
+    #: top-level ``quantization_config``. ``None`` for an unquantized
+    #: checkpoint. Set by the factory rather than by ``from_hf_config``,
+    #: because ``quantization_config`` sits on the multimodal wrapper config
+    #: and never reaches ``text_config``.
+    quant_spec: "Qwen3_5QuantizationSpec | None" = None
 
     # ------------------------------------------------------------------
     # Normalization and validation

@@ -12,6 +12,10 @@ import pytest
 
 from vllm_neuron.model.qwen3_5.config import Qwen3_5TextConfig
 from vllm_neuron.model.qwen3_5.factory import Qwen3_5ForCausalLM
+from vllm_neuron.model.qwen3_5.quantization import (
+    Qwen3_5QuantizationSpec,
+    WeightFormat,
+)
 from vllm_neuron.model.registry import get_models
 
 
@@ -71,6 +75,31 @@ def test_rejects_quantized_configs(quantization):
         Qwen3_5ForCausalLM._validate_config(
             Qwen3_5TextConfig(), _NeuronConfigStub(quantization)
         )
+
+
+def test_rejects_a_quantized_checkpoint_rather_than_misreading_it():
+    """An FP8 checkpoint must fail at startup, not load as garbage.
+
+    Before this gate existed the load *succeeded*: ``text_weight_mappings``
+    maps only ``.weight`` keys, so every ``.weight_scale_inv`` landed in
+    ``unexpected_keys`` and was discarded, and the loader then cast the raw
+    ``float8_e4m3fn`` bytes to bfloat16. The result is fluent, confidently
+    wrong output announced by nothing but a warning flood -- the worst
+    available failure mode, and the reason this raises.
+    """
+    config = Qwen3_5TextConfig()
+    config.quant_spec = Qwen3_5QuantizationSpec(
+        weight_format=WeightFormat.FP8_BLOCK128
+    )
+    with pytest.raises(ValueError, match="reinterpreted as BF16"):
+        Qwen3_5ForCausalLM._validate_config(config, _NeuronConfigStub())
+
+
+def test_an_unquantized_checkpoint_still_passes():
+    """The complement, so the gate cannot be satisfied by rejecting everything."""
+    config = Qwen3_5TextConfig()
+    config.quant_spec = None
+    Qwen3_5ForCausalLM._validate_config(config, _NeuronConfigStub())
 
 
 def test_warns_about_mtp_rather_than_refusing_to_load(caplog):
