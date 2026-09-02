@@ -342,9 +342,26 @@ same build, isolated compile cache per arm.
 | Aggregate throughput | 18.227 tok/s | 21.721 tok/s | **+19.17%** |
 | Per-rank HBM | 6.006 GiB | 3.758 GiB | **-37.43%** |
 
+### Depth 8, BF16 vs FP8
+
+Same harness and geometry, depth-8 checkpoint.
+
+| Metric | BF16 | FP8 | Change |
+| --- | ---: | ---: | ---: |
+| Median steady ITL | 130.436 ms | 106.935 ms | **+18.02%** |
+| Median TTFT | 568.994 ms | 529.790 ms | +6.89% |
+| Aggregate throughput | 7.470 tok/s | 9.064 tok/s | **+21.34%** |
+| Per-rank HBM | 14.719 GiB | 8.725 GiB | **-40.72%** |
+
 Positive is better. **FP8 is faster, not merely smaller** -- which contradicts
 the earlier expectation, itself resting on a retracted A/B, that batch-1 decode
 is latency-bound and would not benefit.
+
+The ITL gain is 18.03% at depth 3 and 18.02% at depth 8 -- essentially
+identical, which is what a per-layer effect looks like and is not what noise
+looks like. Per-repetition medians confirm it: within-arm spread is 0.91% /
+4.52% / 0.09% / 0.26% against an 18% gap, and no arm's repetitions come near
+the other arm's.
 
 **What the delta actually contains.** These arms differ in more than dtype: FP8
 routes the MoE to `shard_on_i` with a 256-token block, BF16 uses
