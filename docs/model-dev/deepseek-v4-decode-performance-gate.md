@@ -310,3 +310,60 @@ production depth is a shorter context.
 No available geometry runs depth 43 in BF16 -- cores 32-63 would be needed for
 TP32 and are not free. This is the clearest statement of what FP8 buys: not
 speed, but a configuration that otherwise cannot be instantiated.
+
+
+## FP8 results on device (2026-09-02)
+
+### Depth 43 runs, and only in FP8
+
+43 layers, 256 experts, TP16/EP2, Q64, dummy FP8 weights, logical cores
+0-3 + 20-31. Generated 4 tokens (`[6690, 824, 4628, 5697]`), 2219 s cold
+init, 11.84 s to first token, 1.609 tok/s end-to-end at that geometry.
+
+Per-rank parameter footprint **18.653 GiB**, 19.02 GiB HBM used, 4.98 GiB
+free of 24. The same weights in BF16 are ~36 GiB/rank, so **no available
+geometry runs depth 43 in BF16** -- TP32 would need cores 32-63. This is the
+concrete thing FP8 buys.
+
+The run needed `--enable-expert-parallel --ep-degree 2`: see the `shard_on_i`
+I_TP constraint above.
+
+### Depth 3, BF16 vs FP8
+
+TP8/EP4, Q512, 256 experts, sustained workload (384-token prompt, 128 output
+tokens), CPU sampling on **both** arms, 2 warmups + 3 repetitions, cores 12-19,
+same build, isolated compile cache per arm.
+
+| Metric | BF16 | FP8 | Change |
+| --- | ---: | ---: | ---: |
+| Median steady ITL | 54.405 ms | 44.597 ms | **+18.03%** |
+| p95 steady ITL | 55.694 ms | 53.723 ms | +3.54% |
+| Median TTFT | 132.415 ms | 117.000 ms | +11.64% |
+| Aggregate throughput | 18.227 tok/s | 21.721 tok/s | **+19.17%** |
+| Per-rank HBM | 6.006 GiB | 3.758 GiB | **-37.43%** |
+
+Positive is better. **FP8 is faster, not merely smaller** -- which contradicts
+the earlier expectation, itself resting on a retracted A/B, that batch-1 decode
+is latency-bound and would not benefit.
+
+**What the delta actually contains.** These arms differ in more than dtype: FP8
+routes the MoE to `shard_on_i` with a 256-token block, BF16 uses
+`shard_on_block` with 128. Kernel, block size and weight dtype all move
+together, so the 18% is the combined effect of the FP8 path, not an
+attribution to quantization alone. Separating them would need `shard_on_i` at
+BF16, which no current call site builds.
+
+Both arms use **CPU sampling**, because device sampling on this branch emits
+out-of-range token IDs and kills the request in `_validate_token_ids` -- see
+below. That makes these numbers internally comparable but not comparable to
+the earlier device-sampling figures (69.199 ms at depth 3), which were also
+produced by a different tree.
+
+### Open defect: device sampling emits invalid token IDs
+
+With this branch's code, `--sampling-backend device` produces token IDs far
+outside `[0, 129280)` -- observed `967439869` and `-1167771948` -- which fail
+`_validate_token_ids` on the next decode step. It reproduces on the **BF16**
+arm, so it is not an FP8 regression. It went unnoticed until now because
+earlier benchmark runs did not set `PYTHONPATH` and were silently executing
+the primary checkout. Not yet diagnosed.
