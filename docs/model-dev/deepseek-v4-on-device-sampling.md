@@ -83,8 +83,21 @@ was small enough to hit the defect. Gathering the shard is the same operation
 it is correct.
 
 The cost is one vocabulary-width gather per sampling call (~517 KB at batch 1
-for a 129280 vocabulary). On-device sampling still avoids the device-to-host
-round trip, which is its main benefit.
+for a 129280 vocabulary). Measured, it is free: the gather costs about half a
+millisecond and the host round trip it replaces costs about the same.
+
+Depth 3, TP8/EP4, BF16, sustained workload, median steady inter-token latency
+over 3 repetitions:
+
+| sampling | ITL | tok/s |
+|---|---|---|
+| host | 54.32 ms (52.36-56.62) | 18.41 |
+| on-device | 54.83 ms (51.64-58.87) | 18.24 |
+
+Under 1% apart, with overlapping ranges. Depth 8 on-device measures 131.07 ms
+/ 7.63 tok/s, which matches the ~7 tok/s recorded before this fix -- that
+earlier figure was taken with on-device sampling emitting garbage tokens, and
+it is now confirmed that only the tokens were wrong, not the timing.
 
 Verified at depth 3, TP8, cores 12-19, dummy weights, greedy:
 
