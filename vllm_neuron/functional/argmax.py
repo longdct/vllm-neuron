@@ -94,50 +94,30 @@ def argmax(
     if tp_degree == 1:
         return torch.argmax(tensor, dim=dim, keepdim=keepdim)
 
-    # TODO: Remove this upcast - NKI kernel and functional tests work with bfloat16, but E2E models show accuracy regression without it
-    tensor = tensor.to(torch.float32)
-    # Find local max values and indices
-    local_value, local_index = _compute_local_max(tensor, dim)
+    # Gather the shards themselves and reduce locally, rather than exchanging
+    # per-rank maxima. Exchanging maxima is the cheaper algorithm and was what
+    # this function did, but it is not correct on this platform: see
+    # `docs/model-dev/deepseek-v4-on-device-sampling.md`. A small all-gather --
+    # the [batch, 1] local maximum -- silently returns a buffer in which each
+    # rank sees only the shards belonging to its own physical Neuron device,
+    # with the remaining slots left uninitialized. Measured at TP8 on trn2,
+    # every rank in the first device agreed with its three neighbours, every
+    # rank in the second agreed with its own three, and the two halves never
+    # agreed. When an uninitialized slot won the reduction, the index that came
+    # back with it was a float bit pattern, i.e. an out-of-vocabulary token id.
+    #
+    # The defect is a function of payload width, not of the gather dimension or
+    # the index dtype: widths 1, 128 and 1024 are all wrong and 16160 is
+    # correct, so there is no cheap padding that avoids it. Gathering the shard
+    # is exactly what `nn/cpl.py` does on every host-sampled decode at this same
+    # TP degree, and is correct there. It costs one vocabulary-width gather per
+    # sampling call; on-device sampling still avoids the host round trip, which
+    # is its main benefit.
+    global_tensor = all_gather_tensor(
+        tensor.contiguous(), gather_dim, group=process_group
+    )
 
-    # Gather results from all ranks
-    global_values = all_gather_tensor(local_value, gather_dim, group=process_group)
-    global_indices = all_gather_tensor(local_index, gather_dim, group=process_group)
-
-    # Correct indices for sharding offset when gather_dim == dim
-    if gather_dim == dim:
-        global_indices = _apply_sharding_offset(
-            global_indices, dim, tensor.shape[gather_dim], tp_degree
-        )
-
-    # Find global argmax and extract final indices
-    global_argmax = torch.argmax(global_values, dim=dim, keepdim=True)
-    final_indices = torch.gather(global_indices, dim, global_argmax)
-
-    if not keepdim:
-        return final_indices.squeeze(dim)
-    return final_indices
-
-
-def _compute_local_max(tensor: Tensor, dim: int) -> tuple[Tensor, Tensor]:
-    """Compute a graph-compatible local maximum.
-
-    The nkilib cascaded-max kernel shipped with nki 0.6.0 fails HOP lowering
-    with an unresolved ``cascaded_max_utils.reduce`` symbol. Native
-    ``torch.max`` lowers successfully on the same Neuron stack and preserves
-    the required first-index tie breaking, so use it until that kernel is
-    consumable from the installed library.
-    """
-    return torch.max(tensor, dim=dim, keepdim=True)
-
-
-def _apply_sharding_offset(
-    indices: Tensor, dim: int, shard_size: int, tp_degree: int
-) -> Tensor:
-    """Apply offset to indices to account for tensor sharding."""
-    offset_shape = [1] * len(indices.shape)
-    offset_shape[dim] = tp_degree
-
-    offset = torch.arange(0, shard_size * tp_degree, shard_size, device=indices.device)
-    offset = offset.view(offset_shape)
-
-    return indices + offset
+    # Indices into the gathered tensor are already global when the gather
+    # concatenated the same axis the reduction runs over, so the per-rank
+    # sharding offset the exchange-maxima algorithm needed is gone with it.
+    return torch.argmax(global_tensor, dim=dim, keepdim=keepdim)

@@ -1,8 +1,8 @@
 # On-device sampling is wrong when the TP group spans Neuron devices
 
-**Status:** root cause established, fix not yet landed. On-device sampling is
-correct at TP4 and broken at TP8 on trn2. Until it is fixed, benchmark and
-generate with `--sampling-backend cpu`, or keep the TP group inside one device.
+**Status:** fixed. At TP8 on trn2, on-device sampling now returns exactly the
+host-sampled token ids, with async scheduling on and off. The fix is in
+`functional/argmax.py` and `functional/topk.py`; see "The fix" below.
 
 ## Symptom
 
@@ -71,6 +71,49 @@ Each of these was tested and eliminated, in this order:
   makes gathering an int64 index tensor look suspect. Narrowing the gathered
   indices to int32 changes the result not at all — bit-identical.
 
+## The fix
+
+Both distributed reductions now **gather the shards and reduce locally**,
+instead of exchanging per-rank maxima and merging them.
+
+The old algorithm is the cheaper one -- it moves `[batch, 1]` per rank instead
+of `[batch, vocab_shard]` -- and that is exactly why it was wrong: the payload
+was small enough to hit the defect. Gathering the shard is the same operation
+`nn/cpl.py` performs on every host-sampled decode at the same TP degree, where
+it is correct.
+
+The cost is one vocabulary-width gather per sampling call (~517 KB at batch 1
+for a 129280 vocabulary). On-device sampling still avoids the device-to-host
+round trip, which is its main benefit.
+
+Verified at depth 3, TP8, cores 12-19, dummy weights, greedy:
+
+| configuration | tokens |
+|---|---|
+| host sampling (reference) | `[4868, 508, 4868, 508]` |
+| on-device, async off | `[4868, 508, 4868, 508]` |
+| on-device, async on | `[4868, 508, 4868, 508]` |
+
+Exact equality is the right gate here, not "finite output": greedy argmax over
+identical logits has no legitimate freedom to differ.
+
+## Why padding was rejected
+
+The obvious cheaper fix is to keep the exchange-maxima algorithm and pad the
+tiny payload up to a width that gathers correctly. Measured, the width has to
+be far larger than any useful `k`:
+
+| gathered width | result at TP8 |
+|---|---|
+| 1 (the original) | wrong |
+| 128 | wrong |
+| 1024 | wrong |
+| 16160 (one vocab shard) | correct |
+
+Anything wide enough to work costs about as much as gathering the shard
+outright, so padding buys nothing and leaves the code depending on an
+undocumented threshold that could move.
+
 ## The trap when fixing it
 
 `vllm_neuron/functional/argmax.py` and `topk.py` gather through
@@ -83,9 +126,18 @@ collectives during tracing (`_functional_collectives.py`,
 A fix has to change the collective that actually executes, not the one written
 in Python.
 
+Gathering on dim 0 instead of dim 1 does not help either, and neither does
+narrowing the gathered indices to int32 -- both produce bit-identical wrong
+output. Only the payload width matters.
+
 Note also that `functional/collectives/all_gather_v.py` asserts a replica group
 size of exactly 4, with a TODO to extend it. Group-size-4 is a real constraint
 elsewhere in this collectives layer.
+
+The underlying collective defect is not fixed by any of this: a narrow
+all-gather across a TP group spanning Neuron devices still returns a
+partially-uninitialized buffer, silently. That is worth reporting upstream --
+any caller gathering a small tensor across such a group is exposed.
 
 ## Reproducing
 

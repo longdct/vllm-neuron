@@ -194,43 +194,30 @@ def topk(
             # torch fallback (CPU, kernels disabled, or out of kernel envelope)
             return _topk_torch(tensor, k, dim)
 
+    # Gather the shards and run one local top-k, rather than exchanging each
+    # rank's top-k and merging. The two-stage algorithm moves far less data, but
+    # its exchange is a [batch, k] all-gather, and an all-gather of that width
+    # is silently wrong here: each rank receives only the shards from its own
+    # physical Neuron device and the remaining slots hold uninitialized memory.
+    # `functional/argmax.py` carries the full account, and
+    # `docs/model-dev/deepseek-v4-on-device-sampling.md` the measurements. The
+    # width at which it starts working is far above any k worth using, so
+    # padding the exchange buys nothing over gathering the shard outright.
+    #
+    # `rank` is consequently unused: indices out of a gathered tensor are
+    # already global, so there is no per-rank offset to apply. It stays in the
+    # signature because callers pass it positionally.
+    global_tensor = all_gather_tensor(
+        tensor.contiguous(), gather_dim, group=process_group
+    )
+
     # Convert to float32 for kernel accuracy
     ## TODO: remove after migrating topk to NKIv2 frontend
-    tensor = tensor.to(torch.float32)
+    global_tensor = global_tensor.to(torch.float32)
 
-    # Step 1: Local topk on each rank
-    local_k = min(k, tensor.shape[gather_dim]) if gather_dim == dim else k
-    if _select_topk_method(tensor, local_k, dim) is not None:
-        local_value, local_index = _topk_nki(tensor, local_k, dim)
-    else:
-        local_value, local_index = _topk_torch(tensor, local_k, dim)
-
-    # Apply sharding offset locally before gather (when gather_dim == dim)
-    if gather_dim == dim:
-        if rank is None:
-            raise ValueError(
-                "rank must be provided as a tensor when process_group is set "
-                "and gather_dim == dim, to avoid baking rank as a compile-time "
-                "constant. Pass torch.tensor(dist.get_rank(group), dtype=torch.int32)."
-            )
-        offset = rank * tensor.shape[gather_dim]
-        local_index = local_index + offset
-
-    # Step 2: Gather from all ranks
-    global_values = all_gather_tensor(local_value, gather_dim, group=process_group)
-    global_indices = all_gather_tensor(local_index, gather_dim, group=process_group)
-
-    # Step 3: Global topk on gathered results
-    if _select_topk_method(global_values, k, dim) is not None:
-        values, global_max_local_index = _topk_nki(global_values, k, dim)
-    else:
-        values, global_max_local_index = _topk_torch(global_values, k, dim)
-
-    # Convert indices to match global_indices dtype for gather
-    global_max_local_index = global_max_local_index.to(dtype=global_indices.dtype)
-    final_indices = torch.gather(global_indices, dim, global_max_local_index)
-
-    return values, final_indices
+    if _select_topk_method(global_tensor, k, dim) is not None:
+        return _topk_nki(global_tensor, k, dim)
+    return _topk_torch(global_tensor, k, dim)
 
 
 def batch_sharded_topk(

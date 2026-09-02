@@ -124,7 +124,11 @@ def test_sampler_masks_only_padding_on_the_last_vocabulary_shard(monkeypatch):
     assert torch.isneginf(captured["logits"][0, 2:]).all()
 
 
-def test_distributed_argmax_normalizes_negative_gather_dimension(monkeypatch):
+def _patch_gather(monkeypatch, world_size, replacement=None):
+    """Patch the collective the distributed reductions use.
+
+    Records the gather dims so the negative-dim normalization stays pinned.
+    """
     import importlib
 
     argmax_module = importlib.import_module("vllm_neuron.functional.argmax")
@@ -132,10 +136,24 @@ def test_distributed_argmax_normalizes_negative_gather_dimension(monkeypatch):
 
     def fake_all_gather(tensor, dim, group):
         gathered_dims.append(dim)
-        return torch.cat([tensor] * 8, dim=dim)
+        if replacement is not None:
+            return replacement
+        return torch.cat([tensor] * world_size, dim=dim)
 
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 8)
+    monkeypatch.setattr(
+        torch.distributed, "get_world_size", lambda group: world_size
+    )
     monkeypatch.setattr(argmax_module, "all_gather_tensor", fake_all_gather)
+    return argmax_module, gathered_dims
+
+
+def test_distributed_argmax_normalizes_negative_gather_dimension(monkeypatch):
+    """A negative gather dim must not reach the collective.
+
+    ``_maybe_view_chunk_cat``, which the collective reconstructs its result
+    with, is not negative-dim safe -- it re-appends the whole shape and raises.
+    """
+    argmax_module, gathered_dims = _patch_gather(monkeypatch, world_size=8)
     logits = torch.tensor(
         [
             [1.0, 3.0, 2.0, 0.0],
@@ -143,10 +161,39 @@ def test_distributed_argmax_normalizes_negative_gather_dimension(monkeypatch):
         ]
     )
     actual = argmax_module.argmax(
-        logits,
-        dim=-1,
-        gather_dim=-1,
-        process_group=object(),
+        logits, dim=-1, gather_dim=-1, process_group=object()
     )
-    assert gathered_dims == [1, 1]
+    assert gathered_dims == [1]
     assert actual.tolist() == [1, 0]
+
+
+def test_distributed_argmax_returns_the_globally_winning_index(monkeypatch):
+    """The index must come from whichever shard actually holds the maximum.
+
+    This is the regression the on-device defect produced: each rank reduced
+    over only the shards on its own physical Neuron device, so it returned an
+    index from its own half of the vocabulary rather than the global one. Here
+    the winner is planted in the third shard of four, where a half-blind
+    reduction cannot find it.
+    """
+    shard, shards = 10, 4
+    gathered = torch.zeros(1, shard * shards)
+    gathered[0, 2 * shard + 2] = 9.0  # the only maximum, in shard 2
+    argmax_module, _ = _patch_gather(monkeypatch, world_size=shards, replacement=gathered)
+
+    actual = argmax_module.argmax(
+        torch.zeros(1, shard), dim=-1, gather_dim=-1, process_group=object()
+    )
+    assert actual.tolist() == [2 * shard + 2]
+
+
+def test_distributed_argmax_is_a_plain_argmax_over_the_gathered_shards(monkeypatch):
+    """Ties resolve to the lowest global index, matching torch.argmax."""
+    shard, shards = 4, 2
+    gathered = torch.tensor([[0.0, 5.0, 1.0, 2.0, 0.0, 5.0, 1.0, 2.0]])
+    argmax_module, _ = _patch_gather(monkeypatch, world_size=shards, replacement=gathered)
+
+    actual = argmax_module.argmax(
+        torch.zeros(1, shard), dim=-1, gather_dim=-1, process_group=object()
+    )
+    assert actual.tolist() == [1]
