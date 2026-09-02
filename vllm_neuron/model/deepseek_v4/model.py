@@ -2118,6 +2118,13 @@ class DeepseekV4Model(nn.Module):
         return self.norm(self.hc_head(streams))
 
 
+#: Parameters that are dequantization multipliers rather than weights, by exact
+#: leaf name. A suffix match on "_scale" would also catch ``hc_scale``.
+_QUANTIZATION_SCALE_PARAMETERS = frozenset(
+    {"routed_gate_up_scale", "routed_down_scale"}
+)
+
+
 @torch.no_grad()
 def _initialize_dummy_parameters(module: nn.Module) -> None:
     """Materialize stable, finite dummy weights without changing buffers.
@@ -2137,7 +2144,14 @@ def _initialize_dummy_parameters(module: nn.Module) -> None:
         # generic uniform_(-1e-3, 1e-3) below would make it tiny and sometimes
         # negative, which silently sign-flips whole expert channels and makes a
         # dummy FP8 run unrepresentative of the real one.
-        if name.endswith("_scale") and parameter.dtype.is_floating_point:
+        #
+        # Matched by exact name, NOT by a "_scale" suffix: `hc_scale` is a
+        # learned mHC mixing weight that also ends in _scale, and pinning it to
+        # 1.0 amplifies the residual streams into non-finite logits, after
+        # which on-device argmax returns an out-of-range token id and the
+        # request dies in _validate_token_ids. See the note at HyperConnection,
+        # which records the same collision biting the checkpoint loader.
+        if name.rsplit(".", 1)[-1] in _QUANTIZATION_SCALE_PARAMETERS:
             with torch.no_grad():
                 parameter.fill_(1.0)
             continue

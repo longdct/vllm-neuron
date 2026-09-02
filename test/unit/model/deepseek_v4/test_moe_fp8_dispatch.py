@@ -169,3 +169,42 @@ class TestBf16Unchanged:
         # The BF16 decode block must not grow: that would be a silent
         # performance regression on the path FP8 is not involved in.
         assert captured["block_size"] == 128
+
+
+class TestDummyScaleInitialisation:
+    """`hc_scale` is a learned mHC weight, not a quantization scale.
+
+    Pinning it to 1.0 amplifies the residual streams into non-finite logits;
+    on-device argmax then returns an out-of-range token id and the request
+    dies far away in `_validate_token_ids` with no mention of initialization.
+    The same name collision is documented at `HyperConnection` for the
+    checkpoint loader, so it is worth a test in both places.
+    """
+
+    def test_only_quantization_scales_are_pinned_to_one(self):
+        from vllm_neuron.model.deepseek_v4.model import (
+            _QUANTIZATION_SCALE_PARAMETERS,
+        )
+
+        assert "routed_gate_up_scale" in _QUANTIZATION_SCALE_PARAMETERS
+        assert "routed_down_scale" in _QUANTIZATION_SCALE_PARAMETERS
+        assert "hc_scale" not in _QUANTIZATION_SCALE_PARAMETERS
+        assert "hc_head_scale" not in _QUANTIZATION_SCALE_PARAMETERS
+
+    def test_dummy_init_leaves_hc_scale_random_and_fixes_expert_scales(self):
+        from vllm_neuron.model.deepseek_v4.model import (
+            _initialize_dummy_parameters,
+        )
+
+        module = torch.nn.Module()
+        module.hc_scale = torch.nn.Parameter(torch.ones(3))
+        module.routed_down_scale = torch.nn.Parameter(torch.zeros(4, 1, 8))
+        module.weight = torch.nn.Parameter(torch.zeros(4, 4))
+
+        _initialize_dummy_parameters(module)
+
+        assert torch.equal(module.routed_down_scale, torch.ones(4, 1, 8))
+        # hc_scale went through the ordinary dummy draw, so it is no longer
+        # its constructed value and is small like any other weight.
+        assert not torch.equal(module.hc_scale, torch.ones(3))
+        assert float(module.hc_scale.abs().max()) <= 1e-3
