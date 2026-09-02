@@ -168,3 +168,66 @@ result to 43 layers or claim the 20% gate from collective counts alone.
 Do not run the known broken full Q512 cold compile described in the MLA defect
 handoff until its structural checks confirm that static query expansion and
 query-by-history materializations are absent.
+
+## Depth-8 A/B on 2026-09-02: the fused reduction is a small regression
+
+The 2026-09-01 comparison above could not separate the fused reduction from
+noise at 3 layers, where it removes only 3 collectives per generated token.
+This run repeats it at depth 8, where it removes 8, and adds the controls the
+earlier pair lacked: both arms come from one build at `a192310`, selected by
+`VLLM_NEURON_DSV4_FUSED_MOE_REDUCTION` rather than a source overlay, and each
+report records the flag that produced it.
+
+Shape-accurate BF16 dummy checkpoint, 8 layers, 256 experts, TP8/EP4, Q512,
+`max_model_len` 512, sustained workload (384-token prompt, 128 output tokens),
+device sampling, 2 discarded warmups and 3 measured repetitions, logical cores
+12--19, isolated compile cache per arm. Reports are
+`/tmp/dsv4-moe-ab-depth8/{fused,legacy}/result.json`.
+
+| Metric | Legacy (2 reductions) | Fused (1) | Change |
+| --- | ---: | ---: | ---: |
+| Median steady ITL | 131.534 ms | 132.215 ms | -0.52% |
+| p95 steady ITL | 133.381 ms | 134.677 ms | -0.97% |
+| Median TTFT | 577.016 ms | 577.707 ms | -0.12% |
+| First decode interval | 131.357 ms | 132.685 ms | -1.01% |
+| Aggregate output throughput | 7.403 tok/s | 7.359 tok/s | -0.59% |
+
+Positive change denotes improvement, so **every metric moved the wrong way**.
+The result is small but it is not noise: per-repetition median ITL was 131.517
+/ 131.538 / 131.561 ms for legacy against 131.955 / 132.293 / 132.373 ms for
+fused, so the two arms do not overlap and the within-arm spread (0.03% and
+0.32%) is below the 0.52% gap. Per-rank HBM was identical at 15,804,137,472
+bytes, and async scheduling behaved identically (635 async steps, 5 sync
+fallbacks on both), so neither is a confound. The two NEFF sets do differ
+(281,804,931 vs 281,802,386 bytes), which confirms the flag reached the
+compiled graph rather than being silently ignored.
+
+Read with the 2026-09-01 depth-3 pair, the regression grows roughly with depth
+-- -0.15% at 3 layers, -0.52% at 8 -- which is the opposite of the trend the
+fusion was adopted for. Removing 8 all-reduces per token made decode slower,
+so **the TP collective count is not the decode bottleneck at this geometry**,
+and the 20% batch-1 gate cannot be reached by removing more of them.
+
+A plausible mechanism, untested: the legacy path issues two independent
+all-reduces that the runtime can overlap with expert compute, while the fused
+path serialises routed -> shared -> add -> one reduce, putting the whole sum on
+the critical path. If that is the cause, the fix is to overlap the single
+reduction rather than to restore the second one. Attribute this before either
+keeping or reverting the fusion; the flag now makes that a one-variable
+experiment.
+
+Two caveats bound the result. Both arms required
+`VLLM_NEURON_DSV4_FIXED_CSA_SELECTION=1`, so neither is a correctness or
+acceptance measurement. And the normal CSA selection graph still does not make
+forward progress: at depth 8 it compiled, dispatched, and then failed prefill
+warmup at bucket 512 with `NRT EXECUTION FAILED ... Operation timed out`,
+exactly as at depth 3. That blocker is therefore **not depth-dependent**, which
+removes model depth as a candidate cause and keeps the fault localized to the
+lightning-indexer scoring/selection region.
+
+For planning only, and not a claim about the real model: median steady ITL was
+69.199 ms at depth 3 and 132.215 ms at depth 8 on the same cores and geometry,
+which fits `31.4 ms + 12.6 ms x depth`. Extrapolated to 43 layers that is
+roughly 573 ms per token at TP8. TP32/TP64 is the geometry that has to close
+that gap, and it remains unavailable while the production service holds cores
+32--63.
