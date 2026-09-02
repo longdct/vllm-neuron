@@ -265,3 +265,48 @@ which fits `31.4 ms + 12.6 ms x depth`. Extrapolated to 43 layers that is
 roughly 573 ms per token at TP8. TP32/TP64 is the geometry that has to close
 that gap, and it remains unavailable while the production service holds cores
 32--63.
+
+
+## FP8 on TRN2: the constraints that actually bind (2026-09-02)
+
+Recorded from getting the FP8 path onto device, because none of these are
+discoverable from the error text they produce.
+
+### `shard_on_i` needs I_TP >= 256, which forces EP at high TP
+
+FP8 experts must use `shard_on_i` (`shard_on_block` ignores the scales -- see
+the milestone 0 notes). At TP16 with no expert parallelism,
+`expert_tp_degree = 16` and `I_TP = 2048/16 = 128`, and decode graph extraction
+fails inside the kernel:
+
+```
+bwmm_shard_on_I.py:1483 [INTERNAL_ERROR] [NCC_IBIR243]
+Access pattern out of bounds. Pattern: [[256,128],[1,256]]
+```
+
+The 256 is the FP8 MoE block; the 128 is `I_TP`. TP8 gives `I_TP = 256` and
+works. The fix at TP16 is `--enable-expert-parallel --ep-degree 2`, which makes
+`expert_tp_degree = world/ep = 8` and restores `I_TP = 256` at *identical*
+per-rank memory -- each rank then holds 128 experts sharded 8 ways instead of
+256 sharded 16 ways. **Above TP8, FP8 requires EP.**
+
+### The paged-MLA query bucket set is sparse
+
+`(1, 2, 4, 8, 64, 512, 1024, 2048, 4096, 8192)` -- there is no 16, 32, 128 or
+256. A `max_model_len` of 256 fails in the MLA guard, which until now reported
+it as a head-count violation. Fixed to name the bucket.
+
+### KV budget is computed after graph allocation
+
+At depth 43 / TP16 the parameter footprint is 18.695 GiB per rank and HBM sits
+at ~21.5 GiB once graphs are allocated, so the default
+`gpu_memory_utilization=0.9` leaves ~0.11 GiB for KV and the engine refuses a
+512-token context. Raising GMU alone does not rescue it; the practical lever at
+production depth is a shorter context.
+
+### Depth 43 does not exist in BF16 here
+
+18.695 GiB/rank of FP8 weights becomes ~36 GiB in BF16, against a 24 GiB core.
+No available geometry runs depth 43 in BF16 -- cores 32-63 would be needed for
+TP32 and are not free. This is the clearest statement of what FP8 buys: not
+speed, but a configuration that otherwise cannot be instantiated.
