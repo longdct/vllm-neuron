@@ -376,11 +376,22 @@ below. That makes these numbers internally comparable but not comparable to
 the earlier device-sampling figures (69.199 ms at depth 3), which were also
 produced by a different tree.
 
-### Open defect: device sampling emits invalid token IDs
+### Resolved: device sampling emitted invalid token IDs
 
-With this branch's code, `--sampling-backend device` produces token IDs far
-outside `[0, 129280)` -- observed `967439869` and `-1167771948` -- which fail
-`_validate_token_ids` on the next decode step. It reproduces on the **BF16**
-arm, so it is not an FP8 regression. It went unnoticed until now because
-earlier benchmark runs did not set `PYTHONPATH` and were silently executing
-the primary checkout. Not yet diagnosed.
+`--sampling-backend device` used to produce token IDs far outside
+`[0, 129280)` -- observed `967439869` and `-1167771948` -- failing
+`_validate_token_ids` on the next decode step. Fixed; see
+`deepseek-v4-on-device-sampling.md` for the diagnosis.
+
+Two things from it bear on the numbers here. **These runs used cores 12-19,
+which is a broken TP8 placement**: devices 3 and 4 have no interconnect link,
+and a narrow collective across them silently returns partial data. The model's
+wide collectives are unaffected, and the host-sampled tokens were correct
+throughout, so these timings stand -- but new measurements should use a
+connected group (`16-23`, `20-27`, `16-31`).
+
+And on-device sampling now costs nothing measurable against host sampling:
+depth 3, TP8/EP4, BF16, median steady ITL 54.83 ms on-device against 54.32 ms
+on host, with overlapping ranges. Depth 8 on-device is 7.63 tok/s, reproducing
+the ~7 tok/s recorded while sampling was still emitting garbage -- the timing
+was always sound, only the tokens were wrong.
