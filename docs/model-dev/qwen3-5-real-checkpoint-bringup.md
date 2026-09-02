@@ -525,6 +525,79 @@ weights + 2.0 GiB KV + 0.14 GiB GDN state + ~3.75 GiB prefill transient, near
 head-dim-256 prefill kernel plus the segmented branch in the layer, and belong
 in their own plan.
 
+### 32K and 64K, tried on the real 27B rather than argued about
+
+Both routes were run to failure, because they fail for different reasons and
+testing only one would mislead. Each fails at config time in about 26 seconds,
+so nothing is learned at the cost of a compile.
+
+| config | outcome |
+|---|---|
+| 32K single-shot | `ValueError: Single-shot prefill (max_num_batched_tokens=32768 >= max_model_len=32768) is only supported when max_model_len <= 16384` |
+| 32K chunked, 8192 | gets further -- `Segmented prefill auto-enabled with kv_segment_size_buckets=[8192]` -- then `ValueError: Qwen3.5 head_dim=256 exceeds the segmented-attention kernel's 128-element partition bound` |
+| 64K single-shot | the same 16384 ceiling |
+| 64K chunked, 8192 | the same head_dim-256 rejection |
+
+This is a pincer, not one wall. Above 16384 the bucket resolver *requires*
+chunked prefill; chunked prefill *is* segmented attention; segmented attention
+refuses head_dim 256. There is no configuration between the two.
+
+The second row is the one that matters. It is what a reasonable person tries
+after hitting the first error, and before the factory raise it was accepted
+silently -- `Qwen3_5Attention` has no `kv_segment_size` branch at all, so it
+would have attended within each 8192-token chunk and ignored everything cached
+before it. Fluent, confident, and missing most of its context. It now fails
+loudly instead, which is the entire value of that raise.
+
+### Latency: you pay for `max_model_len`, not for the context you use
+
+Measured on the real 27B at TP=8, one request in flight, `max_num_seqs=8`.
+vLLM's per-request metrics come back empty on this path, so prefill and decode
+were separated by regression instead: `wall(burst)` is affine, so timing bursts
+of 1, 8, 16 and 32 tokens at a fixed depth gives decode as the slope and
+prefill as the intercept, with no dependence on TTFT.
+
+| `max_model_len` | prefill | decode | decode rate | half-window decode |
+|---|---|---|---|---|
+| 2048 | **0.71 s** | **131 ms/tok** | 7.6 tok/s | 1024 tok = 2.2 min |
+| 16384 | **7.80 s** | **247 ms/tok** | 4.1 tok/s | 8192 tok = 33.7 min |
+
+**Both terms are flat in context depth.** At 16K, sweeping the prefilled depth
+over 256, 512, 1024, 2048, 4096 and 8192 -- a 32x range, up to half the window
+-- moves the wall clock by 0.3%: 11.62, 11.64, 11.63, 11.62, 11.66, 11.63 s for
+16 tokens. The fitted prefill stays 7.77-7.86 s and the fitted decode
+240-264 ms/tok with no trend. The 2048 config behaves the same way.
+
+That is the expected consequence of two things already documented above:
+head_dim 256 forbids chunked prefill, so the prefill bucket is always the whole
+window however short the prompt; and the decode graph is compiled per bucket
+with `_gather_cache` reading every block the block table can address, so the
+depth actually occupied is not an input to the cost.
+
+The practical reading: **`max_model_len` is the dominant performance lever, and
+since TP=8 is the ceiling it is very nearly the only one.** Going 2048 -> 16384
+is an 8x window for 11x the prefill and 1.9x the per-token decode. A server
+configured at 16K pays 7.8 s of prefill on a 300-token chat turn. Right-size
+the window to the workload, or run several smaller-context instances.
+
+Caveat on method: the first generation of a session carries one-time warm-up
+and must be discarded. In the 2048 sweep it appeared as
+`depth=256 burst=1 wall=6.23s` against 0.84 s for the identical call at every
+later depth, which dragged that one regression to a nonsensical -1.1 ms/tok.
+Refitting without it gives 0.70 s / 133 ms/tok, matching the other depths.
+
+### Compile time, and what a "warm" cache does not cover
+
+Cold compile of the 16384 graph is **2h42m**. Two later runs against the same
+populated `VLLM_CACHE_ROOT` still took **2h40m** and **47m** to reach a ready
+engine, and the cache grew 375 MB / 47 NEFFs -> 748 MB / 58 over them.
+
+The reason is that graph buckets are per batch size: the first run compiled
+batch-8 decode graphs because it submitted eight prompts together, and the
+benchmark submits one request at a time, so it needed batch-1 graphs that did
+not exist yet. **Warming a cache means covering the batch shapes that will
+actually be served, not just the model.**
+
 ## Still open
 
 - ~~**TP>1 loses accuracy on its own.**~~ **Closed, and it was not a defect.**
@@ -652,15 +725,36 @@ Two claims made while debugging this were wrong and are retracted: vLLM did
 allocation), and there is **no evidence** that the prefill activation arena
 consumed the memory.
 
-**The override was never needed.** The same log line that applies it says what
-it replaced: `Overriding num_gpu_blocks=1043 with
-num_gpu_blocks_override=344`. vLLM's own sizing lands at 1043 blocks -- about
-7.1 GiB a rank, just under the `0.30 x 24 GiB` Neuron KV budget cap -- which
-fits perfectly well. Passing nothing would have worked from the start; passing
-344 is tighter and leaves more HBM free; passing 4096 is what broke it. The
-lesson is not "compute the override carefully" but **"do not set it unless you
-have a reason"**, and the guard added alongside this now names the usable
-figure when someone does.
+~~**The override was never needed.**~~ **Wrong -- and the correction matters
+more than the original claim.** The log line that applies it says what it
+replaced: `Overriding num_gpu_blocks=1043 with num_gpu_blocks_override=344`.
+From that alone it looked as though vLLM's own sizing -- 1043 blocks, ~7.1 GiB
+a rank, just under the `0.30 x 24 GiB` Neuron KV budget cap -- would have been
+fine, and that the override was avoidable ceremony.
+
+It is not. Running with the override *removed* OOMs:
+
+    Failed to allocate DEVICE memory (444596224 bytes)
+
+444,596,224 B is ~424 MiB, which is one of the sixteen pools, not the whole
+pool -- the allocator got partway through the set and ran out. Fitting under
+the KV budget cap is necessary, not sufficient: the cap is computed against
+free HBM *at that moment*, and the compiled graph's arena has to live in the
+same 17.2 GiB.
+
+So the rule is the opposite of what this section first said: **the override is
+required at 16K, and 344 is the value that fits.** `num_gpu_blocks_override`
+is the only lever that bounds the pool, because `cache_config.
+kv_cache_memory_bytes` is not honoured on Neuron
+(`NeuronWorker.determine_available_memory` never reads it) and
+`gpu_memory_utilization` / `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION` only move
+the cap, which was already not binding.
+
+Both errors here came from the same habit: reading a number out of a log and
+reasoning about what it implied instead of running the configuration. The
+first produced a 12x-too-large override, the second a claim that no override
+was needed. The arithmetic in the table above is right; the conclusions drawn
+around it were only worth what a device run said about them.
 
 ### Confirmed: 16K x 8 requests works at TP=8
 
