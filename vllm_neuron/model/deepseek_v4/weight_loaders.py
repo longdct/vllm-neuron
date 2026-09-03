@@ -189,10 +189,17 @@ def map_checkpoint_name(name: str, expert_dtype: ExpertDType = "bf16") -> str:
     for source, target in _CONTAINER_RENAMES:
         mapped = mapped.replace(source, target)
     if mapped.endswith(".scale"):
-        if expert_dtype == "fp4" and re.search(
-            r"\.experts\.\d+\.w[123]\.scale$", mapped
-        ):
-            mapped = mapped[: -len(".scale")] + ".weight_scale"
+        if re.search(r"\.experts\.\d+\.w[123]\.scale$", mapped):
+            # A routed expert's dequantization scale. Under ``fp8`` the
+            # checkpoint carries one scale per output channel and the model has
+            # a parameter to put it in, so leave the name alone for
+            # ``resolve_stacked_shard`` to stack. ``fp4`` keeps its historical
+            # rename; nothing consumes either of the renamed forms, which is
+            # why an FP8 checkpoint could not be loaded before.
+            if expert_dtype != "fp8":
+                mapped = mapped[: -len(".scale")] + (
+                    ".weight_scale" if expert_dtype == "fp4" else ".weight_scale_inv"
+                )
         else:
             mapped = mapped[: -len(".scale")] + ".weight_scale_inv"
     elif _BARE_MOE_PARAMS.search(mapped):
@@ -240,6 +247,25 @@ def resolve_stacked_shard(mapped_name: str) -> StackedShard | None:
     expert its own ``gate_up_proj`` parameter holding the ``w1``/``w3``
     concatenation, rather than a single grouped tensor addressed by expert id.
     """
+    routed_scale = re.search(
+        r"^(.*\.moe)\.experts\.(\d+)\.w([123])\.scale$", mapped_name
+    )
+    if routed_scale:
+        prefix, expert, component = routed_scale.groups()
+        # Scales carry one value per output channel, so they stack on the same
+        # axis as their weight but need no transpose: the checkpoint already
+        # indexes them by output channel.
+        if component == "2":
+            return StackedShard(
+                f"{prefix}.routed_down_scale", 0, int(expert), transpose=False
+            )
+        return StackedShard(
+            f"{prefix}.routed_gate_up_scale",
+            0 if component == "1" else 1,
+            int(expert),
+            transpose=False,
+        )
+
     routed = re.search(
         r"^(.*\.moe)\.experts\.(\d+)\.w([123])(?:\.weight)?$", mapped_name
     )
@@ -348,11 +374,29 @@ def load_checkpoint_weights(
                         raise ValueError(
                             f"routed expert {expert_id} is outside {target_name!r}"
                         )
-                    target = (
-                        parameter[expert_id, :, stacked.shard_id, :]
-                        if target_name.endswith("routed_gate_up")
-                        else parameter[expert_id]
-                    )
+                    is_scale = target_name.endswith("_scale")
+                    if is_scale:
+                        # ``[E_local, 1, 2*I_tp]`` for gate/up, ``[E_local, 1, H]``
+                        # for down. The fused gate/up axis is shard-major --
+                        # index ``shard * I_tp + i`` -- which is the layout the
+                        # kernel reads and the one the device probe confirmed
+                        # bitwise against a BF16 reference.
+                        if target_name.endswith("routed_gate_up_scale"):
+                            width = parameter.shape[-1] // 2
+                            target = parameter[
+                                expert_id,
+                                0,
+                                stacked.shard_id * width : (stacked.shard_id + 1)
+                                * width,
+                            ]
+                        else:
+                            target = parameter[expert_id, 0]
+                    else:
+                        target = (
+                            parameter[expert_id, :, stacked.shard_id, :]
+                            if target_name.endswith("routed_gate_up")
+                            else parameter[expert_id]
+                        )
                     source = (
                         loaded_weight.transpose(0, 1)
                         if stacked.transpose
@@ -361,11 +405,25 @@ def load_checkpoint_weights(
                     expert_tp_degree = int(getattr(owner, "expert_tp_degree", 1))
                     expert_tp_rank = int(getattr(owner, "expert_tp_rank", 0))
                     if expert_tp_degree > 1:
-                        shard_dim = 1 if target_name.endswith("routed_gate_up") else 0
-                        shard_size = source.shape[shard_dim] // expert_tp_degree
-                        source = source.narrow(
-                            shard_dim, expert_tp_rank * shard_size, shard_size
-                        )
+                        if is_scale:
+                            # A gate/up scale is indexed by output channel, so it
+                            # shards with the intermediate dimension. A down
+                            # scale is indexed by hidden, which is replicated --
+                            # narrowing it would silently drop 7/8 of the row.
+                            shard_dim = (
+                                0
+                                if target_name.endswith("routed_gate_up_scale")
+                                else None
+                            )
+                        else:
+                            shard_dim = (
+                                1 if target_name.endswith("routed_gate_up") else 0
+                            )
+                        if shard_dim is not None:
+                            shard_size = source.shape[shard_dim] // expert_tp_degree
+                            source = source.narrow(
+                                shard_dim, expert_tp_rank * shard_size, shard_size
+                            )
                     require_weight_shape(
                         source_name, tuple(source.shape), tuple(target.shape)
                     )

@@ -125,11 +125,38 @@ def test_no_subtree_is_skipped_now_that_the_indexer_is_modelled():
 def test_quantized_scale_names_distinguish_fp4_experts():
     source = "layers.2.ffn.experts.7.w1.scale"
     assert map_checkpoint_name(source, "fp4").endswith("w1.weight_scale")
-    assert map_checkpoint_name(source, "fp8").endswith("w1.weight_scale_inv")
     shared = "layers.2.ffn.shared_experts.w2.scale"
     assert map_checkpoint_name(shared, "fp4").endswith(
         "shared_experts.down_proj.weight_scale_inv"
     )
+
+
+def test_fp8_expert_scales_keep_a_name_that_resolves_to_a_parameter():
+    """An fp8 expert scale must reach ``routed_gate_up_scale``/``routed_down_scale``.
+
+    Both the ``weight_scale`` and ``weight_scale_inv`` renames point at names
+    no module declares, so an FP8 checkpoint's scales used to be mapped into
+    nothing and dropped -- which is silent, and leaves the experts running
+    against whatever the scale parameters were initialized to.
+    """
+    gate = map_checkpoint_name("layers.2.ffn.experts.7.w1.scale", "fp8")
+    up = map_checkpoint_name("layers.2.ffn.experts.7.w3.scale", "fp8")
+    down = map_checkpoint_name("layers.2.ffn.experts.7.w2.scale", "fp8")
+    assert gate.endswith("experts.7.w1.scale"), gate
+
+    gate_shard = resolve_stacked_shard(gate)
+    up_shard = resolve_stacked_shard(up)
+    down_shard = resolve_stacked_shard(down)
+    assert gate_shard is not None and up_shard is not None
+    assert gate_shard.parameter_name.endswith("routed_gate_up_scale")
+    assert up_shard.parameter_name.endswith("routed_gate_up_scale")
+    assert down_shard.parameter_name.endswith("routed_down_scale")
+    # Gate is the low half of the fused axis and up the high half, matching the
+    # weights they scale.
+    assert (gate_shard.shard_id, up_shard.shard_id) == (0, 1)
+    assert gate_shard.expert_id == 7
+    # Scales are already indexed by output channel; transposing would corrupt.
+    assert gate_shard.transpose is False and down_shard.transpose is False
 
 
 @pytest.mark.parametrize(

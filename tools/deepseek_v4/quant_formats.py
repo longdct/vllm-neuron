@@ -14,6 +14,9 @@ from vllm_neuron.model.deepseek_v4.quant_formats import (  # noqa: F401
     dequantize,
     dequantize_fp4_blockwise,
     dequantize_fp8_blockwise,
+    dequantize_fp8_per_channel,
+    requantize_fp4_to_fp8,
+    requantize_fp8_blockwise_to_per_channel,
     unpack_fp4,
 )
 
@@ -24,5 +27,8 @@ __all__ = [
     "dequantize",
     "dequantize_fp4_blockwise",
     "dequantize_fp8_blockwise",
+    "dequantize_fp8_per_channel",
+    "requantize_fp4_to_fp8",
+    "requantize_fp8_blockwise_to_per_channel",
     "unpack_fp4",
 ]

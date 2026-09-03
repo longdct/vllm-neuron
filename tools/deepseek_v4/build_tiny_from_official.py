@@ -38,7 +38,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from quant_formats import dequantize
+from quant_formats import dequantize, requantize_fp4_to_fp8
 
 #: ``compress_ratios`` entry -> attention implementation.
 RATIO_TO_LAYER_TYPE = {
@@ -112,7 +112,7 @@ def _shard_readers(shard_dir: Path, index: dict, names: set[str]) -> dict[str, s
 
 
 def build(shard_dir: Path, output: Path, source_layers: tuple[int, ...],
-          n_experts: int) -> None:
+          n_experts: int, expert_dtype: str = "bf16") -> None:
     index = json.loads((shard_dir / "model.safetensors.index.json").read_text())
     config = json.loads((shard_dir / "config.json").read_text())
     weight_map = index["weight_map"]
@@ -155,6 +155,19 @@ def build(shard_dir: Path, output: Path, source_layers: tuple[int, ...],
         def emit(name: str, destination_name: str) -> None:
             scale_name = name.rsplit(".", 1)[0] + ".scale"
             scale = source(scale_name) if scale_name in readers else None
+            if expert_dtype == "fp8" and _EXPERT_RE.match(name) is not None:
+                if scale is None:
+                    raise SystemExit(f"{name} has no scale to requantize from")
+                # MXFP4 -> FP8 with one scale per output channel: exact, and the
+                # granularity `shard_on_i` consumes. The emitted names match the
+                # official ones so the loader's ordinary expert path stacks
+                # them; only the dtype and the scale's shape change.
+                elements, channel_scale = requantize_fp4_to_fp8(source(name), scale)
+                tensors[destination_name] = elements.contiguous()
+                tensors[destination_name.rsplit(".", 1)[0] + ".scale"] = (
+                    channel_scale.contiguous()
+                )
+                return
             tensors[destination_name] = dequantize(source(name), scale).contiguous()
 
         for name in OUTPUT_STACK:
@@ -204,6 +217,12 @@ def build(shard_dir: Path, output: Path, source_layers: tuple[int, ...],
     # scale tensors that no longer exist.
     slim.pop("quantization_config", None)
     slim.pop("expert_dtype", None)
+    if expert_dtype == "fp8":
+        # Everything except the routed experts is dequantized, so the official
+        # quantization_config would misdescribe the file. Record the one thing
+        # that is still quantized, for a reader; the runtime learns it from
+        # neuron_config.quantization rather than from here.
+        slim["expert_dtype"] = "fp8"
     (output / "config.json").write_text(json.dumps(slim, indent=2) + "\n")
 
     for filename in TOKENIZER_FILES:
@@ -258,6 +277,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("shard_dir", type=Path, help="output of fetch_official_shards.py")
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--expert-dtype",
+        choices=("bf16", "fp8"),
+        default="bf16",
+        help=(
+            "Storage for the routed experts. 'fp8' widens the checkpoint's "
+            "MXFP4 exactly and emits one scale per output channel, halving the "
+            "checkpoint and matching what quantization='fp8' expects at "
+            "runtime. Everything else is dequantized to bf16 either way."
+        ),
+    )
     parser.add_argument("--layers", default="0,2,3")
     parser.add_argument(
         "--experts", type=int, default=32,
@@ -265,7 +295,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     layers = tuple(int(x) for x in re.split(r"[,\s]+", args.layers.strip()) if x)
-    build(args.shard_dir, args.output, layers, args.experts)
+    build(args.shard_dir, args.output, layers, args.experts, args.expert_dtype)
 
 
 if __name__ == "__main__":

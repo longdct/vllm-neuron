@@ -2530,6 +2530,18 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         from safetensors import safe_open
 
+        # The runner calls this positionally (neuron_model_runner.py), so the
+        # keyword above never arrives and an FP8 checkpoint would be mapped as
+        # if its experts were BF16 -- which silently drops their scales. Take
+        # the answer from the model's own configuration instead, and let an
+        # explicit argument still override it.
+        resolved_expert_dtype = (
+            "fp8"
+            if getattr(self.config, "expert_weight_dtype", None)
+            is torch.float8_e4m3fn
+            else expert_dtype
+        )
+
         search_root = checkpoint_path
         if not os.path.isdir(search_root):
             from vllm_neuron.utils.checkpoints import _get_checkpoint_source
@@ -2595,7 +2607,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         yield name, handle.get_tensor(name)
 
         load_checkpoint_weights(
-            self, _weights(), expert_dtype=expert_dtype, strict=True
+            self, _weights(), expert_dtype=resolved_expert_dtype, strict=True
         )
         parameter_bytes = sum(
             parameter.numel() * parameter.element_size()
